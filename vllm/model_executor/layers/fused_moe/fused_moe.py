@@ -15,16 +15,8 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8)
 from vllm.platforms import current_platform
-from vllm.utils import direct_register_custom_op
+from vllm.utils import direct_register_custom_op, rocm_aiter_moe_enabled, rocm_aiter_fp8_block_scaled_moe_enabled
 
-USE_ROCM_AITER_FMOE = envs.VLLM_ROCM_USE_AITER_MOE \
-    and current_platform.is_rocm()
-USE_ROCM_AITER_FP8_BLOCK_SCALED_MOE = envs.VLLM_ROCM_USE_AITER_FP8_BLOCK_SCALED_MOE \
-    and current_platform.is_rocm() # noqa: E501
-
-if USE_ROCM_AITER_FMOE or USE_ROCM_AITER_FP8_BLOCK_SCALED_MOE:
-    import aiter as rocm_aiter
-    import aiter.fused_moe_bf16_asm as rocm_aiter_asm_fmoe
 
 logger = init_logger(__name__)
 
@@ -1170,7 +1162,10 @@ def rocm_aiter_fused_experts(hidden_states: torch.Tensor,
                              w2_scale: Optional[torch.Tensor] = None,
                              block_shape: Optional[List[int]] = None,
                              expert_mask: Optional[torch.Tensor] = None):
-    if USE_ROCM_AITER_FMOE and use_fp8_w8a8:
+    import aiter as rocm_aiter
+    import aiter.fused_moe_bf16_asm as rocm_aiter_asm_fmoe
+
+    if rocm_aiter_fp8_block_scaled_moe_enabled() and use_fp8_w8a8:
         assert w1_scale is not None
         assert w2_scale is not None
 
@@ -1259,7 +1254,7 @@ def fused_experts(hidden_states: torch.Tensor,
                   a2_scale: Optional[torch.Tensor] = None,
                   block_shape: Optional[List[int]] = None,
                   expert_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-    if USE_ROCM_AITER_FMOE:
+    if rocm_aiter_moe_enabled():
         return rocm_aiter_fused_experts(hidden_states, w1, w2, topk_weights,
                                         topk_ids, use_fp8_w8a8, w1_scale,
                                         w2_scale, block_shape, expert_mask)

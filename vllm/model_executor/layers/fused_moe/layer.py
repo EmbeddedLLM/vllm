@@ -18,6 +18,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
+from vllm.utils import rocm_aiter_moe_enabled
 
 if current_platform.is_cuda_alike():
     from .fused_moe import fused_experts
@@ -28,11 +29,6 @@ if current_platform.is_tpu():
     from .moe_torch_iterative import fused_moe as fused_moe_pallas
 else:
     fused_moe_pallas = None  # type: ignore
-
-USE_ROCM_AITER_FMOE = envs.VLLM_ROCM_USE_AITER_MOE and current_platform.is_rocm(
-)
-if USE_ROCM_AITER_FMOE:
-    from aiter.ops.shuffle import shuffle_weight as aiter_shuffle_weight
 
 logger = init_logger(__name__)
 
@@ -102,11 +98,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
 
-        if USE_ROCM_AITER_FMOE:
-            layer.w13_weight = torch.nn.Parameter(aiter_shuffle_weight(
+        if rocm_aiter_moe_enabled():
+            from aiter.ops.shuffle import shuffle_weight as rocm_aiter_shuffle_weight
+
+            layer.w13_weight = torch.nn.Parameter(rocm_aiter_shuffle_weight(
                 layer.w13_weight.data),
                                                   requires_grad=False)
-            layer.w2_weight = torch.nn.Parameter(aiter_shuffle_weight(
+            layer.w2_weight = torch.nn.Parameter(rocm_aiter_shuffle_weight(
                 layer.w2_weight.data),
                                                  requires_grad=False)
 
