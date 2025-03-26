@@ -140,6 +140,8 @@ RUN cd aiter \
     && pip install -r requirements.txt \
     && PREBUILD_KERNELS=1 GPU_ARCHS=gfx942 python3 setup.py develop && pip show aiter 
 
+RUN ln -sf $(ls ${ROCM_PATH}/lib/libamdhip64.so) /usr/lib/libamdhip64.so
+
 ARG BASE_IMAGE
 ARG HIPBLASLT_BRANCH
 ARG HIPBLAS_COMMON_BRANCH
