@@ -16,7 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only LLaMA model compatible with HuggingFace weights."""
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
@@ -36,7 +36,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from .llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP, LlamaModel
+from .llama import LlamaForCausalLM, LlamaMLP, LlamaModel
 from .utils import (AutoWeightsLoader, extract_layer_index,
                     is_pp_missing_parameter)
 
@@ -247,7 +247,7 @@ class Llama4Attention(nn.Module):
         return output
 
 
-class Llama4DecoderLayer(LlamaDecoderLayer):
+class Llama4DecoderLayer(nn.Module):
 
     def __init__(
         self,
@@ -256,8 +256,9 @@ class Llama4DecoderLayer(LlamaDecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        super().__init__()
+
         self.layer_idx = extract_layer_index(prefix)
-        nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
         rope_theta = config.rope_theta
         rope_scaling = config.rope_scaling
@@ -329,7 +330,7 @@ class Llama4Model(LlamaModel):
                  *,
                  vllm_config: VllmConfig,
                  prefix: str = "",
-                 layer_type: Type[Llama4DecoderLayer] = Llama4DecoderLayer):
+                 layer_type: type[Llama4DecoderLayer] = Llama4DecoderLayer):
         self.num_experts = vllm_config.model_config.hf_config.num_local_experts
         super().__init__(vllm_config=vllm_config,
                          prefix=prefix,
@@ -476,15 +477,15 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         gen_config.update(vllm_config.model_config.override_generation_config)
         vllm_config.model_config.hf_config.attn_temperature_tuning \
             = gen_config.get("attn_temperature_tuning", False)
-        LlamaForCausalLM.__init__(self,
-                                  vllm_config=vllm_config,
-                                  prefix=prefix,
-                                  layer_type=Llama4DecoderLayer)
+
+        super().__init__(vllm_config=vllm_config,
+                         prefix=prefix,
+                         layer_type=Llama4DecoderLayer)
 
     def _init_model(self,
                     vllm_config: VllmConfig,
                     prefix: str = "",
-                    layer_type: Type[Llama4DecoderLayer] = Llama4DecoderLayer):
+                    layer_type: type[Llama4DecoderLayer] = Llama4DecoderLayer):
         return Llama4Model(vllm_config=vllm_config,
                            prefix=prefix,
                            layer_type=layer_type)
