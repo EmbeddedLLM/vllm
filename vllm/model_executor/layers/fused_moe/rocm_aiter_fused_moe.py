@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import torch
 
 import vllm.envs as envs
 from vllm.platforms import current_platform
+from vllm.utils import direct_register_custom_op
 
 
 def is_rocm_aiter_moe_enabled() -> bool:
@@ -18,19 +19,47 @@ def is_rocm_aiter_block_scaled_moe_enabled() -> bool:
         envs.VLLM_ROCM_USE_AITER_FP8_BLOCK_SCALED_MOE
 
 
+def rocm_aiter_ck_moe_wrapper(hidden_states: torch.Tensor, w1: torch.Tensor,
+                              w2: torch.Tensor, topk_weights: torch.Tensor,
+                              topk_ids: torch.Tensor) -> torch.Tensor:
+    import aiter as rocm_aiter
+    return rocm_aiter.ck_moe(hidden_states=hidden_states,
+                             w1=w1,
+                             w2=w2,
+                             topk_weights=topk_weights,
+                             topk_ids=topk_ids)
+
+
+def rocm_aiter_ck_moe_fake(hidden_states: torch.Tensor, w1: torch.Tensor,
+                           w2: torch.Tensor, topk_weights: torch.Tensor,
+                           topk_ids: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+# Register the custom op
+if current_platform.is_rocm():
+    direct_register_custom_op(
+        op_name="rocm_aiter_ck_moe",
+        op_func=rocm_aiter_ck_moe_wrapper,
+        mutates_args=[],
+        fake_impl=rocm_aiter_ck_moe_fake,
+        dispatch_key=current_platform.dispatch_key,
+    )
+
+
 def rocm_aiter_fused_experts(
-        *,
-        hidden_states: torch.Tensor,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        use_fp8_w8a8: bool = False,
-        w1_scale: Optional[torch.Tensor] = None,
-        w2_scale: Optional[torch.Tensor] = None,
-        block_shape: Optional[List[int]] = None,
-        expert_mask: Optional[torch.Tensor] = None,
-        **kwagrs  # Ignore additional keyword arguments
+    *,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    use_fp8_w8a8: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[List[int]] = None,
+    expert_mask: Optional[torch.Tensor] = None,
+    **kwagrs: dict[str, Any]  # Ignore additional keyword arguments
 ) -> torch.Tensor:
 
     import aiter as rocm_aiter
@@ -101,11 +130,14 @@ def rocm_aiter_fused_experts(
                                            fc2_smooth_scale=None,
                                            a16=False)
 
-    return rocm_aiter.ck_moe(hidden_states=hidden_states,
-                             w1=w1,
-                             w2=w2,
-                             topk_weights=topk_weights,
-                             topk_ids=topk_ids)
+    # Use the registered op instead of direct call
+    return torch.ops.vllm.rocm_aiter_ck_moe(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
 
 
 def rocm_aiter_topk_softmax(topk_weights: torch.Tensor,

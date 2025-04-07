@@ -460,7 +460,11 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
                             use_int8_w8a16: bool,
                             use_int4_w4a16: bool,
                             block_shape: Optional[List[int]] = None) -> None:
+
     assert topk_weights is not None or not mul_routed_weight
+    if topk_weights is not None:
+        # This is to handle the bug https://github.com/ROCm/pytorch/issues/2020
+        topk_weights = topk_weights.view(-1).reshape(topk_weights.shape)
     assert topk_weights is None or topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
