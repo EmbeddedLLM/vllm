@@ -462,9 +462,6 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
                             block_shape: Optional[List[int]] = None) -> None:
 
     assert topk_weights is not None or not mul_routed_weight
-    if topk_weights is not None:
-        # This is to handle the bug https://github.com/ROCm/pytorch/issues/2020
-        topk_weights = topk_weights.view(-1).reshape(topk_weights.shape)
     assert topk_weights is None or topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
@@ -1006,6 +1003,7 @@ direct_register_custom_op(
     op_func=inplace_fused_experts,
     mutates_args=["hidden_states"],
     fake_impl=inplace_fused_experts_fake,
+    tags=(torch.Tag.needs_fixed_stride_order),
 )
 
 
@@ -1064,6 +1062,7 @@ direct_register_custom_op(
     op_func=outplace_fused_experts,
     mutates_args=[],
     fake_impl=outplace_fused_experts_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
 
