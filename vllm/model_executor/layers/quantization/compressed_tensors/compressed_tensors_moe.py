@@ -220,6 +220,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 normalize_e4m3fn_to_e4m3fnuz(
                     layer.w2_weight, layer.w2_weight_scale,
                     layer.w2_input_scale)
+
             # Reset the parameter
             layer.w13_weight = torch.nn.Parameter(w13_weight,
                                                   requires_grad=False)
