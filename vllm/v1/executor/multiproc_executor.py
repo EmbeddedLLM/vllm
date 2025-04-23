@@ -151,7 +151,7 @@ class MultiprocExecutor(Executor):
 
     def collective_rpc(self,
                        method: Union[str, Callable],
-                       timeout: Optional[float] = 180.0,
+                       timeout: Optional[float] = 200.0,
                        args: tuple = (),
                        kwargs: Optional[dict] = None,
                        rank0_reply_only: bool = False) -> list[Any]:
