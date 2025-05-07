@@ -1404,6 +1404,8 @@ class EngineArgs:
                 from vllm.vllm_flash_attn.fa_utils import (
                     flash_attn_supports_fp8)
                 supported = flash_attn_supports_fp8()
+            if current_platform.is_rocm():
+                supported = True
             if not supported:
                 _raise_or_fallback(feature_name="--kv-cache-dtype",
                                    recommend_to_remove=False)
@@ -1527,11 +1529,11 @@ class EngineArgs:
             return False
 
         # Non-CUDA is supported on V1, but off by default for now.
-        not_cuda = not current_platform.is_cuda()
-        if not_cuda and _warn_or_fallback(  # noqa: SIM103
-                current_platform.device_name):
-            return False
-        #############################################################
+        # not_cuda = not current_platform.is_cuda()
+        # if not_cuda and _warn_or_fallback(  # noqa: SIM103
+        #         current_platform.device_name):
+        #     return False
+        ############################################################
 
         return True
 

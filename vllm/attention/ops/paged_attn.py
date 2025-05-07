@@ -192,23 +192,24 @@ class PagedAttention:
         return output
 
     @staticmethod
-    def forward_prefix(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache_dtype: str,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        block_tables: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        seq_lens_tensor: torch.Tensor,
-        max_query_len: int,
-        alibi_slopes: Optional[torch.Tensor],
-        sliding_window: Optional[int],
-        k_scale: torch.Tensor,
-        v_scale: torch.Tensor,
-    ) -> torch.Tensor:
-        output = torch.empty_like(query)
+    def forward_prefix(query: torch.Tensor,
+                       key: torch.Tensor,
+                       value: torch.Tensor,
+                       kv_cache_dtype: str,
+                       key_cache: torch.Tensor,
+                       value_cache: torch.Tensor,
+                       block_tables: torch.Tensor,
+                       query_start_loc: torch.Tensor,
+                       seq_lens_tensor: torch.Tensor,
+                       max_query_len: int,
+                       alibi_slopes: Optional[torch.Tensor],
+                       sliding_window: Optional[int],
+                       k_scale: torch.Tensor,
+                       v_scale: torch.Tensor,
+                       output: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if output is None:
+            output = torch.empty_like(query)
+
         max_seq_len = None
         context_attention_fwd(
             query,
