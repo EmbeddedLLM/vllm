@@ -15,6 +15,7 @@
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Callable, Optional
 
 import torch
@@ -24,6 +25,7 @@ from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.kv_transfer.kv_pipe.base import KVPipeBase
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
+from vllm.utils import current_stream
 
 logger = init_logger(__name__)
 
@@ -90,9 +92,11 @@ class PyNcclPipe(KVPipeBase):
         recv: Callable[[torch.Tensor, int], None]
         if self.device.type == "cuda":
             # use PyNCCL for send / recv
-            comm = PyNcclCommunicator(group, device=self.local_rank)
-            comm.disabled = False
-            send, recv = comm.send, comm.recv  # type: ignore
+            self.comm = PyNcclCommunicator(group, device=self.local_rank)
+            self.comm.disabled = False
+            self.stream = current_stream()
+            send = partial(self.comm.send, stream=self.stream)
+            recv = partial(self.comm.recv, stream=self.stream)
         else:
             # This send / recv implementation here is NOT intended to transfer
             # KV caches (and should NOT be repurposed to transfer KV caches).
@@ -104,6 +108,8 @@ class PyNcclPipe(KVPipeBase):
                 x[...] = group.recv_obj(src)
 
             recv = my_recv
+            self.comm = None
+            self.stream = None
 
         return send, recv
 
@@ -178,8 +184,11 @@ class PyNcclPipe(KVPipeBase):
         metadata = self._make_metadata(tensor)
         self._send_metadata(metadata)
         if tensor is not None:
-            self.device_send_func(tensor.to(self.device),
-                                  self.target_rank_for_send)
+            with torch.cuda.stream(self.stream):
+                self.device_send_func(tensor.to(self.device),
+                                      self.target_rank_for_send)
+            if self.stream is not None:
+                tensor.record_stream(self.stream)
 
     def _recv_impl(self) -> Optional[torch.Tensor]:
         """
@@ -193,7 +202,11 @@ class PyNcclPipe(KVPipeBase):
         if metadata["dtype"] is None:
             return None
         buffer = self._prepare_recv_buffer(metadata)
-        self.device_recv_func(buffer, self.target_rank_for_recv)
+
+        with torch.cuda.stream(self.stream):
+            self.device_recv_func(buffer, self.target_rank_for_recv)
+        if self.stream is not None:
+            buffer.record_stream(self.stream)
 
         return buffer
 
