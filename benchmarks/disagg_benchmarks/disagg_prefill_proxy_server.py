@@ -91,7 +91,6 @@ async def handle_request():
         if is_stream:
             response = await make_response(response_generator())
             response.timeout = None
-            print(f"Response headers: {response.headers}")
             response.headers["Content-Type"] = "text/event-stream"
             return response
         else:
