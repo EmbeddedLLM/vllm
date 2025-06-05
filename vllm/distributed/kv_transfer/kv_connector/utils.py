@@ -82,8 +82,10 @@ class model_aware_kv_ops_helper:
             ops.reshape_and_cache_flash(
                 keys.to(key_cache.device),
                 values.to(value_cache.device),
-                key_cache,
-                value_cache,
+                key_cache.reshape(key_cache.shape[0], -1, keys.shape[-2],
+                                  keys.shape[-1]),
+                value_cache.reshape(value_cache.shape[0], -1, values.shape[-2],
+                                    values.shape[-1]),
                 slot_mapping[start_pos:end_pos],
                 layer.self_attn.attn.kv_cache_dtype,
                 layer.self_attn.attn._k_scale,
