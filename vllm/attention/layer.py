@@ -306,9 +306,11 @@ class MultiHeadAttention(nn.Module):
                                         block_size=16,
                                         is_attention_free=False)
         backend = backend_name_to_enum(attn_backend.get_name())
+
         if current_platform.is_rocm():
-            # currently, only torch_sdpa is supported on rocm
-            self.attn_backend = _Backend.TORCH_SDPA
+            self.attn_backend = backend if backend in {
+                _Backend.TORCH_SDPA, _Backend.ROCM_AITER_FLASH_ATTN_VLLM_V1
+            } else _Backend.TORCH_SDPA
         else:
             if backend in {_Backend.FLASH_ATTN, _Backend.FLASH_ATTN_VLLM_V1}:
                 backend = _Backend.XFORMERS
@@ -358,6 +360,9 @@ class MultiHeadAttention(nn.Module):
             from torch_xla.experimental.custom_kernel import flash_attention
             out = flash_attention(query, key, value, sm_scale=self.scale)
             out = out.transpose(1, 2)
+        elif self.attn_backend == _Backend.ROCM_AITER_FLASH_ATTN_VLLM_V1:
+            from aiter import flash_attn_func
+            out = flash_attn_func(query, key, value, softmax_scale=self.scale)
 
         return out.reshape(bsz, q_len, -1)
 

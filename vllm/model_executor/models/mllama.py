@@ -945,7 +945,8 @@ class MllamaTextCrossAttention(nn.Module):
         if len(kv_cache.shape) > 1:
             i = torch.ones(1, dtype=torch.float32)
             if self.attn.backend in (_Backend.FLASH_ATTN,
-                                     _Backend.FLASH_ATTN_VLLM_V1):
+                                     _Backend.FLASH_ATTN_VLLM_V1,
+                                     _Backend.ROCM_AITER_FLASH_ATTN_VLLM_V1):
                 cached_k = torch.cat([k[s:e] for s, e in kv_range_for_decode])
                 cached_v = torch.cat([v[s:e] for s, e in kv_range_for_decode])
                 torch.ops._C_cache_ops.reshape_and_cache_flash(
@@ -973,6 +974,7 @@ class MllamaTextCrossAttention(nn.Module):
                     f"Unsupported Attention backend {self.attn.backend} "
                     "enum found. Expected the Attention backend to be "
                     "FLASH_ATTN, FLASH_ATTN_VLLM_V1, "
+                    "ROCM_AITER_FLASH_ATTN_VLLM_V1, "
                     "XFORMERS or TORCH_SDPA.")
 
         # We have to call torch.sdpa for prefill when using a

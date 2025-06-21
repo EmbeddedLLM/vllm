@@ -1314,10 +1314,12 @@ class EngineArgs:
         # No Fp8 KV cache so far.
         if self.kv_cache_dtype != "auto":
             fp8_attention = self.kv_cache_dtype.startswith("fp8")
-            will_use_fa = (
-                current_platform.is_cuda()
-                and not envs.is_set("VLLM_ATTENTION_BACKEND")
-            ) or envs.VLLM_ATTENTION_BACKEND == "FLASH_ATTN_VLLM_V1"
+            will_use_fa = (current_platform.is_cuda()
+                           and not envs.is_set("VLLM_ATTENTION_BACKEND")
+                           ) or envs.VLLM_ATTENTION_BACKEND in [
+                               "FLASH_ATTN_VLLM_V1",
+                               "ROCM_AITER_FLASH_ATTN_VLLM_V1"
+                           ]
             supported = False
             if current_platform.is_rocm():
                 supported = True
@@ -1401,6 +1403,7 @@ class EngineArgs:
 
         # No XFormers so far.
         V1_BACKENDS = [
+            "ROCM_AITER_FLASH_ATTN_VLLM_V1",
             "FLASH_ATTN_VLLM_V1",
             "FLASH_ATTN",
             "PALLAS",
