@@ -205,4 +205,4 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                              attn_metadata.decode.paged_kv_indices,
                              attn_metadata.decode.paged_kv_last_page_len)
 
-        return self._v_up_proj(o)
+        return self._v_up_proj_and_o_proj(o)
