@@ -2662,3 +2662,30 @@ def is_torch_equal_or_newer(target: str) -> bool:
     except Exception:
         # Fallback to PKG-INFO to load the package info, needed by the doc gen.
         return Version(importlib.metadata.version('torch')) >= Version(target)
+
+
+@cache
+def is_navi() -> bool:
+    from vllm.platforms import current_platform
+    if not current_platform.is_rocm() or not torch.cuda.is_available():
+        return False
+    # All (visible) GPUs must be of the same type,
+    # otherwise FP8 results can't be guaranteed.
+    archName = torch.cuda.get_device_properties('cuda').gcnArchName
+    return archName is not None and "gfx1" in archName
+
+
+@cache
+def is_rocm() -> bool:
+    from vllm.platforms import current_platform
+    return current_platform.is_rocm()
+
+
+@cache
+def aiter_enabled() -> bool:
+    return is_rocm() and envs.VLLM_ROCM_USE_AITER
+
+
+@cache
+def aiter_linear_enabled() -> bool:
+    return aiter_enabled() and envs.VLLM_ROCM_USE_AITER_LINEAR

@@ -61,7 +61,6 @@ def rocm_unquantized_gemm_wrapper():
     ON_MI300 = any(arch in GPU_ARCH for arch in ["gfx942"])
     use_aiter = (envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_LINEAR
                  and ON_MI300)
-    print(f"Using unquantized linear method for layer{use_aiter}")
 
     def inner_function(x: torch.Tensor,
                        weight: torch.Tensor,

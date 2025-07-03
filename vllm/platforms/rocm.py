@@ -121,6 +121,12 @@ def use_rocm_custom_paged_attention(qtype: torch.dtype, head_size: int,
             and envs.VLLM_ROCM_CUSTOM_PAGED_ATTN)
 
 
+@cache
+def on_gfx9() -> bool:
+    GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
+    return any(arch in GPU_ARCH for arch in ["gfx90a", "gfx942", "gfx950"])
+
+
 class RocmPlatform(Platform):
     _enum = PlatformEnum.ROCM
     device_name: str = "rocm"
