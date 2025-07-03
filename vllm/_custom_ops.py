@@ -36,6 +36,15 @@ else:
         from torch.library import impl_abstract as register_fake
 
 
+def wvSplitKQ(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype,
+              scale_a: torch.Tensor, scale_b: torch.Tensor,
+              cu_count: int) -> torch.Tensor:
+    out = torch.empty((b.shape[0], a.shape[0]),
+                      dtype=out_dtype,
+                      device=b.device)
+    torch.ops._rocm_C.wvSplitKQ(a, b, out, scale_a, scale_b, cu_count)
+    return out
+
 # page attention ops
 def paged_attention_v1(
     out: torch.Tensor,

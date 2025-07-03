@@ -13,6 +13,11 @@
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // vLLM custom ops for rocm
+  // wvSplitK for fp8
+  rocm_ops.def(
+    "wvSplitKQ(Tensor in_a, Tensor in_b, Tensor! out_c, Tensor scale_a, "
+    "          Tensor scale_b, int CuCount) -> ()");
+  rocm_ops.impl("wvSplitKQ", torch::kCUDA, &wvSplitKQ);
 
   // Custom attention op
   // Compute the attention between an input query and the cached

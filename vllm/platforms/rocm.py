@@ -158,6 +158,11 @@ class RocmPlatform(Platform):
         return "vllm.attention.backends.rocm_flash_attn.ROCmFlashAttentionBackend"  # noqa: E501
 
     @classmethod
+    def get_cu_count(cls, device_id: int = 0) -> int:
+        return torch.cuda.get_device_properties(
+            device_id).multi_processor_count
+
+    @classmethod
     @lru_cache(maxsize=8)
     def get_device_capability(cls,
                               device_id: int = 0
