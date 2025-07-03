@@ -2,13 +2,15 @@
 
 import itertools
 from abc import abstractmethod
-from typing import Any, Literal, Optional, Union
+from typing import Any, Callable, Literal, Optional, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+from vllm import _custom_ops as ops
+from vllm import envs
+from vllm._aiter_ops import aiter_ops
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               split_tensor_along_last_dim,
@@ -26,6 +28,7 @@ from vllm.model_executor.parameter import (BasevLLMParameter,
                                            RowvLLMParameter)
 # yapf: enable
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -48,6 +51,67 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "QuarkLinearMethod",
     "ModelOptNvFp4LinearMethod",
 ]
+
+
+def rocm_unquantized_gemm_wrapper():
+    """Creates a wrapper function with the signature (x, weight, bias)"""
+    # Get configuration from environment variables
+    use_skinny = envs.VLLM_ROCM_USE_SKINNY_GEMM
+    GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
+    ON_MI300 = any(arch in GPU_ARCH for arch in ["gfx942"])
+    use_aiter = (envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_LINEAR
+                 and ON_MI300)
+    print(f"Using unquantized linear method for layer{use_aiter}")
+
+    def inner_function(x: torch.Tensor,
+                       weight: torch.Tensor,
+                       bias: Optional[torch.Tensor] = None):
+        k = weight.shape[1]
+        _use_skinny = (use_skinny and \
+                        x.dtype in [torch.float16, torch.bfloat16] \
+                        and k % 8 == 0 and bias is None)
+
+        if _use_skinny is not True:
+            if use_aiter:
+                return aiter_ops.rocm_aiter_tuned_gemm(x, weight, bias)
+            return torch.nn.functional.linear(x, weight, bias)
+
+        x_view = x.view(-1, x.size(-1))
+        n = x_view.shape[0]
+        m = weight.shape[0]
+        cu_count = current_platform.get_cu_count()
+
+        if m > 8 and 0 < n <= 4:
+            out = ops.wvSplitK(weight, x_view, cu_count)
+            return out.view(*x.shape[:-1], weight.shape[0])
+        elif m % 4 == 0 and n == 1 and k <= 8192:
+            out = ops.LLMM1(weight, x_view, 4)
+            return out.view(*x.shape[:-1], weight.shape[0])
+
+        if use_aiter:
+            return aiter_ops.rocm_aiter_tuned_gemm(x, weight, bias)
+
+        return torch.nn.functional.linear(x, weight, bias)
+
+    return inner_function
+
+
+def dispatch_unquantized_gemm() -> Callable[
+    [torch.Tensor, torch.Tensor, Optional[torch.Tensor]], torch.Tensor]:
+    """
+    Dispatcher function that returns a function with signature (x, weight, bias)
+    based on the current platform and environment variables.
+    """
+    if current_platform.is_rocm():
+        return rocm_unquantized_gemm_wrapper()
+
+    # Return a simple wrapper around linear to maintain the same signature
+    def linear_wrapper(x: torch.Tensor,
+                       weight: torch.Tensor,
+                       bias: Optional[torch.Tensor] = None):
+        return torch.nn.functional.linear(x, weight, bias)
+
+    return linear_wrapper
 
 
 def adjust_marlin_shard(param, shard_size, shard_offset):
@@ -170,6 +234,10 @@ class LinearMethodBase(QuantizeMethodBase):
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
+    def __init__(self):
+        super().__init__()
+        self._gemm_func = dispatch_unquantized_gemm()
+
     def create_weights(self, layer: torch.nn.Module,
                        input_size_per_partition: int,
                        output_partition_sizes: list[int], input_size: int,
@@ -187,8 +255,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-
-        return F.linear(x, layer.weight, bias)
+        return self._gemm_func(x, layer.weight, bias)
 
 
 class LinearBase(torch.nn.Module):

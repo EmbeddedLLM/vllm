@@ -46,6 +46,10 @@ def wvSplitKQ(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype,
     return out
 
 
+def wvSplitK(a: torch.Tensor, b: torch.Tensor, cu_count: int) -> torch.Tensor:
+    return torch.ops._rocm_C.wvSplitK(a, b, cu_count)
+
+
 # page attention ops
 def paged_attention_v1(
     out: torch.Tensor,
