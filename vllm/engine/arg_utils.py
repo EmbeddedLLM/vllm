@@ -1368,7 +1368,8 @@ class EngineArgs:
         #############################################################
         # Unsupported Feature Flags on V1.
 
-        if self.load_format == LoadFormat.SHARDED_STATE.value:
+        if (self.load_format == LoadFormat.TENSORIZER.value
+                or self.load_format == LoadFormat.SHARDED_STATE.value):
             _raise_or_fallback(
                 feature_name=f"--load_format {self.load_format}",
                 recommend_to_remove=False)
@@ -1469,6 +1470,12 @@ class EngineArgs:
             _raise_or_fallback(
                 feature_name=f"--quantization {model_config.quantization}",
                 recommend_to_remove=False)
+            return False
+
+        # No Embedding Models so far.
+        if model_config.task not in ["generate"]:
+            _raise_or_fallback(feature_name=f"--task {model_config.task}",
+                               recommend_to_remove=False)
             return False
 
         # No Mamba or Encoder-Decoder so far.
