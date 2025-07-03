@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_CUSTOM_PAGED_ATTN: bool = True
+    VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
@@ -546,13 +547,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: (os.getenv("VLLM_ROCM_USE_AITER_MOE", "True").lower() in
              ("true", "1")),
 
-
     # Whether to use aiter asm moe ops.
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_ASMMOE":
     lambda: (os.getenv("VLLM_ROCM_USE_AITER_ASMMOE", "False").lower() in
              ("true", "1")),
-
 
     # use aiter rms norm op if aiter ops are enabled.
     "VLLM_ROCM_USE_AITER_RMSNORM":
@@ -570,6 +569,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # custom paged attention kernel for MI3* cards
     "VLLM_ROCM_CUSTOM_PAGED_ATTN":
     lambda: (os.getenv("VLLM_ROCM_CUSTOM_PAGED_ATTN", "True").lower() in
+             ("true", "1")),
+
+    # Use skinny gemm for FP8 kernels
+    "VLLM_ROCM_USE_SKINNY_GEMM":
+    lambda: (os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in
              ("true", "1")),
 
     # Divisor for dynamic query scale factor calculation for FP8 KV Cache
