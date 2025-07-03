@@ -581,9 +581,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.rocm_aiter_use_asm = (self.rocm_aiter_moe_enabled
                                    and envs.VLLM_ROCM_USE_AITER_ASMMOE)
 
-        print(f"rocm_aiter_moe_enabled: {self.rocm_aiter_moe_enabled}")
-        print(f"rocm_aiter_use_asm: {self.rocm_aiter_use_asm}")
-
         # TODO (rob): refactor block quant into separate class.
         if self.block_quant:
             assert self.quant_config.activation_scheme == "dynamic"

@@ -38,7 +38,7 @@ logger = init_logger(__name__)
 POLLING_TIMEOUT_MS = 5000
 POLLING_TIMEOUT_S = POLLING_TIMEOUT_MS // 1000
 
-EXECUTE_MODEL_TIMEOUT_S = 30
+EXECUTE_MODEL_TIMEOUT_S = 300
 
 
 class MultiprocExecutor(Executor):
@@ -151,7 +151,7 @@ class MultiprocExecutor(Executor):
 
     def collective_rpc(self,
                        method: Union[str, Callable],
-                       timeout: Optional[float] = 180.0,
+                       timeout: Optional[float] = None,
                        args: tuple = (),
                        kwargs: Optional[dict] = None,
                        rank0_reply_only: bool = False) -> list[Any]:
