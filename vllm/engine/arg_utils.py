@@ -548,7 +548,7 @@ class EngineArgs:
         parser.add_argument('--block-size',
                             type=int,
                             default=EngineArgs.block_size,
-                            choices=[8, 16, 32, 64, 128],
+                            choices=[1, 8, 16, 32, 64, 128],
                             help='Token block size for contiguous chunks of '
                             'tokens. This is ignored on neuron devices and '
                             'set to ``--max-model-len``. On CUDA devices, '
@@ -1368,8 +1368,7 @@ class EngineArgs:
         #############################################################
         # Unsupported Feature Flags on V1.
 
-        if (self.load_format == LoadFormat.TENSORIZER.value
-                or self.load_format == LoadFormat.SHARDED_STATE.value):
+        if self.load_format == LoadFormat.SHARDED_STATE.value:
             _raise_or_fallback(
                 feature_name=f"--load_format {self.load_format}",
                 recommend_to_remove=False)
@@ -1472,12 +1471,6 @@ class EngineArgs:
                 recommend_to_remove=False)
             return False
 
-        # No Embedding Models so far.
-        if model_config.task not in ["generate"]:
-            _raise_or_fallback(feature_name=f"--task {model_config.task}",
-                               recommend_to_remove=False)
-            return False
-
         # No Mamba or Encoder-Decoder so far.
         if not model_config.is_v1_compatible:
             _raise_or_fallback(feature_name=model_config.architectures,
@@ -1522,8 +1515,14 @@ class EngineArgs:
 
         # No FlashInfer or XFormers so far.
         V1_BACKENDS = [
-            "FLASH_ATTN_VLLM_V1", "FLASH_ATTN", "PALLAS", "PALLAS_VLLM_V1",
-            "TRITON_ATTN_VLLM_V1", "TRITON_MLA", "FLASHMLA"
+            "FLASH_ATTN_VLLM_V1",
+            "FLASH_ATTN",
+            "PALLAS",
+            "PALLAS_VLLM_V1",
+            "TRITON_ATTN_VLLM_V1",
+            "TRITON_MLA",
+            "FLASHMLA",
+            "ROCM_AITER_MLA",
         ]
         if (envs.is_set("VLLM_ATTENTION_BACKEND")
                 and envs.VLLM_ATTENTION_BACKEND not in V1_BACKENDS):
