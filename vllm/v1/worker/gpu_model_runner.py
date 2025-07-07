@@ -1486,7 +1486,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_actual_tokens=num_tokens,
                 max_query_len=num_tokens,
             )
-            self.attn_metadata_builder.build_for_cuda_graph_capture(
+            self.attn_metadata_builder.build_for_cudagraph_capture(
                 common_attn_metadata, )
 
         with self.maybe_dummy_run_with_lora(self.lora_config,
