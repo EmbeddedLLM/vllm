@@ -344,3 +344,7 @@ class RocmPlatform(Platform):
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         supported_archs = ['gfx94']
         return any(gfx in gcn_arch for gfx in supported_archs)
+
+    @classmethod
+    def get_piecewise_backend_cls(cls) -> str:
+        return "vllm.compilation.cuda_piecewise_backend.CUDAPiecewiseBackend"  # noqa

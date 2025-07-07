@@ -4,7 +4,7 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -39,11 +39,19 @@ class ForwardContext:
     # copy from vllm_config.compilation_config.static_forward_context
     no_compile_layers: dict[str, Any]
     # TODO: extend to support per-layer dynamic forward context
-    attn_metadata: "AttentionMetadata"  # set dynamically for each forward pass
-    # TODO: remove after making all virtual_engines share the same kv cache
+    """
+    Type AttentionMetadata for v0, 
+    Type Dict[str, AttentionMetadata] for v1, map from layer_name of each 
+    attention layer to its attention metadata
+    set dynamically for each forward pass
+    """
+    attn_metadata: Union["AttentionMetadata", dict[
+        str,
+        "AttentionMetadata"]]  # TODO: remove after making all virtual_engines share the same kv cache
     virtual_engine: int  # set dynamically for each forward pass
     # set dynamically for each forward pass
     dp_metadata: Optional[DPMetadata] = None
+    skip_cuda_graphs: bool = False
 
 
 _forward_context: Optional[ForwardContext] = None
@@ -58,10 +66,13 @@ def get_forward_context() -> ForwardContext:
 
 
 @contextmanager
-def set_forward_context(attn_metadata: Any,
-                        vllm_config: VllmConfig,
-                        virtual_engine: int = 0,
-                        num_tokens: int = 0):
+def set_forward_context(
+    attn_metadata: Any,
+    vllm_config: VllmConfig,
+    virtual_engine: int = 0,
+    num_tokens: Optional[int] = None,
+    skip_cuda_graphs: bool = False,
+):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
     Here we can inject common logic for every model forward pass.
@@ -101,7 +112,8 @@ def set_forward_context(attn_metadata: Any,
         static_forward_context,
         virtual_engine=virtual_engine,
         attn_metadata=attn_metadata,
-        dp_metadata=dp_metadata)
+        dp_metadata=dp_metadata,
+        skip_cuda_graphs=skip_cuda_graphs)
 
     # KVConnector: trigger (possibly async) load before forward.
     # Each attn layer will block until the reading is complete.
