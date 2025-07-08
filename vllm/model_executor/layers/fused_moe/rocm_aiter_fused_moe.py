@@ -119,14 +119,15 @@ def rocm_aiter_biased_grouped_topk_impl(
         num_expert_group: int,
         topk_group: int,
         need_renorm: bool,
-        routed_scaling_factor: float = 1.0  # mul to topk_weights
+        routed_scaling_factor: float = 1.0,  # mul to topk_weights
+        num_fused_shared_experts: int = 0
 ) -> None:
 
     from aiter import biased_grouped_topk
 
     biased_grouped_topk(gating_output, correction_bias, topk_weights, topk_ids,
                         num_expert_group, topk_group, need_renorm,
-                        routed_scaling_factor)
+                        routed_scaling_factor, num_fused_shared_experts)
 
 
 def rocm_aiter_biased_grouped_topk_fake(
@@ -137,7 +138,8 @@ def rocm_aiter_biased_grouped_topk_fake(
         num_expert_group: int,
         topk_group: int,
         need_renorm: bool,
-        routed_scaling_factor: float = 1.0  # mul to topk_weights
+        routed_scaling_factor: float = 1.0,  # mul to topk_weights
+        num_fused_shared_experts: int = 0
 ) -> None:
     pass
 
@@ -150,13 +152,14 @@ def rocm_aiter_grouped_topk_impl(
         topk_group: int,
         need_renorm: bool,
         scoring_func: str = "softmax",
-        routed_scaling_factor: float = 1.0  # mul to topk_weights
+        routed_scaling_factor: float = 1.0,  # mul to topk_weights
+        num_fused_shared_experts: int = 0
 ) -> None:
 
     from aiter import grouped_topk
 
     grouped_topk(gating_output, topk_weights, topk_ids, num_expert_group,
-                 topk_group, need_renorm, scoring_func, routed_scaling_factor)
+                 topk_group, need_renorm, scoring_func, routed_scaling_factor, num_fused_shared_experts)
 
 
 def rocm_aiter_grouped_topk_fake(
@@ -167,7 +170,8 @@ def rocm_aiter_grouped_topk_fake(
         topk_group: int,
         need_renorm: bool,
         scoring_func: str = "softmax",
-        routed_scaling_factor: float = 1.0  # mul to topk_weights
+        routed_scaling_factor: float = 1.0,  # mul to topk_weights
+        num_fused_shared_experts: int = 0,
 ) -> None:
     pass
 
@@ -267,7 +271,9 @@ def rocm_aiter_grouped_topk(
     num_expert_group: int = 0,
     topk_group: int = 0,
     scoring_func: str = "softmax",
-    e_score_correction_bias: Optional[torch.Tensor] = None
+    e_score_correction_bias: Optional[torch.Tensor] = None,
+    routed_scaling_factor: float = 1.,
+    num_fused_shared_experts: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     token = hidden_states.shape[0]
     device = hidden_states.device
@@ -296,6 +302,8 @@ def rocm_aiter_grouped_topk(
             topk_group,
             renormalize,
             scoring_func,
+            routed_scaling_factor,
+            num_fused_shared_experts,
         )
 
     return topk_weights, topk_ids

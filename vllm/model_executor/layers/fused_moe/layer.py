@@ -646,6 +646,8 @@ class FusedMoE(torch.nn.Module):
         activation: str = "silu",
         enable_eplb: bool = False,
         num_redundant_experts: int = 0,
+        routed_scaling_factor: float = 1.,
+        num_fused_shared_experts: int = 0,
     ):
         super().__init__()
         if params_dtype is None:
@@ -711,6 +713,8 @@ class FusedMoE(torch.nn.Module):
         self.scoring_func = scoring_func
         self.e_score_correction_bias = e_score_correction_bias
         self.apply_router_weight_on_input = apply_router_weight_on_input
+        self.routed_scaling_factor = routed_scaling_factor
+        self.num_fused_shared_experts = num_fused_shared_experts
         self.activation = activation
 
         if self.scoring_func != "softmax" and not self.use_grouped_topk:
@@ -1225,6 +1229,8 @@ class FusedMoE(torch.nn.Module):
         expert_load_view: Optional[torch.Tensor] = None,
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
+        routed_scaling_factor: float = 1.,
+        num_fused_shared_experts: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Route the input hidden states to the top-k experts based on the
@@ -1252,7 +1258,9 @@ class FusedMoE(torch.nn.Module):
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
                 scoring_func=scoring_func,
-                e_score_correction_bias=e_score_correction_bias)
+                e_score_correction_bias=e_score_correction_bias,
+                routed_scaling_factor=routed_scaling_factor,
+                num_fused_shared_experts=num_fused_shared_experts)
             if indices_type is not None:
                 topk_ids = topk_ids.to(dtype=indices_type)
         elif custom_routing_function is None:
@@ -1431,6 +1439,8 @@ class FusedMoE(torch.nn.Module):
                 expert_load_view=self.expert_load_view,
                 logical_to_physical_map=self.logical_to_physical_map,
                 logical_replica_count=self.logical_replica_count,
+                routed_scaling_factor=self.routed_scaling_factor,
+                num_fused_shared_experts=self.num_fused_shared_experts,
             )
 
             if not skip_result_store:
@@ -1492,6 +1502,8 @@ class FusedMoE(torch.nn.Module):
             expert_load_view=self.expert_load_view,
             logical_to_physical_map=self.logical_to_physical_map,
             logical_replica_count=self.logical_replica_count,
+            routed_scaling_factor=self.routed_scaling_factor,
+            num_fused_shared_experts=self.num_fused_shared_experts,
         )
 
         if do_naive_dispatch_combine:

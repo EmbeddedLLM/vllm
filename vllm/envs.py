@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_CUSTOM_PAGED_ATTN: bool = True
+    VLLM_ENABLE_SHARED_EXPERTS_FUSION: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
@@ -724,6 +725,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB":
     lambda: maybe_convert_int(
         os.environ.get("VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", None)),
+
+    # enable shared experts fusion
+    "VLLM_ENABLE_SHARED_EXPERTS_FUSION":
+    lambda: (os.getenv("VLLM_ENABLE_SHARED_EXPERTS_FUSION", "False").lower() in
+             ("true", "1")),
 
     # Divisor for dynamic query scale factor calculation for FP8 KV Cache
     "Q_SCALE_CONSTANT":

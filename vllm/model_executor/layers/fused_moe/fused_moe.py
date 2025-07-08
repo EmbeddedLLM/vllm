@@ -924,7 +924,9 @@ def grouped_topk(
     num_expert_group: int = 0,
     topk_group: int = 0,
     scoring_func: str = "softmax",
-    e_score_correction_bias: Optional[torch.Tensor] = None
+    e_score_correction_bias: Optional[torch.Tensor] = None,
+    routed_scaling_factor: float = 1.,
+    num_fused_shared_experts: int = 0
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
     assert hidden_states.size(0) == gating_output.size(0), (
@@ -937,7 +939,8 @@ def grouped_topk(
     else:
         raise ValueError(f"Unsupported scoring function: {scoring_func}")
 
-    num_token = scores.size(0)
+    num_token = scores.shape[0]
+    num_experts = scores.shape[1]
     if e_score_correction_bias is not None:
         # Store original scores before applying correction bias. We use biased
         # scores for expert selection but original scores for routing weights
@@ -967,9 +970,23 @@ def grouped_topk(
                                             k=topk,
                                             dim=-1,
                                             sorted=False)
+    if num_fused_shared_experts:
+        topk_ids[:, -1] = torch.randint(
+            low=num_experts,
+            high=num_experts + num_fused_shared_experts,
+            size=(topk_ids.size(0),),
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
 
     if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights_sum = (
+            topk_weights.sum(dim=-1, keepdim=True)
+            if num_fused_shared_experts == 0
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+        )
+        topk_weights = topk_weights / topk_weights_sum
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
