@@ -12,7 +12,19 @@
 // https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#annotations
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
+  // Custom gemm op for skinny matrix-matrix multiplication
+  rocm_ops.def(
+      "wvSplitK(Tensor in_a, Tensor in_b, int CuCount) -> "
+      "Tensor");
+
+  rocm_ops.impl("wvSplitK", torch::kCUDA, &wvSplitK);
+
   // vLLM custom ops for rocm
+  // wvSplitK for fp8
+  rocm_ops.def(
+      "wvSplitKQ(Tensor in_a, Tensor in_b, Tensor! out_c, Tensor scale_a, "
+      "          Tensor scale_b, int CuCount) -> ()");
+  rocm_ops.impl("wvSplitKQ", torch::kCUDA, &wvSplitKQ);
 
   // Custom attention op
   // Compute the attention between an input query and the cached

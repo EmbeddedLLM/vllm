@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from functools import cache
 from typing import List, Optional, Tuple, Union
 
 import torch
 
 from vllm import _custom_ops as ops
+from vllm import envs
+from vllm._aiter_ops import aiter_ops
 from vllm.config import CompilationLevel, get_current_vllm_config
 from vllm.platforms import current_platform
 
@@ -18,6 +21,58 @@ TORCH_DEVICE_IDENTITY = None
 # are time consuming.
 USE_ROWWISE_TORCH_SCALED_MM = (current_platform.is_rocm()
                                and current_platform.has_device_capability(94))
+
+
+@cache
+def on_mi3xx() -> bool:
+    GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
+    return any(arch in GPU_ARCH for arch in ["gfx942", "gfx950"])
+
+
+@cache
+def use_skinny_gemm() -> bool:
+    return envs.VLLM_ROCM_USE_SKINNY_GEMM
+
+
+def rocm_aiter_per_tensor_w8a8_scaled_mm(qinput: torch.Tensor,
+                                         weight: torch.Tensor,
+                                         out_dtype: torch.dtype,
+                                         scale_a: torch.Tensor,
+                                         scale_b: torch.Tensor,
+                                         bias: torch.Tensor,
+                                         input_2d: torch.Tensor,
+                                         output_shape: list) -> torch.Tensor:
+
+    output = aiter_ops.rocm_aiter_tuned_gemm(qinput,
+                                             weight.t(),
+                                             out_dtype=out_dtype,
+                                             scale_a=scale_a,
+                                             scale_b=scale_b,
+                                             bias=bias)
+
+    return torch.narrow(output, 0, 0, input_2d.shape[0]).view(*output_shape)
+
+
+def rocm_per_tensor_w8a8_scaled_mm(qinput: torch.Tensor, weight: torch.Tensor,
+                                   out_dtype: torch.dtype,
+                                   scale_a: torch.Tensor,
+                                   scale_b: torch.Tensor, bias: torch.Tensor,
+                                   input_2d: torch.Tensor,
+                                   output_shape: list) -> torch.Tensor:
+
+    if use_skinny_gemm() and on_mi3xx(
+    ) and qinput.shape[0] == 1 and qinput.shape[1] % 16 == 0:
+        output = ops.wvSplitKQ(weight.t(), qinput, out_dtype, scale_a, scale_b,
+                               current_platform.get_cu_count())
+    else:
+        output = torch._scaled_mm(qinput,
+                                  weight,
+                                  out_dtype=out_dtype,
+                                  scale_a=scale_a,
+                                  scale_b=scale_b,
+                                  bias=bias)
+
+    return torch.narrow(output, 0, 0, input_2d.shape[0]).view(*output_shape)
 
 
 def sparse_cutlass_supported() -> bool:
@@ -158,6 +213,10 @@ class Fp8LinearOp:
             pad_output = config.level < CompilationLevel.PIECEWISE
         self.output_padding = 17 if pad_output else None
 
+        self.use_aiter_and_is_supported = (envs.VLLM_ROCM_USE_AITER
+                                           and envs.VLLM_ROCM_USE_AITER_LINEAR
+                                           and current_platform.is_fp8_fnuz())
+
     def apply(
         self,
         input: torch.Tensor,
@@ -218,10 +277,23 @@ class Fp8LinearOp:
             else:
                 qinput, x_scale = input_2d, input_scale
 
-            per_tensor_weights = (weight_scale.numel() == 1)
-            per_tensor_activations = (x_scale.numel() == 1)
+            per_tensor_weights = (weight_scale.numel()
+                                  == 1) and weight_scale.dim() < 2
+            per_tensor_activations = (x_scale.numel()
+                                      == 1) and x_scale.dim() < 2
 
             if per_tensor_weights and per_tensor_activations:
+                if current_platform.is_rocm():
+                    if self.use_aiter_and_is_supported:
+                        print("Using ROCm AITER for per-tensor W8A8 scaled mm")
+                        return rocm_aiter_per_tensor_w8a8_scaled_mm(
+                            qinput, weight, out_dtype, x_scale, weight_scale,
+                            bias, input_2d, output_shape)
+
+                    return rocm_per_tensor_w8a8_scaled_mm(
+                        qinput, weight, out_dtype, x_scale, weight_scale, bias,
+                        input_2d, output_shape)
+
                 # Fused GEMM_DQ
                 output = torch._scaled_mm(qinput,
                                           weight,

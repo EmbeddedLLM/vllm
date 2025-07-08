@@ -13,3 +13,9 @@ void paged_attention(torch::Tensor& out, torch::Tensor& exp_sums,
                      const std::optional<torch::Tensor>& alibi_slopes,
                      const std::string& kv_cache_dtype, torch::Tensor& k_scale,
                      torch::Tensor& v_scale);
+
+void wvSplitKQ(at::Tensor& in_a, at::Tensor& in_b, at::Tensor& out_c,
+               at::Tensor& scale_a, at::Tensor& scale_b, const int64_t CuCount);
+
+torch::Tensor wvSplitK(at::Tensor& in_a, at::Tensor& in_b,
+                       const int64_t CuCount);

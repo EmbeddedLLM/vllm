@@ -121,6 +121,12 @@ def use_rocm_custom_paged_attention(qtype: torch.dtype, head_size: int,
             and envs.VLLM_ROCM_CUSTOM_PAGED_ATTN)
 
 
+@cache
+def on_gfx9() -> bool:
+    GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
+    return any(arch in GPU_ARCH for arch in ["gfx90a", "gfx942", "gfx950"])
+
+
 class RocmPlatform(Platform):
     _enum = PlatformEnum.ROCM
     device_name: str = "rocm"
@@ -140,8 +146,40 @@ class RocmPlatform(Platform):
                              kv_cache_dtype, block_size, use_v1,
                              use_mla) -> str:
         if use_mla:
-            logger.info("Using Triton MLA backend.")
-            return "vllm.attention.backends.triton_mla.TritonMLABackend"
+            from vllm.attention.backends.rocm_aiter_mla import (
+                is_aiter_mla_enabled)
+
+            if selected_backend is None:
+                selected_backend = (_Backend.ROCM_AITER_MLA if
+                                    is_aiter_mla_enabled() or block_size == 1
+                                    else _Backend.TRITON_MLA)
+
+            if selected_backend == _Backend.TRITON_MLA:
+                if block_size != 1:
+                    logger.info("Using Triton MLA backend.")
+                    return "vllm.attention.backends.triton_mla.TritonMLABackend"  # noqa: E501
+                else:
+                    raise ValueError(
+                        f" The selected backend, {selected_backend.name},"
+                        f"does not support block size {block_size}.")
+            elif selected_backend == _Backend.ROCM_AITER_MLA \
+                or selected_backend == _Backend.ROCM_AITER_MLA_VLLM_V1:
+                if block_size == 1:
+                    if use_v1:
+                        logger.info("Using AITER MLA backend on V1 engine.")
+                        return "vllm.v1.attention.backends.mla.rocm_aiter_mla.AiterMLABackend"  # noqa: E501
+                    else:
+                        raise ValueError(
+                            "AITER MLA backend is not ported on V0 engine.")
+                else:
+                    raise ValueError(
+                        f" The selected backend, {selected_backend.name},"
+                        f"does not support block size {block_size}."
+                        "(currently only supports block size 1)")
+            else:
+                raise ValueError(
+                    f" The selected backend, {selected_backend.name},"
+                    f"is not MLA type while requested for MLA backend.")
         selected_backend = (_Backend.ROCM_FLASH if selected_backend
                             == _Backend.FLASH_ATTN else selected_backend)
         if envs.VLLM_USE_V1:
@@ -156,6 +194,11 @@ class RocmPlatform(Platform):
             logger.info("%s is not supported in AMD GPUs.", selected_backend)
         logger.info("Using ROCmFlashAttention backend.")
         return "vllm.attention.backends.rocm_flash_attn.ROCmFlashAttentionBackend"  # noqa: E501
+
+    @classmethod
+    def get_cu_count(cls, device_id: int = 0) -> int:
+        return torch.cuda.get_device_properties(
+            device_id).multi_processor_count
 
     @classmethod
     @lru_cache(maxsize=8)
