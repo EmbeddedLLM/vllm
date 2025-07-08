@@ -14,7 +14,7 @@ class CompilationCounter:
     # not including the splitting ops
     num_piecewise_capturable_graphs_seen: int = 0
     num_backend_compilations: int = 0
-    num_cudagraph_caputured: int = 0
+    num_cudagraph_captured: int = 0
 
     def clone(self) -> "CompilationCounter":
         return copy.deepcopy(self)
