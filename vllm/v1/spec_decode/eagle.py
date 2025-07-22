@@ -263,7 +263,8 @@ class EagleProposer:
         common_attn_metadata: CommonAttentionMetadata,
     ) -> torch.Tensor:
         num_tokens = target_token_ids.shape[0]
-        num_draft_tokens = common_attn_metadata.max_query_len - draft_token_ids
+        num_draft_tokens = (common_attn_metadata.max_query_len -
+                            self.num_speculative_tokens)
         batch_size = next_token_ids.shape[0]
         last_token_indices = common_attn_metadata.query_start_loc[
             1:] - num_draft_tokens
