@@ -5,10 +5,12 @@
 
 #include "cumem_allocator_compat.h"
 
+#undef USE_ROCM
+
 #ifndef USE_ROCM
 static const char* PYARGS_PARSE = "KKKK";
 #else
-  #define MEMCREATE_CHUNK_SIZE (2 * 1024 * 1024)
+  #define MEMCREATE_CHUNK_SIZE (512 * 1024 * 1024)
   #define MIN(a, b) (a < b ? a : b)
 
 static const char* PYARGS_PARSE = "KKKO";
