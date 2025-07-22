@@ -15,6 +15,7 @@ from vllm.model_executor.models import supports_multimodal
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.utils import is_pin_memory_available
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
+from vllm.v1.attention.backends.mla.rocm_aiter_mla import is_aiter_mla_enabled
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -75,6 +76,8 @@ class EagleProposer:
                                    1,
                                    device=device,
                                    dtype=torch.int32)
+        self.is_rocm_aiter_mla_backend_running = (self.method == "deepseek_mtp"
+                                                  and is_aiter_mla_enabled())
 
     def propose(
         self,
@@ -89,6 +92,13 @@ class EagleProposer:
         common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
+        if self.is_rocm_aiter_mla_backend_running:
+            return self.propose_deepseek_mtp_aiter_mla(target_token_ids,
+                                                       target_positions,
+                                                       target_hidden_states,
+                                                       next_token_ids,
+                                                       common_attn_metadata)
+
         num_tokens = target_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
         last_token_indices = common_attn_metadata.query_start_loc[1:] - 1
@@ -239,6 +249,70 @@ class EagleProposer:
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         return draft_token_ids
+
+    def propose_deepseek_mtp_aiter_mla(
+        self,
+        # [num_tokens]
+        target_token_ids: torch.Tensor,
+        # [num_tokens]
+        target_positions: torch.Tensor,
+        # [num_tokens, hidden_size]
+        target_hidden_states: torch.Tensor,
+        # [batch_size]
+        next_token_ids: torch.Tensor,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> torch.Tensor:
+        num_tokens = target_token_ids.shape[0]
+        num_draft_tokens = common_attn_metadata.max_query_len - draft_token_ids
+        batch_size = next_token_ids.shape[0]
+        last_token_indices = common_attn_metadata.query_start_loc[
+            1:] - num_draft_tokens
+
+        # Shift the input ids by n draft token.
+        # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
+        self.input_ids[:num_tokens -
+                       num_draft_tokens] = target_token_ids[num_draft_tokens:]
+        # Replace the last token with the next token.
+        # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
+        self.input_ids[last_token_indices] = next_token_ids
+
+        assert self.runner is not None
+
+        # FIXME: need to consider multiple kv_cache_groups
+        attn_metadata = self.runner.attn_metadata_builders[0].build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+            fast_build=True,
+        )
+
+        # At this moment, we assume all eagle layers belong to the same KV
+        # cache group, thus using the same attention metadata.
+        per_layer_attn_metadata = {}
+        for layer_name in self.attn_layer_names:
+            per_layer_attn_metadata[layer_name] = attn_metadata
+        if self.use_cuda_graph and \
+            num_tokens <= self.cudagraph_batch_sizes[-1]:
+            num_input_tokens = self.vllm_config.pad_for_cudagraph(num_tokens)
+        else:
+            num_input_tokens = num_tokens
+        # copy inputs to buffer for cudagraph
+        self.positions[:num_tokens] = target_positions
+        self.hidden_states[:num_tokens] = target_hidden_states
+
+        with set_forward_context(per_layer_attn_metadata,
+                                 self.vllm_config,
+                                 num_tokens=num_input_tokens):
+            last_hidden_states = self.model(
+                self.input_ids[:num_input_tokens],
+                self.positions[:num_input_tokens],
+                self.hidden_states[:num_input_tokens],
+            )
+
+        sample_hidden_states = last_hidden_states[last_token_indices]
+        logits = self.model.compute_logits(sample_hidden_states, None)
+        draft_token_ids = logits.argmax(dim=-1)
+
+        return draft_token_ids.view(batch_size, num_draft_tokens)
 
     def prepare_inputs(
         self,

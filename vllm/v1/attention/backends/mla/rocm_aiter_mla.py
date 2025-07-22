@@ -9,6 +9,7 @@ import torch
 import vllm.envs as envs
 from vllm.attention.ops.rocm_aiter_mla import aiter_mla_decode_fwd
 from vllm.config import VllmConfig
+from vllm.platforms import current_platform
 from vllm.utils import cdiv
 # yapf conflicts with isort for this docstring
 # yapf: disable
@@ -24,7 +25,8 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 def is_aiter_mla_enabled() -> bool:
     return envs.VLLM_ROCM_USE_AITER \
-        and envs.VLLM_ROCM_USE_AITER_MLA
+        and envs.VLLM_ROCM_USE_AITER_MLA \
+        and current_platform.is_rocm()
 
 
 class AiterMLABackend(MLACommonBackend):
@@ -57,6 +59,8 @@ class AiterMLADecodeMetadata(MLACommonDecodeMetadata):
     paged_kv_last_page_len: Optional[torch.Tensor] = None
     # The query indptr, shape : [num_decode + 1]
     qo_indptr: Optional[torch.Tensor] = None
+    # max_seqlen_qo must be 1 except for MTP
+    max_seqlen_qo: int = 1
 
 
 class AiterMLAMetadata(MLACommonMetadata[AiterMLADecodeMetadata]):
@@ -72,11 +76,15 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         assert self.kv_cache_spec.block_size == 1, "AITER MLA" \
             "only supports block size 1."
 
+        self.decode_threshold = 4
+
         self.compilation_config = vllm_config.compilation_config
         max_num_pages_per_req = cdiv(vllm_config.model_config.max_model_len,
                                      self.kv_cache_spec.block_size)
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         max_num_pages = max_num_reqs * max_num_pages_per_req
+
+        self.speculative_config = vllm_config.speculative_config
 
         # Preparing persistent buffers
         if vllm_config.compilation_config.full_cuda_graph:
@@ -95,8 +103,12 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                                           dtype=torch.int32,
                                           device=device)
 
-    def _build_decode(self, block_table_tensor: torch.Tensor,
-                      seq_lens: torch.Tensor) -> AiterMLADecodeMetadata:
+    def _build_decode(self,
+                      block_table_tensor: torch.Tensor,
+                      seq_lens: torch.Tensor,
+                      max_query_len: int = 1) -> AiterMLADecodeMetadata:
+        assert max_query_len <= self.decode_threshold
+
         page_size = self.kv_cache_spec.block_size
         block_table_bounds = (seq_lens + page_size - 1) // page_size
         device = self.device
@@ -116,6 +128,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             torch.zeros(1, dtype=block_table_bounds.dtype, device=device),
             block_table_bounds.cumsum(dim=0, dtype=torch.int32)
         ])
+
+        max_seqlen_qo = max_query_len
 
         if self.compilation_config.full_cuda_graph:
 
@@ -139,9 +153,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             qo_indptr = self.qo_indptr[:1 + num_reqs]
 
         else:
-            qo_indptr = torch.arange(0,
-                                     num_reqs + 1,
-                                     step=1,
+            qo_indptr = torch.arange(0, (num_reqs * max_seqlen_qo) + 1,
+                                     step=max_seqlen_qo,
                                      dtype=torch.int32,
                                      device=device)
 
@@ -151,7 +164,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             paged_kv_indptr=paged_kv_indptr,
             paged_kv_indices=paged_kv_indices,
             paged_kv_last_page_len=paged_kv_last_page_len,
-            qo_indptr=qo_indptr)
+            qo_indptr=qo_indptr,
+            max_seqlen_qo=max_seqlen_qo)
 
         return attn_metadata
 
@@ -218,6 +232,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AiterMLAMetadata,
     ) -> torch.Tensor:
+        # print("====forward decode====")
+
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
@@ -232,11 +248,9 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
-        # max_seqlen_qo must be 1 except for MTP
-        # TODO: Find the best value for MTP
-        max_seqlen_qo = 1
         aiter_mla_decode_fwd(q, kv_buffer, o, self.scale,
-                             attn_metadata.decode.qo_indptr, max_seqlen_qo,
+                             attn_metadata.decode.qo_indptr,
+                             attn_metadata.decode.max_seqlen_qo,
                              attn_metadata.decode.paged_kv_indptr,
                              attn_metadata.decode.paged_kv_indices,
                              attn_metadata.decode.paged_kv_last_page_len)

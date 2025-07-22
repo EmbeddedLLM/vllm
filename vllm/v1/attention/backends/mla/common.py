@@ -480,6 +480,8 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 device=device,
             )
 
+        self.decode_threshold = 1
+
     def _build_fi_prefill_wrappers(self, prefill: FlashInferPrefillMetadata):
         qo_indptr = prefill.query_start_loc
 
@@ -563,8 +565,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                                                            scheduler_output,
                                                            decode_threshold=1)
 
-    def _build_decode(self, block_table_tensor: torch.Tensor,
-                      seq_lens: torch.Tensor):
+    def _build_decode(self,
+                      block_table_tensor: torch.Tensor,
+                      seq_lens: torch.Tensor,
+                      max_query_len: int = 1):
         return MLACommonDecodeMetadata(
             block_table=block_table_tensor,
             seq_lens=seq_lens,
@@ -610,7 +614,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                                    query_seq_lens_cpu)
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = \
-            split_decodes_and_prefills(common_attn_metadata)
+            split_decodes_and_prefills(common_attn_metadata, decode_threshold=self.decode_threshold)
 
         assert num_decodes + num_prefills == num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_tokens
@@ -711,6 +715,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             decode_metadata = self._build_decode(
                 block_table_tensor=block_table_tensor[:num_decodes, ...],
                 seq_lens=seq_lens[:num_decodes],
+                max_query_len=max_query_len,
             )
 
         attn_metadata = self.metadata_cls(
