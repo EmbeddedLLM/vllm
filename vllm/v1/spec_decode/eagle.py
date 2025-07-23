@@ -262,17 +262,17 @@ class EagleProposer:
         next_token_ids: torch.Tensor,
         common_attn_metadata: CommonAttentionMetadata,
     ) -> torch.Tensor:
-        num_tokens = target_token_ids.shape[0]
+        total_num_tokens = target_token_ids.shape[0]
         num_draft_tokens = (common_attn_metadata.max_query_len -
                             self.num_speculative_tokens)
+        num_tokens = total_num_tokens - num_draft_tokens
         batch_size = next_token_ids.shape[0]
         last_token_indices = common_attn_metadata.query_start_loc[
             1:] - num_draft_tokens
 
         # Shift the input ids by n draft token.
         # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
-        self.input_ids[:num_tokens -
-                       num_draft_tokens] = target_token_ids[num_draft_tokens:]
+        self.input_ids[:num_tokens] = target_token_ids[num_draft_tokens:]
         # Replace the last token with the next token.
         # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
         self.input_ids[last_token_indices] = next_token_ids
@@ -297,8 +297,10 @@ class EagleProposer:
         else:
             num_input_tokens = num_tokens
         # copy inputs to buffer for cudagraph
-        self.positions[:num_tokens] = target_positions
-        self.hidden_states[:num_tokens] = target_hidden_states
+        self.positions[:num_tokens] = target_positions[:num_draft_tokens]
+        self.hidden_states[:
+                           num_tokens] = target_hidden_states[:
+                                                              num_draft_tokens]
 
         with set_forward_context(per_layer_attn_metadata,
                                  self.vllm_config,
