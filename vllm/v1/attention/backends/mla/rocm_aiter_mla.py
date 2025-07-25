@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar, Optional, overload
 
 import torch
 
@@ -19,7 +19,7 @@ from vllm.v1.attention.backends.mla.common import (MLACommonBackend,
                                                    MLACommonMetadata,
                                                    MLACommonMetadataBuilder)
 from vllm.v1.kv_cache_interface import AttentionSpec
-
+from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 # yapf: enable
 
 
@@ -103,10 +103,67 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                                           dtype=torch.int32,
                                           device=device)
 
+    def build_for_drafter(self,
+              common_prefix_len: int,
+              common_attn_metadata: CommonAttentionMetadata):
+        m = common_attn_metadata
+        assert self.speculative_config is not None
+
+        if m.max_query_len > self.decode_threshold:
+            return self.build(common_prefix_len, m)
+
+        m.max_query_len = self.speculative_config.num_speculative_tokens
+        num_reqs = m.num_reqs
+        m.num_actual_tokens = self.speculative_config.num_speculative_tokens
+        num_decode_tokens = m.num_actual_tokens
+        num_decodes = num_reqs
+        block_table_tensor = m.block_table_tensor
+        seq_lens = m.seq_lens
+
+        decode_metadata = self._build_decode(
+            block_table_tensor=block_table_tensor[:num_decodes, ...],
+            seq_lens=seq_lens[:num_decodes],
+            max_query_len=m.max_query_len,
+            is_building_for_drafter=True,
+        )
+
+        print("== aiter build for drafter ===")
+        print(m.num_actual_tokens)
+        print(num_decode_tokens)
+        attn_metadata = self.metadata_cls(
+            num_reqs=common_attn_metadata.num_reqs,
+            max_query_len=m.max_query_len,
+            num_actual_tokens=m.num_actual_tokens,
+            query_start_loc=m.query_start_loc,
+            slot_mapping=m.slot_mapping,
+            head_dim=self.model_config.get_head_size(),
+            # MLACommonMetadata Chunk prefill specific
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_prefills=0,
+            prefill=None,
+            decode=decode_metadata,
+        )
+
+        return attn_metadata
+
+    @overload
+    def _build_decode(self,
+                      block_table_tensor: torch.Tensor,
+                      seq_lens: torch.Tensor) -> AiterMLADecodeMetadata: ...
+    @overload
     def _build_decode(self,
                       block_table_tensor: torch.Tensor,
                       seq_lens: torch.Tensor,
-                      max_query_len: int = 1) -> AiterMLADecodeMetadata:
+                      max_query_len: int = 1,
+                      is_building_for_drafter: bool = False) -> AiterMLADecodeMetadata: ...
+
+    def _build_decode(self,
+                      block_table_tensor: torch.Tensor,
+                      seq_lens: torch.Tensor,
+                      max_query_len: int = 1,
+                      is_building_for_drafter: bool = False) -> AiterMLADecodeMetadata:
+
         assert max_query_len <= self.decode_threshold
 
         page_size = self.kv_cache_spec.block_size
@@ -129,7 +186,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             block_table_bounds.cumsum(dim=0, dtype=torch.int32)
         ])
 
-        max_seqlen_qo = max_query_len
+        max_seqlen_qo = max_query_len if is_building_for_drafter else 1
 
         if self.compilation_config.full_cuda_graph:
 
@@ -168,7 +225,6 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             max_seqlen_qo=max_seqlen_qo)
 
         return attn_metadata
-
 
 class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
@@ -232,8 +288,6 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AiterMLAMetadata,
     ) -> torch.Tensor:
-        # print("====forward decode====")
-
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
@@ -248,9 +302,16 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
+        max_seqlen_qo = attn_metadata.decode.max_seqlen_qo
+        print("aiter decode")
+        print(q.shape)
+        if max_seqlen_qo > 1:
+            q = q.repeat(max_seqlen_qo, 1, 1)
+            print(q.shape)
+
         aiter_mla_decode_fwd(q, kv_buffer, o, self.scale,
                              attn_metadata.decode.qo_indptr,
-                             attn_metadata.decode.max_seqlen_qo,
+                             max_seqlen_qo,
                              attn_metadata.decode.paged_kv_indptr,
                              attn_metadata.decode.paged_kv_indices,
                              attn_metadata.decode.paged_kv_last_page_len)

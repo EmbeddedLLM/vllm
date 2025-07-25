@@ -587,7 +587,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits_indices, spec_decode_metadata
         ]
         """
+        print("=== target model prepare inputs ====")
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
@@ -597,10 +599,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.input_batch.block_table.commit_block_table(num_reqs)
 
         # Get the number of scheduled tokens for each request.
-        req_ids = self.input_batch.req_ids
+        req_ids = self.input_batch.req_ids 
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+
+        if self.speculative_config:
+            if self.speculative_config.method == "deepseek_mtp":
+                print("prepare inputs adjust scheduled tokens")
+                num_spec_tokens = self.speculative_config.num_speculative_tokens
+                if (total_num_scheduled_tokens - num_spec_tokens) == 1:
+                    total_num_scheduled_tokens -= num_spec_tokens
+                    tokens = [scheduler_output.num_scheduled_tokens[i]-num_spec_tokens for i in req_ids]  
+        
+        print("num scheduled tokens")
+        print(len(tokens))
         num_scheduled_tokens = np.array(tokens, dtype=np.int32)
         max_num_scheduled_tokens = max(tokens)
+        print(f"max_num_scheduled: {max_num_scheduled_tokens}")
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -684,6 +698,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         attn_metadata: dict[str, Any] = {}
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
+        print("=== before createing common metadata ====")
+        print(total_num_scheduled_tokens)
+        print(max_num_scheduled_tokens)
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
                 self.kv_cache_config.kv_cache_groups):
 
@@ -1293,6 +1310,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          spec_decode_common_attn_metadata) = (
              self._prepare_inputs(scheduler_output))
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        if self.speculative_config:
+            if self.speculative_config.method == "deepseek_mtp":
+                num_spec_tokens = self.speculative_config.num_speculative_tokens
+                if (num_scheduled_tokens - num_spec_tokens) == 1:
+                    num_scheduled_tokens -= num_spec_tokens
+
         if (self.use_cuda_graph
                 and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
             # Use piecewise CUDA graphs.
@@ -1362,6 +1385,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        print("==== forwarding target model ====")
         with set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -1385,7 +1409,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             hidden_states = model_output
             aux_hidden_states = None
-
+        print("after target model is forward")
+        print(hidden_states.shape)
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping mirco-batches
@@ -1543,6 +1568,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 spec_decode_metadata,
                 spec_decode_common_attn_metadata,
             )
+            print("===after propose===")
 
         self.eplb_step()
 
@@ -1568,6 +1594,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         spec_decode_metadata: Optional[SpecDecodeMetadata],
         common_attn_metadata: CommonAttentionMetadata,
     ) -> list[list[int]]:
+        print("=== propose draft token ids gpu runner ====")
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if self.speculative_config.method == "ngram":
             assert isinstance(self.drafter, NgramProposer)
@@ -1626,18 +1653,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     target_hidden_states = hidden_states[:num_scheduled_tokens]
             else:
+                print("spec decode metadata is not none")
                 # TODO(woosuk): Refactor this.
                 num_draft_tokens = spec_decode_metadata.num_draft_tokens
+                print(f"num draft tokens: {num_draft_tokens}")
                 num_rejected_tokens = [
                     n + 1 - len(sampled_token_ids[i]) if n > 0 else 0
                     for i, n in enumerate(num_draft_tokens)
                 ]
                 num_rejected_tokens_cpu = torch.tensor(num_rejected_tokens,
                                                        dtype=torch.int32)
+                print(f"number of rejected tokens: {num_rejected_tokens}")
+                print("before calling drafter prepare inputs")
+                print(common_attn_metadata.num_actual_tokens)
                 common_attn_metadata, token_indices =\
                     self.drafter.prepare_inputs(
                     common_attn_metadata, num_rejected_tokens_cpu)
-
+                print(token_indices)
                 target_token_ids = self.input_ids[token_indices]
                 # TODO(woosuk): Support M-RoPE.
                 target_positions = self.positions[token_indices]
@@ -1646,6 +1678,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         [h[token_indices] for h in aux_hidden_states], dim=-1)
                 else:
                     target_hidden_states = hidden_states[token_indices]
+            print("before calling propose")
+            print(target_token_ids.shape)
+            print(num_scheduled_tokens)
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,

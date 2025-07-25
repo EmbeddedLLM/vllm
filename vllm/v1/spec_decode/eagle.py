@@ -250,73 +250,6 @@ class EagleProposer:
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         return draft_token_ids
 
-    def propose_deepseek_mtp_aiter_mla(
-        self,
-        # [num_tokens]
-        target_token_ids: torch.Tensor,
-        # [num_tokens]
-        target_positions: torch.Tensor,
-        # [num_tokens, hidden_size]
-        target_hidden_states: torch.Tensor,
-        # [batch_size]
-        next_token_ids: torch.Tensor,
-        common_attn_metadata: CommonAttentionMetadata,
-    ) -> torch.Tensor:
-        total_num_tokens = target_token_ids.shape[0]
-        num_draft_tokens = (common_attn_metadata.max_query_len -
-                            self.num_speculative_tokens)
-        num_tokens = total_num_tokens - num_draft_tokens
-        batch_size = next_token_ids.shape[0]
-        last_token_indices = common_attn_metadata.query_start_loc[
-            1:] - num_draft_tokens
-
-        # Shift the input ids by n draft token.
-        # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
-        self.input_ids[:num_tokens] = target_token_ids[num_draft_tokens:]
-        # Replace the last token with the next token.
-        # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
-        self.input_ids[last_token_indices] = next_token_ids
-
-        assert self.runner is not None
-
-        # FIXME: need to consider multiple kv_cache_groups
-        attn_metadata = self.runner.attn_metadata_builders[0].build(
-            common_prefix_len=0,
-            common_attn_metadata=common_attn_metadata,
-            fast_build=True,
-        )
-
-        # At this moment, we assume all eagle layers belong to the same KV
-        # cache group, thus using the same attention metadata.
-        per_layer_attn_metadata = {}
-        for layer_name in self.attn_layer_names:
-            per_layer_attn_metadata[layer_name] = attn_metadata
-        if self.use_cuda_graph and \
-            num_tokens <= self.cudagraph_batch_sizes[-1]:
-            num_input_tokens = self.vllm_config.pad_for_cudagraph(num_tokens)
-        else:
-            num_input_tokens = num_tokens
-        # copy inputs to buffer for cudagraph
-        self.positions[:num_tokens] = target_positions[:num_draft_tokens]
-        self.hidden_states[:
-                           num_tokens] = target_hidden_states[:
-                                                              num_draft_tokens]
-
-        with set_forward_context(per_layer_attn_metadata,
-                                 self.vllm_config,
-                                 num_tokens=num_input_tokens):
-            last_hidden_states = self.model(
-                self.input_ids[:num_input_tokens],
-                self.positions[:num_input_tokens],
-                self.hidden_states[:num_input_tokens],
-            )
-
-        sample_hidden_states = last_hidden_states[last_token_indices]
-        logits = self.model.compute_logits(sample_hidden_states, None)
-        draft_token_ids = logits.argmax(dim=-1)
-
-        return draft_token_ids.view(batch_size, num_draft_tokens)
-
     def prepare_inputs(
         self,
         common_attn_metadata: CommonAttentionMetadata,
@@ -329,6 +262,8 @@ class EagleProposer:
         tokens (and newly sampled tokens). It also returns the token indices
         of the tokens that should be fed to the speculator.
         """
+        if self.is_rocm_aiter_mla_backend_running:
+            self.prepare_inputs_for_deepseek_mtp_aiter_mla(common_attn_metadata, num_rejected_tokens)
         # E.g.
         #  common_attn_metadata.query_start_loc{_cpu}:
         #         [0, q1, q1 + q2, q1 + q2 + q3]
@@ -405,6 +340,187 @@ class EagleProposer:
             num_reqs=common_attn_metadata.num_reqs,
             num_actual_tokens=total_num_tokens,
             max_query_len=new_query_len_per_req.max().item(),
+            block_table_tensor=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping[token_indices],
+        )
+
+        return spec_common_attn_metadata, token_indices
+
+    def propose_deepseek_mtp_aiter_mla(
+        self,
+        # [num_tokens]
+        target_token_ids: torch.Tensor,
+        # [num_tokens]
+        target_positions: torch.Tensor,
+        # [num_tokens, hidden_size]
+        target_hidden_states: torch.Tensor,
+        # [batch_size]
+        next_token_ids: torch.Tensor,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> torch.Tensor:
+        print("--- propose ----")
+
+        num_tokens = target_token_ids.shape[0]
+        print("max_query_len")
+        print(common_attn_metadata.max_query_len)
+        print("next token ids")
+        print(next_token_ids.shape)
+        print(f"target token ids {target_token_ids.shape}")
+        num_draft_tokens = self.num_speculative_tokens
+        # max_query_len = len(input_prompts) + len(output_tokens) + len(speculative_tokens)
+        # prefill stage -> max_query_len = n + 0 + 0
+        # decode stage -> max_query_len = 0 + 1 + k_speculative_token
+
+        print(f"num_target_tokens {num_tokens}")
+        print(f"num_draft tokens: {num_draft_tokens}")
+        print()
+        # num_tokens = total_num_tokens - num_draft_tokens
+        last_token_indices = common_attn_metadata.query_start_loc[
+            1:] - 1
+
+        print(f"last token indices {last_token_indices}")
+        # Shift the input ids by n draft token.
+        # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
+        self.input_ids[:num_tokens - 1] = target_token_ids[1:]
+        # # Replace the last token with the next token.
+        # # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
+        # self.input_ids[last_token_indices] = next_token_ids
+
+
+
+        if num_tokens == 1 and num_draft_tokens > 1:
+            # We want to replace the last num_draft_tokens indices in self.input_ids with next_token_ids.
+            # next_token_ids assumed to be [batch_size, num_draft_tokens]
+            batch_size = next_token_ids.shape[0]
+            # For each batch, grab the appropriate target slot range
+            start_indices = last_token_indices - (num_draft_tokens - 1)
+            for i in range(batch_size):
+                start = start_indices[i].item()
+                end = start + num_draft_tokens
+                self.input_ids[start:end] = next_token_ids[i]
+            num_input_tokens = num_draft_tokens
+        else:
+            # Standard shifting and token replacement for other cases
+            self.input_ids[:num_tokens - 1] = target_token_ids[1:]
+            self.input_ids[last_token_indices] = next_token_ids
+            num_input_tokens = num_tokens
+
+        assert self.runner is not None
+
+        attn_metadata = self.runner.attn_metadata_builders[0].build_for_drafter(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+        )
+
+        # At this moment, we assume all eagle layers belong to the same KV
+        # cache group, thus using the same attention metadata.
+        per_layer_attn_metadata = {}
+        for layer_name in self.attn_layer_names:
+            per_layer_attn_metadata[layer_name] = attn_metadata
+        if self.use_cuda_graph and num_input_tokens <= self.cudagraph_batch_sizes[-1]:
+            num_input_tokens = self.vllm_config.pad_for_cudagraph(num_input_tokens)
+
+        # copy inputs to buffer for cudagraph
+        self.positions[:num_tokens] = target_positions
+        self.hidden_states[:num_tokens] = target_hidden_states
+
+        print(f"self.input_ids[:num_input_tokens]: {self.input_ids[:num_input_tokens].shape}")
+        print(f"self.hidden_states[:num_input_tokens]: {self.hidden_states[:num_input_tokens].shape}")
+        with set_forward_context(per_layer_attn_metadata,
+                                 self.vllm_config,
+                                 num_tokens=num_input_tokens):
+            last_hidden_states = self.model(
+                self.input_ids[:num_input_tokens],
+                self.positions[:num_input_tokens],
+                self.hidden_states[:num_input_tokens],
+            )
+        print("=== after foward ===")
+        print(last_hidden_states.shape)
+        sample_hidden_states = last_hidden_states[-num_draft_tokens:]
+        logits = self.model.compute_logits(sample_hidden_states, None)
+        draft_token_ids = logits.argmax(dim=-1)
+        print(f"draft token ids: {draft_token_ids.shape}")
+
+        # [batch_size,num_draft_tokens] 
+        return draft_token_ids.view(-1, num_draft_tokens)
+
+    def prepare_inputs_for_deepseek_mtp_aiter_mla(
+        self,
+        common_attn_metadata,    # CommonAttentionMetadata object
+        num_rejected_tokens: torch.Tensor
+    ) -> tuple:
+        """
+        Prepare the attention metadata and token indices for speculative decoding, 
+        allocating slots for k speculative tokens per request. 
+
+        Args:
+            common_attn_metadata: CommonAttentionMetadata
+            num_rejected_tokens: [batch_size]  # tokens rejected by verifier
+
+        Returns:
+            spec_common_attn_metadata, token_indices
+        """
+        k = self.num_speculative_tokens
+        device = common_attn_metadata.query_start_loc.device
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        new_seq_lens_cpu = (common_attn_metadata.seq_lens_cpu + k) \
+            - num_rejected_tokens
+
+        # [0, q1, q1 + q2, q1 + q2 + q3] -> [q1, q2, q3]
+        new_query_len_per_req = (query_start_loc_cpu[1:] -
+                                 query_start_loc_cpu[:-1])
+        # [q1, q2, q3] -> [q1 - n1, q2 - n2, q3 - n3]
+        new_num_tokens_per_req = (new_query_len_per_req + k) - num_rejected_tokens
+        new_num_tokens_per_req_np = new_num_tokens_per_req.numpy()
+
+        # [q1 - n1, q2 - n2, q3 - n3] ->
+        # [0, q1 - n1, q1 + q2 - n1 - n2, q1 + q2 + q3 - n1 - n2 - n3]
+        new_query_start_loc_cpu = torch.zeros(
+            query_start_loc_cpu.shape,
+            dtype=torch.int32,
+            pin_memory=is_pin_memory_available())
+        new_query_start_loc_np = new_query_start_loc_cpu.numpy()
+        np.cumsum(new_num_tokens_per_req_np, out=new_query_start_loc_np[1:])
+
+        total_num_tokens = new_query_start_loc_np[-1]
+        # Example assuming num_tokens_per_req_np = [2, 4, 3]
+        # this implies that `new_query_start_locs` is:
+        # [0, 2, 6, 9] ->
+        # [0, 0, 2, 2, 2, 2, 6, 6, 6]
+        #  _r1_  ____r2____  ___r3__
+        new_query_start_locs_expanded = np.repeat(new_query_start_loc_np[:-1],
+                                                  new_num_tokens_per_req_np)
+        # [0, 1, 2, 3, 4, 5, 6, 7, 8] ->
+        # [0, 1, 0, 1, 2, 3, 0, 1, 2]
+        #  _r1_  ____r2____  ___r3__
+        token_offests = self.token_arange_np[:total_num_tokens] \
+            - new_query_start_locs_expanded
+
+        # Expand starting positions to match token pattern
+        # [0, q1, q1 + q2] ->
+        # [0, 0, q1, q1, q1, q1, q1 + q2, q1 + q2, q1 + q2]
+        #  _r1_  _____r2_______  ___________r3____________
+        old_query_start_locs_expanded = np.repeat(
+            query_start_loc_cpu[:-1].numpy(), new_num_tokens_per_req_np)
+        # Final token indices are:
+        # [0, 1,                                   // req 1
+        #  q1 + 0, q1 + 1, q1 + 2, q1 + 3,         // req 2
+        #  q1 + q2 + 0, q1 + q2 + 1, q1 + q2 + 2]  // req 3
+        token_indices_np = token_offests + old_query_start_locs_expanded
+        token_indices = torch.from_numpy(token_indices_np).to(
+            device, non_blocking=True)
+
+        spec_common_attn_metadata = CommonAttentionMetadata(
+            query_start_loc=new_query_start_loc_cpu.to(device,
+                                                       non_blocking=True),
+            seq_lens=new_seq_lens_cpu.to(device, non_blocking=True),
+            query_start_loc_cpu=new_query_start_loc_cpu,
+            seq_lens_cpu=new_seq_lens_cpu,
+            num_computed_tokens_cpu=common_attn_metadata.
+            num_computed_tokens_cpu,
+            num_reqs=common_attn_metadata.num_reqs,
+            num_actual_tokens=total_num_tokens,
+            max_query_len=new_query_len_per_req.max().item()+k,
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping[token_indices],
         )
