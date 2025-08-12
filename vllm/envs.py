@@ -752,8 +752,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use aiter rms norm pad op.
     # By default is disabled.
     "VLLM_ROCM_USE_AITER_RMSNORM_PAD":
-    lambda: (os.getenv("VLLM_ROCM_USE_AITER_RMSNORM_PAD", "True").lower() in
-             ("false", "0")),
+    lambda: (os.getenv("VLLM_ROCM_USE_AITER_RMSNORM_PAD", "FALSE").lower() in
+             ("true", "1")),
 
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM":
