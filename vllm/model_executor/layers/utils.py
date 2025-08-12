@@ -5,8 +5,8 @@ from typing import Callable, Optional
 
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
-from vllm import envs
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
 
@@ -92,6 +92,18 @@ def default_unquantized_gemm(layer: torch.nn.Module,
     return torch.nn.functional.linear(x, weight, bias)
 
 
+def is_rocm_aiter_enabled() -> bool:
+    return envs.VLLM_ROCM_USE_AITER_TRITON_GEMM \
+        and envs.VLLM_ROCM_USE_AITER \
+        and current_platform.is_rocm()
+
+
+def rocm_aiter_gemm_check(n, k) -> bool:
+    return ((n == 5120 and k == 2880) or (n == 2880 and k == 4096)
+            or (n == 128 and k == 2880) or (n == 640 and k == 2880)
+            or (n == 2880 and k == 512))
+
+
 def rocm_unquantized_gemm_impl(
         x: torch.Tensor,
         weight: torch.Tensor,
@@ -101,7 +113,6 @@ def rocm_unquantized_gemm_impl(
     use_skinny = (envs.VLLM_ROCM_USE_SKINNY_GEMM and on_gfx9() and \
                     x.dtype in [torch.float16, torch.bfloat16] \
                     and k % 8 == 0 and bias is None)
-
     if use_skinny is not True:
         return torch.nn.functional.linear(x, weight, bias)
 
@@ -109,6 +120,12 @@ def rocm_unquantized_gemm_impl(
     n = x_view.shape[0]
     m = weight.shape[0]
     cu_count = current_platform.get_cu_count()
+
+    use_aiter_triton = (is_rocm_aiter_enabled()
+                        and rocm_aiter_gemm_check(n, k))
+    if use_aiter_triton:
+        from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+        return gemm_a16w16(x, weight, bias)
 
     if m > 8 and 0 < n <= 4:
         out = ops.wvSplitK(weight, x_view, cu_count)
