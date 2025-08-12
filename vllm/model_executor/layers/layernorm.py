@@ -17,6 +17,12 @@ def is_rocm_aiter_rmsnorm_enabled() -> bool:
         and envs.VLLM_ROCM_USE_AITER
 
 
+def is_rocm_aiter_rmsnorm_pad_enabled() -> bool:
+    return current_platform.is_rocm() \
+        and envs.VLLM_ROCM_USE_AITER_RMSNORM_PAD \
+        and envs.VLLM_ROCM_USE_AITER
+
+
 def rms_norm(x: torch.Tensor, weight: torch.Tensor,
              variance_epsilon: float) -> torch.Tensor:
     from vllm import _custom_ops as ops
@@ -55,6 +61,22 @@ def rocm_aiter_rms_norm(x: torch.Tensor, weight: torch.Tensor,
     return rocm_aiter.rms_norm(x, weight, variance_epsilon)
 
 
+def rocm_aiter_triton_fused_add_rms_norm_pad(
+        x: torch.Tensor, residual: Optional[torch.Tensor],
+        weight: torch.Tensor, variance_epsilon: float
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
+    output = fused_add_rmsnorm_pad(
+        x,
+        weight,
+        variance_epsilon,
+        residual,
+    )
+    if residual is None:
+        return output, None
+    return output
+
+
 def rocm_aiter_fused_add_rms_norm(
         x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
         variance_epsilon: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -74,14 +96,27 @@ def rocm_aiter_fused_add_rms_norm(
     return output, residual_out
 
 
-def dispatch_cuda_rmsnorm_func(add_residual: bool):
+def dispatch_hip_rmsnorm_func(add_residual: bool):
     if add_residual:
+        if is_rocm_aiter_rmsnorm_pad_enabled():
+            return rocm_aiter_triton_fused_add_rms_norm_pad
         if is_rocm_aiter_rmsnorm_enabled():
             return rocm_aiter_fused_add_rms_norm
         return fused_add_rms_norm
 
+    if is_rocm_aiter_rmsnorm_pad_enabled():
+        # Pad-enabled no residual case: just call with residual=None
+        return lambda x, weight, eps: rocm_aiter_triton_fused_add_rms_norm_pad(
+            x, None, weight, eps)[0]
+
     if is_rocm_aiter_rmsnorm_enabled():
         return rocm_aiter_rms_norm
+    return rms_norm
+
+
+def dispatch_cuda_rmsnorm_func(add_residual: bool):
+    if add_residual:
+        return fused_add_rms_norm
     return rms_norm
 
 
@@ -152,6 +187,23 @@ class RMSNorm(CustomOp):
             return x
         else:
             return x, residual
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if self.variance_size_override is not None:
+            return self.forward_native(x, residual)
+
+        add_residual = residual is not None
+        norm_func = dispatch_hip_rmsnorm_func(add_residual)
+
+        if add_residual:
+            return norm_func(x, residual, self.weight.data,
+                             self.variance_epsilon)
+        else:
+            return norm_func(x, self.weight.data, self.variance_epsilon)
 
     def forward_cuda(
         self,
