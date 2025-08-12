@@ -124,13 +124,27 @@ class RotaryEmbedding(CustomOp):
     def forward_hip(
         self,
         positions: torch.Tensor,
-        query: torch.Tensor,
+        query: Optional[torch.Tensor] = None,
         key: Optional[torch.Tensor] = None,
+        qkv: Optional[torch.Tensor] = None,
         offsets: Optional[torch.Tensor] = None,
-        is_nope_first=False,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        is_nope_first: bool = False,
+        num_local_attention_heads: int = 0,
+        num_local_key_value_heads: int = 0,
+    ) -> tuple[torch.Tensor, ...]:
         # currently only rotary embedding ops from AITER package are
         # supported for HiP forward.
+        if qkv is not None:
+            assert query is None and key is None, \
+                "Don't pass both qkv and separate query/key"
+
+        # currently supported for GPT-OSS models only.
+        if qkv is not None:
+            return self.forward_triton_rocm_aiter_fused_qkv(
+                positions, qkv, num_local_attention_heads,
+                num_local_key_value_heads, offsets, is_nope_first)
+
+        assert query is not None, "query must be provided"
         if self.is_rocm_aiter_enabled:
             return self.forward_hip_rocm_aiter(positions, query, key, offsets,
                                                is_nope_first)
@@ -189,6 +203,42 @@ class RotaryEmbedding(CustomOp):
             is_nope_first)
 
         return query.view(query_shape), key.view(key_shape)
+
+    def forward_triton_rocm_aiter_fused_qkv(
+        self,
+        positions: torch.Tensor,
+        qkv: torch.Tensor,
+        num_local_attention_heads: int,
+        num_local_key_value_heads: int,
+        offsets: Optional[torch.Tensor] = None,
+        is_nope_first: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
+        from aiter.ops.triton.fused_qkv_split_qk_rope import (
+            fused_qkv_split_qk_rope)
+
+        if self.cos_sin_cache.device != qkv.device or \
+            self.cos_sin_cache.dtype != qkv.dtype:
+            self.cos_sin_cache = self.cos_sin_cache.to(qkv.device,
+                                                       dtype=qkv.dtype)
+        cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
+
+        q, k, v = fused_qkv_split_qk_rope(
+            qkv,
+            cos,
+            sin,
+            positions,
+            num_local_attention_heads,
+            num_local_key_value_heads,
+            self.rotary_dim,
+            is_neox=self.is_neox_style,
+            offsets=offsets,
+            reuse_freqs_front_part=(self.rotary_dim // 2 == cos.shape[-1]),
+            nope_first=is_nope_first,
+        )
+        q = q.view(-1, self.q_size)
+        k = k.view(-1, self.kv_size)
+
+        return q, k, v
 
     def forward_xpu(
         self,

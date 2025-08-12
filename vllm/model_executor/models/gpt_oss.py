@@ -21,6 +21,8 @@ from vllm.model_executor.layers.linear import (QKVParallelLinear,
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.rotary_embedding.rocm_aiter_rope_ops import (
+    is_aiter_triton_fused_qkv_rope_enabled)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -119,13 +121,25 @@ class OAIAttention(nn.Module):
             sinks=self.sinks,
         )
 
+        aiter_fused_rope_enabled = is_aiter_triton_fused_qkv_rope_enabled()
+        self.is_aiter_fused_rope_enabled = aiter_fused_rope_enabled
+
     def forward(self, hidden_states: torch.Tensor,
                 positions: torch.Tensor) -> torch.Tensor:
         t = self.norm(hidden_states)
 
         qkv, _ = self.qkv(t)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        if self.is_aiter_fused_rope_enabled:
+            q, k, v = self.rotary_emb(
+                positions,
+                qkv=qkv,
+                num_local_attention_heads=self.num_local_attention_heads,
+                num_local_key_value_heads=self.num_local_key_value_heads)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                                dim=-1)
+            q, k = self.rotary_emb(positions, q=q, k=k)
+
         v = v.contiguous()
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)

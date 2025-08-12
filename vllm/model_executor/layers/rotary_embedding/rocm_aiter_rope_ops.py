@@ -10,6 +10,11 @@ from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
 
 
+def is_aiter_triton_fused_qkv_rope_enabled() -> bool:
+    return (current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER
+            and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_QKV_ROPE)
+
+
 def is_rocm_rotary_embedding_enabled() -> bool:
     return (current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER)
 

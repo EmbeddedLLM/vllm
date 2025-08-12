@@ -97,6 +97,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_QKV_ROPE: bool = False
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -748,6 +749,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_MHA":
     lambda: (os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in
              ("true", "1")),
+
+    # Whether to use aiter triton fused qkv rope op.
+    # By default is disabled.
+    "VLLM_ROCM_USE_AITER_TRITON_FUSED_QKV_ROPE":
+    lambda: (os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_QKV_ROPE", "False")
+             .lower() in ("true", "1")),
 
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM":
