@@ -31,12 +31,19 @@ class RotaryEmbedding(CustomOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
+        self.is_rocm_aiter_enabled = is_rocm_rotary_embedding_enabled()
 
         cache = self._compute_cos_sin_cache()
-        cache = cache.to(dtype)
-        self.cos_sin_cache: torch.Tensor
-        self.register_buffer("cos_sin_cache", cache, persistent=False)
-        self.is_rocm_aiter_enabled = is_rocm_rotary_embedding_enabled()
+        if not self.is_rocm_aiter_enabled:
+            cache = cache.to(dtype)
+            self.cos_sin_cache: torch.Tensor
+            self.register_buffer("cos_sin_cache", cache, persistent=False)
+        else:
+            cos, sin = self._unpack_cos_sin_cache_aiter(cache)
+            self.cos_cache: torch.Tensor
+            self.sin_cache: torch.Tensor
+            self.register_buffer("cos_cache", cos, persistent=False)
+            self.register_buffer("sin_cache", sin, persistent=False)
 
     def _compute_inv_freq(self, base: float) -> torch.Tensor:
         """Compute the inverse frequency."""
@@ -58,6 +65,15 @@ class RotaryEmbedding(CustomOp):
         sin = freqs.sin()
         cache = torch.cat((cos, sin), dim=-1)
         return cache
+
+    def _unpack_cos_sin_cache_aiter(
+            self,
+            cos_sin_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Aiter requires separate cos and sin buffers."""
+        cos, sin = cos_sin_cache.chunk(2, dim=-1)
+        cos = cos.unsqueeze(-2).unsqueeze(-2)
+        sin = sin.unsqueeze(-2).unsqueeze(-2)
+        return cos, sin
 
     def forward_native(
         self,
@@ -148,14 +164,17 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
         is_nope_first: bool = False,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if self.cos_sin_cache.device != query.device or \
-            self.cos_sin_cache.dtype != query.dtype:
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device,
-                                                       dtype=query.dtype)
-        cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
 
-        cos = cos.unsqueeze(-2).unsqueeze(-2)
-        sin = sin.unsqueeze(-2).unsqueeze(-2)
+        if self.cos_cache.device != query.device or \
+            self.cos_cache.dtype != query.dtype:
+            cos = self.cos_cache.to(query.device, dtype=query.dtype)
+        else:
+            cos = self.cos_cache
+        if self.sin_cache.device != query.device or \
+            self.sin_cache.dtype != query.dtype:
+            sin = self.sin_cache.to(query.device, dtype=query.dtype)
+        else:
+            sin = self.sin_cache
 
         rotate_style = 0 if self.is_neox_style else 1
 
