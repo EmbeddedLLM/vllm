@@ -11,7 +11,8 @@ from vllm.utils import direct_register_custom_op
 
 
 def is_rocm_rotary_embedding_enabled() -> bool:
-    return (current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER)
+    return (current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER \
+        and envs.VLLM_ROCM_USE_AITER_ROPE)
 
 
 def rocm_aiter_rotary_emb_without_key_forward_hip_impl(
