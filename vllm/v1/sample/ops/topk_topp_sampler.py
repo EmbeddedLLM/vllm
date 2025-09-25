@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Optional
 
 import torch
@@ -16,6 +17,7 @@ logger = init_logger(__name__)
 
 try:
     import flashinfer.sampling
+
     is_flashinfer_available = True
 except ImportError:
     is_flashinfer_available = False
@@ -34,8 +36,8 @@ class TopKTopPSampler(nn.Module):
         self.logprobs_mode = logprobs_mode
         # flashinfer optimization does not apply if intermediate
         # logprobs/logits after top_k/top_p need to be returned
-        if logprobs_mode not in ("processed_logits", "processed_logprobs"
-                                 ) and current_platform.is_cuda():
+        if (logprobs_mode not in ("processed_logits", "processed_logprobs")
+                and current_platform.is_cuda()):
             if is_flashinfer_available:
                 flashinfer_version = flashinfer.__version__
                 if version.parse(flashinfer_version) < version.parse("0.2.3"):
@@ -68,6 +70,14 @@ class TopKTopPSampler(nn.Module):
                     "native implementation of top-p & top-k sampling. For the "
                     "best performance, please install FlashInfer.")
                 self.forward = self.forward_native
+
+        elif (logprobs_mode not in ("processed_logits", "processed_logprobs")
+              and current_platform.is_rocm()
+              and os.getenv("VLLM_ROCM_USE_AITER_SAMPLER", "0") == "1"):
+            logger.info_once(
+                "Using aiter sampler on ROCm (lazy import, sampling-only).")
+            self.forward = self.forward_rocm
+
         else:
             self.forward = self.forward_native
 
@@ -112,12 +122,52 @@ class TopKTopPSampler(nn.Module):
                                     "PyTorch-native implementation.")
             return self.forward_native(logits, generators, k, p)
         assert self.logprobs_mode not in (
-            "processed_logits", "processed_logprobs"
+            "processed_logits",
+            "processed_logprobs",
         ), "FlashInfer does not support returning logits/logprobs"
         # flashinfer sampling functions expect contiguous logits.
         # In flex_attn/triton_attn fp32 inference, logits can be non-contiguous
         # because of slicing operation in logits_processor.
         return flashinfer_sample(logits.contiguous(), k, p, generators), None
+
+    def forward_rocm(
+        self,
+        logits: torch.Tensor,
+        generators: dict[int, torch.Generator],
+        k: Optional[torch.Tensor],
+        p: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Optimized ROCm/aiter path (same structure as forward_cuda).
+
+        - If processed logits/logprobs are requested,
+          or per-request generators exist, fall back to native.
+        - Otherwise call aiter_sample (CPU-GPU sync may occur; keep it at end).
+        """
+        if (k is None and p is None) or generators:
+            if generators:
+                logger.warning_once(
+                    "aiter sampler does not support per-request generators; "
+                    "falling back to PyTorch-native.")
+            logger.info_once(
+                "forward_rocm: path=native (no top-k/p or generators present)."
+            )
+            return self.forward_native(logits, generators, k, p)
+
+        assert self.logprobs_mode not in (
+            "processed_logits",
+            "processed_logprobs",
+        ), "aiter sampler does not support returning logits/logprobs."
+
+        try:
+            logger.info_once(
+                "forward_rocm: path=aiter_sample (contiguous logits).")
+            next_token_ids = aiter_sample(logits.contiguous(), k, p,
+                                          generators)
+            return next_token_ids, None
+        except Exception as e:
+            logger.warning_once(
+                f"aiter sampling unavailable ({e}); falling back to native.")
+            return self.forward_native(logits, generators, k, p)
 
 
 def apply_top_k_top_p(
@@ -249,3 +299,121 @@ def flashinfer_sample(
             logits, k, p, deterministic=True)
 
     return next_token_ids.view(-1)
+
+
+def aiter_sample(
+    logits: torch.Tensor,
+    k: Optional[torch.Tensor],
+    p: Optional[torch.Tensor],
+    generators: dict[int, torch.Generator],
+) -> torch.Tensor:
+    """Sample from logits using aiter ops.
+
+    Notes:
+    - Includes potential CPU-GPU sync; call at the end of forward.
+    - Accepts scalar-or-batch k/p (same as CUDA branch).
+    - Uses joint kernel when both k and p are active;
+      falls back to 2-step if needed.
+    """
+    assert not (k is None and p is None)
+
+    # Lazy import keeps FMHA/other aiter parts untouched
+    import importlib
+
+    try:
+        importlib.import_module("aiter.ops.sampling")
+    except Exception as e:
+        raise RuntimeError(f"import aiter.ops.sampling failed: {e}") from e
+
+    # Convert logits -> probs (float32) for aiter sampling kernels
+    probs = logits.softmax(dim=-1, dtype=torch.float32).contiguous()
+    B = probs.size(0)
+    device = probs.device
+
+    # Normalize k (support scalar or per-batch)
+    maybe_k_arr: Optional[torch.Tensor] = None
+    top_k_val: int = 0
+    if k is not None:
+        if torch.is_tensor(k):
+            if k.numel() == 1:
+                top_k_val = int(k.item())
+            else:
+                k = k.view(-1)
+                if k.numel() != B:
+                    raise RuntimeError(
+                        f"top-k tensor size {k.numel()} != batch {B}")
+                maybe_k_arr = k.to(device=device, dtype=torch.int32)
+                top_k_val = 0
+        else:
+            top_k_val = int(k)
+
+    # Normalize p (support scalar or per-batch)
+    maybe_p_arr: Optional[torch.Tensor] = None
+    top_p_val: float = 0.0
+    if p is not None:
+        if torch.is_tensor(p):
+            p = p.view(-1)
+            if p.numel() == 1:
+                maybe_p_arr = p.to(device=device,
+                                   dtype=torch.float32).expand(B)
+            else:
+                assert p.numel() == B
+                maybe_p_arr = p.to(device=device, dtype=torch.float32)
+            top_p_val = 0.0
+        else:
+            top_p_val = float(p)  # 只有 Python float 走这里
+
+    # No constraint -> should have been handled by forward_rocm
+    if (top_k_val == 0 and maybe_k_arr is None) and (top_p_val == 0.0
+                                                     and maybe_p_arr is None):
+        logger.info_once("aiter_sample: path=native (no top-k/p).")
+        # Mirror flashinfer_sample contract: caller will handle native fallback.
+        raise RuntimeError("no active top-k/top-p constraints")
+
+    # Single-constraint paths
+    if (top_k_val == 0 and maybe_k_arr is None) and (top_p_val != 0.0 or
+                                                     maybe_p_arr is not None):
+        logger.info_once(
+            "aiter_sample: path=top-p-only (aiter.top_p_sampling_from_probs).")
+        next_token_ids = torch.ops.aiter.top_p_sampling_from_probs(
+            probs,
+            None,  # indices
+            maybe_p_arr,
+            top_p_val,  # batch/scalar p
+            deterministic=True,
+        )
+        return next_token_ids.view(-1)
+
+    if (top_p_val == 0.0 and maybe_p_arr
+            is None) and (top_k_val != 0 or maybe_k_arr is not None):
+        logger.debug("aiter_sample: path=top-k-only (renorm -> multinomial).")
+        renorm_probs = torch.ops.aiter.top_k_renorm_probs(
+            probs, maybe_k_arr, top_k_val)
+        return torch.multinomial(renorm_probs, num_samples=1).view(-1)
+
+    # Joint k+p: prefer joint kernel, fall back to 2-step if needed
+    logger.info_once("aiter_sample: path=joint k+p "
+                     "(try aiter.top_k_top_p_sampling_from_probs).")
+    try:
+        next_token_ids = torch.ops.aiter.top_k_top_p_sampling_from_probs(
+            probs,
+            None,  # indices
+            maybe_k_arr,
+            top_k_val,
+            maybe_p_arr,
+            top_p_val,
+            deterministic=True,
+        )
+        return next_token_ids.view(-1)
+    except Exception as e:
+        logger.warning_once(f"aiter joint k+p kernel failed ({e});")
+        renorm_probs = torch.ops.aiter.top_k_renorm_probs(
+            probs, maybe_k_arr, top_k_val)
+        next_token_ids = torch.ops.aiter.top_p_sampling_from_probs(
+            renorm_probs,
+            None,
+            maybe_p_arr,
+            top_p_val,
+            deterministic=True,
+        )
+        return next_token_ids.view(-1)
