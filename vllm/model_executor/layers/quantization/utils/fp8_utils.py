@@ -66,6 +66,36 @@ def rocm_aiter_gemm_w8a8_blockscale_impl(
     return rocm_aiter.gemm_a8w8_blockscale(A, B, As, Bs, dtype=output_dtype)
 
 
+def rocm_aiter_gemm_w8a8_blockscale_b_preshuffle_impl(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: list[int],
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    import aiter as rocm_aiter
+    return rocm_aiter.gemm_a8w8_blockscale_bpreshuffle(A,
+                                                       B,
+                                                       As,
+                                                       Bs,
+                                                       dtype=output_dtype)
+
+
+def rocm_aiter_gemm_w8a8_blockscale_b_preshuffle_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: list[int],
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    m = A.shape[0]
+    n = B.shape[0]
+    Y = torch.empty(m, n, dtype=output_dtype, device=A.device)
+    return Y
+
+
 def rocm_aiter_gemm_w8a8_blockscale_fake(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -87,6 +117,13 @@ if current_platform.is_rocm():
         op_func=rocm_aiter_gemm_w8a8_blockscale_impl,
         fake_impl=rocm_aiter_gemm_w8a8_blockscale_fake,
     )
+
+    direct_register_custom_op(
+        op_name="rocm_aiter_gemm_w8a8_blockscale_b_preshuffle",
+        op_func=rocm_aiter_gemm_w8a8_blockscale_b_preshuffle_impl,
+        fake_impl=rocm_aiter_gemm_w8a8_blockscale_b_preshuffle_fake,
+    )
+
     if (envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_LINEAR
             and current_platform.is_fp8_fnuz()):
 
@@ -97,7 +134,9 @@ if current_platform.is_rocm():
 
 
 def dispatch_w8a8_blockscale_func(
-    use_cutlass: bool, use_aiter_and_is_supported: bool
+    use_cutlass: bool,
+    use_aiter_and_is_supported: bool,
+    is_aiter_swizzled_layout: bool = False
 ) -> Callable[[
         torch.Tensor,
         torch.Tensor,
@@ -108,7 +147,9 @@ def dispatch_w8a8_blockscale_func(
 ], torch.Tensor]:
     if use_cutlass:
         return cutlass_scaled_mm
-    if (use_aiter_and_is_supported):
+    if use_aiter_and_is_supported and is_aiter_swizzled_layout:
+        return torch.ops.vllm.rocm_aiter_gemm_w8a8_blockscale_b_preshuffle
+    if use_aiter_and_is_supported:
         return torch.ops.vllm.rocm_aiter_gemm_w8a8_blockscale
     return w8a8_block_fp8_matmul
 
@@ -116,15 +157,15 @@ def dispatch_w8a8_blockscale_func(
 # TODO fix ROCm->Triton custom path:
 #  https://github.com/vllm-project/vllm/issues/14397
 def apply_w8a8_block_fp8_linear(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    block_size: list[int],
-    weight_scale: torch.Tensor,
-    input_scale: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-    cutlass_block_fp8_supported: bool = CUTLASS_BLOCK_FP8_SUPPORTED,
-    use_aiter_and_is_supported: bool = False,
-) -> torch.Tensor:
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        block_size: list[int],
+        weight_scale: torch.Tensor,
+        input_scale: Optional[torch.Tensor] = None,
+        bias: Optional[torch.Tensor] = None,
+        cutlass_block_fp8_supported: bool = CUTLASS_BLOCK_FP8_SUPPORTED,
+        use_aiter_and_is_supported: bool = False,
+        is_aiter_swizzled_layout: bool = False) -> torch.Tensor:
     assert input_scale is None
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
@@ -150,7 +191,8 @@ def apply_w8a8_block_fp8_linear(
         return output.to(dtype=output_dtype).view(*output_shape)
 
     w8a8_blockscale_func = dispatch_w8a8_blockscale_func(
-        cutlass_block_fp8_supported, use_aiter_and_is_supported)
+        cutlass_block_fp8_supported, use_aiter_and_is_supported,
+        is_aiter_swizzled_layout)
     if cutlass_block_fp8_supported:
         num_pad = 0
         if current_platform.is_device_capability(90):
@@ -171,7 +213,9 @@ def apply_w8a8_block_fp8_linear(
     else:
         if use_aiter_and_is_supported:
             q_input, x_scale = aiter_per1x128_quant(
-                input_2d.contiguous(), quant_dtype=rocm_aiter.dtypes.fp8)
+                input_2d.contiguous(),
+                quant_dtype=rocm_aiter.dtypes.fp8,
+                transpose_scale=is_aiter_swizzled_layout)
         else:
             q_input, x_scale = per_token_group_quant_fp8(
                 input_2d, block_size[1], column_major_scales=False)
@@ -185,15 +229,15 @@ def apply_w8a8_block_fp8_linear(
 
 
 def apply_w8a8_block_fp8_linear_fake(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    block_size: list[int],
-    weight_scale: torch.Tensor,
-    input_scale: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-    cutlass_block_fp8_supported: bool = CUTLASS_BLOCK_FP8_SUPPORTED,
-    use_aiter_and_is_supported: bool = False,
-) -> torch.Tensor:
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        block_size: list[int],
+        weight_scale: torch.Tensor,
+        input_scale: Optional[torch.Tensor] = None,
+        bias: Optional[torch.Tensor] = None,
+        cutlass_block_fp8_supported: bool = CUTLASS_BLOCK_FP8_SUPPORTED,
+        use_aiter_and_is_supported: bool = False,
+        is_aiter_swizzled_layout: bool = False) -> torch.Tensor:
     output_shape = [*input.shape[:-1], weight.shape[0]]
     return torch.empty(output_shape, dtype=input.dtype, device=input.device)
 
@@ -924,10 +968,13 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module,
             layer.weight_scale.data.T.contiguous(), requires_grad=False)
 
 
-def apply_fp8_block_linear(layer: torch.nn.Module, input: torch.Tensor,
-                           bias: Optional[torch.Tensor],
-                           cutlass_block_fp8_supported: bool,
-                           use_aiter_and_is_supported: bool) -> torch.Tensor:
+def apply_fp8_block_linear(
+        layer: torch.nn.Module,
+        input: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        cutlass_block_fp8_supported: bool,
+        use_aiter_and_is_supported: bool,
+        is_aiter_swizzled_layout: bool = False) -> torch.Tensor:
     """Apply block-wise FP8 linear operation."""
     assert layer.weight_block_size is not None
 
@@ -940,7 +987,7 @@ def apply_fp8_block_linear(layer: torch.nn.Module, input: torch.Tensor,
         bias=bias,
         cutlass_block_fp8_supported=cutlass_block_fp8_supported,
         use_aiter_and_is_supported=use_aiter_and_is_supported,
-    )
+        is_aiter_swizzled_layout=is_aiter_swizzled_layout)
 
 
 def expert_weight_is_col_major(x: torch.Tensor) -> bool:

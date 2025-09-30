@@ -68,6 +68,11 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = init_logger(__name__)
 
 
+def is_aiter_swizzle_layout_compatible(n: int, k: int,
+                                       layout: tuple[int, int]) -> bool:
+    return n % layout[0] == 0 and k % (layout[1] * 2) == 0
+
+
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
 
@@ -331,6 +336,10 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         size_k_first = True
         input_scale = None
+        use_aiter = (current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER
+                     and envs.VLLM_ROCM_USE_AITER_LINEAR
+                     and current_platform.is_fp8_fnuz())
+
         # TODO(rob): refactor block quant into separate class.
         if self.block_quant:
             assert not self.act_q_static
@@ -341,6 +350,15 @@ class Fp8LinearMethod(LinearMethodBase):
             # Delete the weight_scale_inv parameter to avoid confusion
             # with the weight_scale parameter
             del layer.weight_scale_inv
+
+            n, k = weight.shape
+            self.is_aiter_swizzled_layout = (
+                use_aiter
+                and is_aiter_swizzle_layout_compatible(n, k, (16, 16)))
+
+            if self.is_aiter_swizzled_layout:
+                from aiter.ops.shuffle import shuffle_weight
+                weight = shuffle_weight(weight, layout=(16, 16))
 
         # If checkpoint not serialized fp8, quantize the weights.
         elif not self.quant_config.is_checkpoint_fp8_serialized:
@@ -404,7 +422,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 input=x,
                 bias=bias,
                 cutlass_block_fp8_supported=self.cutlass_block_fp8_supported,
-                use_aiter_and_is_supported=self.use_aiter_and_is_supported)
+                use_aiter_and_is_supported=self.use_aiter_and_is_supported,
+                is_aiter_swizzled_layout=self.is_aiter_swizzled_layout)
 
         return self.fp8_linear.apply(input=x,
                                      weight=layer.weight,
