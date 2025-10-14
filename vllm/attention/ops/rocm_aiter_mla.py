@@ -34,8 +34,8 @@ def aiter_mla_decode_fwd(
     kv_indices: Optional[torch.Tensor] = None,
     kv_last_page_lens: Optional[torch.Tensor] = None,
     logit_cap: float = 0.0,
-):
-    torch.ops.vllm.rocm_aiter_mla_decode_fwd(
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops.vllm.rocm_aiter_mla_decode_fwd(
         q,
         kv_buffer.view(-1, 1, 1, q.shape[-1]),
         o,
@@ -60,10 +60,10 @@ def mla_decode_fwd_impl(
     kv_last_page_lens: Optional[torch.Tensor] = None,
     sm_scale: float = 1.0,
     logit_cap: float = 0.0,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor]:
     from aiter.mla import mla_decode_fwd
 
-    mla_decode_fwd(
+    logits, lse_attn = mla_decode_fwd(
         q,
         kv_buffer.view(-1, 1, 1, q.shape[-1]),
         o,
@@ -75,6 +75,8 @@ def mla_decode_fwd_impl(
         sm_scale=sm_scale,
         logit_cap=logit_cap,
     )
+
+    return logits, lse_attn
 
 
 def mla_decode_fwd_fake(
@@ -88,8 +90,8 @@ def mla_decode_fwd_fake(
     kv_last_page_lens: Optional[torch.Tensor] = None,
     sm_scale: float = 1.0,
     logit_cap: float = 0.0,
-) -> None:
-    pass
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(o), torch.empty_like(q)
 
 
 if current_platform.is_rocm():
