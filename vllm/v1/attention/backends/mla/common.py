@@ -532,8 +532,12 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             self.dcp_world_size = 1
             self.dcp_rank = 0
 
+        self.align_chunk_ctx_to_page_size = (
+            current_platform.is_rocm() and self.dcp_world_size > 1
+        )
+
         # Don't try to access the runner on AMD
-        if self.aot_schedule:
+        if self.aot_schedule or self.align_chunk_ctx_to_page_size:
             self.page_size = self.kv_cache_spec.block_size
 
         self.chunked_prefill_workspace_size = (
@@ -777,7 +781,6 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 # NOTE: it is recommend you read the `Chunked Prefill` section
                 # in the comment at the top of the file before trying to
                 # understand the following code
-
                 # currently we allocate an equal amount of workspace for each
                 # prefill in the batch, we could probably use a more advanced
                 # algorithm here and allocate more workspace to prefills with
@@ -786,7 +789,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     self.chunked_prefill_workspace_size // num_prefills_with_context_cpu
                 )
 
-                if self.aot_schedule:
+                if self.aot_schedule or self.align_chunk_ctx_to_page_size:
                     # align max_context_chunk to page_size by rounding down,
                     # currently the `gather_and_maybe_dequant_cache` kernel
                     # cannot handle `context_chunk_starts` that are not aligned
@@ -820,7 +823,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     chunk_seq_lens, dim=1, out=cu_seq_lens_cpu[:, 1:], dtype=torch.int32
                 )
 
+                print("--dcp_world_size:-----", self.dcp_world_size)
                 if self.dcp_world_size > 1:
+                    print("--max context chunk:-----", max_context_chunk)
                     # Note(hc): The above max_context_chunk already enforces
                     # block_size alignment, DCP just need the block_size can
                     # be divisible by dcp_world_size, because DCP use
