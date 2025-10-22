@@ -29,17 +29,19 @@ def aiter_mla_decode_fwd(
     sm_scale: float,
     qo_indptr: torch.Tensor,
     max_seqlen_qo: int,
+    lse_out: torch.Tensor,
     kv_indptr: torch.Tensor | None = None,
     kv_indices: torch.Tensor | None = None,
     kv_last_page_lens: torch.Tensor | None = None,
     logit_cap: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops.vllm.rocm_aiter_mla_decode_fwd(
+) -> None:
+    torch.ops.vllm.rocm_aiter_mla_decode_fwd(
         q,
         kv_buffer.view(-1, 1, 1, q.shape[-1]),
         o,
         qo_indptr,
         max_seqlen_qo,
+        lse_out,
         kv_indptr,
         kv_indices,
         kv_last_page_lens,
@@ -54,15 +56,16 @@ def mla_decode_fwd_impl(
     o: torch.Tensor,
     qo_indptr: torch.Tensor,
     max_seqlen_qo: int,
+    lse_out: torch.Tensor,
     kv_indptr: torch.Tensor | None = None,
     kv_indices: torch.Tensor | None = None,
     kv_last_page_lens: torch.Tensor | None = None,
     sm_scale: float = 1.0,
     logit_cap: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> None:
     from aiter.mla import mla_decode_fwd
 
-    logits, lse_attn = mla_decode_fwd(
+    _, attn_lse = mla_decode_fwd(
         q,
         kv_buffer.view(-1, 1, 1, q.shape[-1]),
         o,
@@ -74,8 +77,10 @@ def mla_decode_fwd_impl(
         sm_scale=sm_scale,
         logit_cap=logit_cap,
     )
-
-    return logits, lse_attn
+    # attn_lse size = [batch_size, num_kv_split, num_heads, 1]
+    # we apply in-place maximum reduction along dim=1
+    # to achieve the required size of [batch_size, num_head]
+    torch.amax(attn_lse.squeeze(-1), dim=1, keepdim=False, out=lse_out)
 
 
 def mla_decode_fwd_fake(
@@ -84,13 +89,14 @@ def mla_decode_fwd_fake(
     o: torch.Tensor,
     qo_indptr: torch.Tensor,
     max_seqlen_qo: int,
+    lse_out: torch.Tensor,
     kv_indptr: torch.Tensor | None = None,
     kv_indices: torch.Tensor | None = None,
     kv_last_page_lens: torch.Tensor | None = None,
     sm_scale: float = 1.0,
     logit_cap: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(o), torch.empty_like(q)
+) -> None:
+    pass
 
 
 if current_platform.is_rocm():
@@ -101,7 +107,7 @@ if current_platform.is_rocm():
     direct_register_custom_op(
         op_name="rocm_aiter_mla_decode_fwd",
         op_func=mla_decode_fwd_impl,
-        mutates_args=["o"],
+        mutates_args=["o", "lse_out"],
         fake_impl=mla_decode_fwd_fake,
         tags=tags,
     )

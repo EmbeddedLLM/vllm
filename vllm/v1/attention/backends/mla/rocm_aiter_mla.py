@@ -118,17 +118,21 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         num_decode_tokens: int,
         dcp_tot_seq_lens_device: torch.Tensor | None,
     ) -> AiterMLADecodeMetadata:
+        seq_lens_tensor = seq_lens_device
         page_size = self.kv_cache_spec.block_size
-        block_table_bounds = (seq_lens_device + page_size - 1) // page_size
+        if dcp_tot_seq_lens_device is not None:
+            seq_lens_tensor = dcp_tot_seq_lens_device
+
+        block_table_bounds = (seq_lens_tensor + page_size - 1) // page_size
         device = self.device
-        num_reqs = seq_lens_device.size(0)
+        num_reqs = seq_lens_tensor.size(0)
 
         mask = torch.arange(
             block_table_tensor.size(1), dtype=block_table_tensor.dtype, device=device
         ).unsqueeze(0) < block_table_bounds.unsqueeze(1)
         paged_kv_indices = block_table_tensor[mask]
 
-        paged_kv_last_page_len = seq_lens_device % page_size
+        paged_kv_last_page_len = seq_lens_tensor % page_size
         paged_kv_last_page_len = torch.where(
             paged_kv_last_page_len == 0, page_size, paged_kv_last_page_len
         )
@@ -267,16 +271,21 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         # max_seqlen_qo must be 1 except for MTP
         # TODO: Find the best value for MTP
         max_seqlen_qo = 1
-        logits, lse_attn = aiter_mla_decode_fwd(
+        lse_out = torch.empty(
+            size=(B, q_num_heads), dtype=torch.float32, device=q.device
+        )
+
+        aiter_mla_decode_fwd(
             q,
             kv_buffer,
             o,
             self.scale,
             attn_metadata.decode.qo_indptr,
             max_seqlen_qo,
+            lse_out,
             attn_metadata.decode.paged_kv_indptr,
             attn_metadata.decode.paged_kv_indices,
             attn_metadata.decode.paged_kv_last_page_len,
         )
 
-        return logits, lse_attn
+        return o, lse_out
