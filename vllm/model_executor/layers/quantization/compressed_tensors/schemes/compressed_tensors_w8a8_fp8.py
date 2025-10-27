@@ -161,7 +161,15 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             raise ValueError(f"Unknown quantization strategy {self.strategy}")
 
         # required by torch.compile to be torch.nn.Parameter
-        layer.weight = Parameter(weight.data, requires_grad=False)
+        layer.weight = Parameter(weight.t(), requires_grad=False)
+        # if self.fp8_linear.is_rocm_aiter_enabled:
+        #     from aiter.ops.shuffle import shuffle_weight
+
+        #     # keep the weight as (N, K)
+        #     layer.weight = Parameter(shuffle_weight(weight), requires_grad=False)
+        # else:
+        #     # keep the weight as (K, N)
+        #     layer.weight = Parameter(weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(weight_scale.data, requires_grad=False)
         if input_scale is not None:
             layer.input_scale = Parameter(input_scale.data, requires_grad=False)
