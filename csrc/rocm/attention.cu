@@ -331,8 +331,8 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,         // [num_seqs, num_heads, head_size]
     const cache_t* __restrict__ k_cache,    // [num_blocks, num_kv_heads, head_size/x, block_size, x]
     const cache_t* __restrict__ v_cache,    // [num_blocks, num_kv_heads, head_size, block_size]
-    const int num_kv_heads,   
-    const float scale,    
+    const int num_kv_heads,
+    const float scale,
     const int* __restrict__ block_tables,   // [num_seqs, max_num_blocks_per_seq]
     const int* __restrict__ seq_lens,   // [num_seqs]
     const int* __restrict__ query_start_loc_ptr,   // [num_seqs]
@@ -345,7 +345,8 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
     float* __restrict__ max_logits,         // [num_seqs, num_heads, max_num_partitions]
     scalar_t* __restrict__ out,             // [num_seqs, num_heads, max_num_partitions, head_size]
     OUTT* __restrict__ final_out,           // [num_seqs, num_heads, head_size]
-    int max_ctx_blocks, const float* k_scale, const float* v_scale) {
+    int max_ctx_blocks, const float* k_scale, const float* v_scale,
+    const float* __restrict__ sinks) {      // [num_heads]
   // clang-format on
   constexpr int NWARPS = NUM_THREADS / WARP_SIZE;
   const auto warpid = threadIdx.x / WARP_SIZE;
@@ -676,7 +677,17 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
   }
 
   // calculate qk_max and exp_sum per warp and write to shared memory
-  float qk_max = -FLT_MAX;
+  // Initialize qk_max with sink value if sinks are provided
+  float qk_max;
+  if (sinks != nullptr && lane16id < GQA_RATIO) {
+    qk_max = sinks[global_qhead_idx];
+  } else {
+    qk_max = -FLT_MAX;
+  }
+  // Broadcast the sink value within the 16-lane group
+  if (sinks != nullptr) {
+    qk_max = __shfl(qk_max, lane16id % GQA_RATIO, 16);
+  }
   float exp_sum = 0.0f;
 
   for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
@@ -946,7 +957,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
     float* __restrict__ max_logits,         // [num_seqs, num_heads, max_num_partitions]
     scalar_t* __restrict__ out,             // [num_seqs, num_heads, max_num_partitions, head_size]
     OUTT* __restrict__ final_out,           // [num_seqs, num_heads, head_size]
-    int max_ctx_blocks, const float* k_scale, const float* v_scale) {
+    int max_ctx_blocks, const float* k_scale, const float* v_scale,
+    const float* __restrict__ sinks) {      // [num_heads]
   // clang-format on
   constexpr int NWARPS = NUM_THREADS / WARP_SIZE;
   const auto warpid = threadIdx.x / WARP_SIZE;
@@ -1001,7 +1013,14 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
 
   for (int h = 0; h < QHLOOP; h++) {
     d_out[h] = {0};
-    qk_max[h] = -FLT_MAX;
+    // Initialize qk_max with sink value if sinks are provided
+    const int qhead_idx = h * 4 + lane4id;
+    const int global_qhead_idx = blockIdx.z * GQA_RATIO + qhead_idx;
+    if (sinks != nullptr && qhead_idx < GQA_RATIO) {
+      qk_max[h] = sinks[global_qhead_idx];
+    } else {
+      qk_max[h] = -FLT_MAX;
+    }
   }
 
   const auto wg_start_head_idx = blockIdx.z * GQA_RATIO;
@@ -1223,7 +1242,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
     const int bpermute_mask = 4 * (16 * ((laneid >> 2) % 4) + lane4id);
 
     for (int h = 0; h < QHLOOP; h++) {
-      qk_max[h] = -FLT_MAX;
+      // Don't reset qk_max - it was already initialized with sinks at line 1016-1023
+      // Just update it with fmaxf to preserve the sink floor value
       for (int i = 0; i < 4; i++) {
         qk_max[h] = (lane4_token_idx + i < seq_len)
                         ? fmaxf(qk_max[h], d_out[h][i])
@@ -1748,7 +1768,8 @@ __launch_bounds__(NUM_THREADS, 3) void paged_attention_ll4mi_QKV_mfma16_kernel(
     scalar_t* __restrict__ out,    // [num_seqs, num_heads, max_num_partitions,
                                    // head_size]
     OUTT* __restrict__ final_out,  // [num_seqs, num_heads, head_size]
-    int max_ctx_blocks, const float* k_scale, const float* v_scale) {
+    int max_ctx_blocks, const float* k_scale, const float* v_scale,
+    const float* __restrict__ sinks) {      // [num_heads]
   // clang-format on
   constexpr int NWARPS = NUM_THREADS / WARP_SIZE;  // 8 warps on gfx11
   const int warpid = threadIdx.x / WARP_SIZE;
@@ -1985,7 +2006,20 @@ __launch_bounds__(NUM_THREADS, 3) void paged_attention_ll4mi_QKV_mfma16_kernel(
   }
 
   // calculate qk_max and exp_sum per warp and write to shared memory
-  float qk_max = -FLT_MAX;
+  // Initialize qk_max with sink value if sinks are provided
+  // Note: global_qhead_idx was already computed at line 1867
+  const int local_qhead_idx = 2 * warpid + rowid;
+  const int global_qhead_idx = wg_start_head_idx + local_qhead_idx;
+  float qk_max;
+  if (sinks != nullptr && local_qhead_idx < GQA_RATIO) {
+    qk_max = sinks[global_qhead_idx];
+  } else {
+    qk_max = -FLT_MAX;
+  }
+  // Broadcast sink value across all lanes in the same row
+  if (sinks != nullptr && local_qhead_idx < GQA_RATIO) {
+    qk_max = __shfl(qk_max, rowid * 16, 32);
+  }
   float exp_sum = 0.0f;
   const int qkout_token_idx =
       partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid;
@@ -2185,7 +2219,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
     scalar_t* __restrict__ out,    // [num_seqs, num_heads, max_num_partitions,
                                    // head_size]
     OUTT* __restrict__ final_out,  // [num_seqs, num_heads, head_size]
-    int max_ctx_blocks, const float* k_scale, const float* v_scale) {
+    int max_ctx_blocks, const float* k_scale, const float* v_scale,
+    const float* __restrict__ sinks) {      // [num_heads]
   UNREACHABLE_CODE
 }
 
@@ -2516,7 +2551,8 @@ __launch_bounds__(NUM_THREADS, 3) void paged_attention_ll4mi_QKV_mfma16_kernel(
     scalar_t* __restrict__ out,    // [num_seqs, num_heads, max_num_partitions,
                                    // head_size]
     OUTT* __restrict__ final_out,  // [num_seqs, num_heads, head_size]
-    int max_ctx_blocks, const float* k_scale, const float* v_scale) {
+    int max_ctx_blocks, const float* k_scale, const float* v_scale,
+    const float* __restrict__ sinks) {      // [num_heads]
   // clang-format on
   constexpr int NWARPS = NUM_THREADS / WARP_SIZE;  // 8 warps on gfx11
   const int warpid = threadIdx.x / WARP_SIZE;
@@ -2752,7 +2788,20 @@ __launch_bounds__(NUM_THREADS, 3) void paged_attention_ll4mi_QKV_mfma16_kernel(
   }
 
   // calculate qk_max and exp_sum per warp and write to shared memory
-  float qk_max = -FLT_MAX;
+  // Initialize qk_max with sink value if sinks are provided
+  // Note: global_qhead_idx was already computed at line 2651
+  const int local_qhead_idx = 2 * warpid + rowid;
+  const int global_qhead_idx = wg_start_head_idx + local_qhead_idx;
+  float qk_max;
+  if (sinks != nullptr && local_qhead_idx < GQA_RATIO) {
+    qk_max = sinks[global_qhead_idx];
+  } else {
+    qk_max = -FLT_MAX;
+  }
+  // Broadcast sink value across all lanes in the same row
+  if (sinks != nullptr && local_qhead_idx < GQA_RATIO) {
+    qk_max = __shfl(qk_max, rowid * 16, 32);
+  }
   float exp_sum = 0.0f;
   const int qkout_token_idx =
       partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 8;
@@ -2918,7 +2967,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
     scalar_t* __restrict__ out,    // [num_seqs, num_heads, max_num_partitions,
                                    // head_size]
     OUTT* __restrict__ final_out,  // [num_seqs, num_heads, head_size]
-    int max_ctx_blocks, const float* k_scale, const float* v_scale) {
+    int max_ctx_blocks, const float* k_scale, const float* v_scale,
+    const float* __restrict__ sinks) {      // [num_heads]
   UNREACHABLE_CODE
 }
 
@@ -3147,7 +3197,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     float* __restrict__ max_logits,           // [num_seqs, num_heads, max_num_partitions]
     scalar_t* __restrict__ out,               // [num_seqs, num_heads, max_num_partitions, head_size]
     OUTT* __restrict__ final_out,             // [num_seqs, num_heads, head_size]
-    int max_ctx_blocks, const float* k_scale, const float* v_scale) {
+    int max_ctx_blocks, const float* k_scale, const float* v_scale,
+    const float* __restrict__ sinks) {      // [num_heads]
   UNREACHABLE_CODE
 }
 
@@ -3174,7 +3225,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
     float* __restrict__ max_logits,          // [num_seqs, num_heads, max_num_partitions]
     scalar_t* __restrict__ out,              // [num_seqs, num_heads, max_num_partitions, head_size]
     OUTT* __restrict__ final_out,            // [num_seqs, num_heads, head_size]
-    int max_ctx_blocks, const float* k_scale, const float* v_scale) {
+    int max_ctx_blocks, const float* k_scale, const float* v_scale,
+    const float* __restrict__ sinks) {      // [num_heads]
   UNREACHABLE_CODE
 }
 
@@ -3205,7 +3257,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
           block_tables_ptr, seq_lens_ptr, query_start_loc_ptr,                 \
           max_num_blocks_per_seq, alibi_slopes_ptr, q_stride, kv_block_stride, \
           kv_head_stride, exp_sums_ptr, max_logits_ptr, tmp_out_ptr, out_ptr,  \
-          max_ctx_blocks, k_scale_ptr, v_scale_ptr);
+          max_ctx_blocks, k_scale_ptr, v_scale_ptr, sinks_ptr);
 
 #define LAUNCH_CUSTOM_ATTENTION_MFMA4(GQA_RATIO)                               \
   paged_attention_ll4mi_QKV_mfma4_kernel<T, KVT, KV_DTYPE, OUTT, BLOCK_SIZE,   \
@@ -3216,7 +3268,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
           block_tables_ptr, seq_lens_ptr, query_start_loc_ptr,                 \
           max_num_blocks_per_seq, alibi_slopes_ptr, q_stride, kv_block_stride, \
           kv_head_stride, exp_sums_ptr, max_logits_ptr, tmp_out_ptr, out_ptr,  \
-          max_ctx_blocks, k_scale_ptr, v_scale_ptr);
+          max_ctx_blocks, k_scale_ptr, v_scale_ptr, sinks_ptr);
 
 #define LAUNCH_CUSTOM_REDUCTION(NPAR_LOOPS)                                 \
   paged_attention_ll4mi_reduce_kernel<T, OUTT, HEAD_SIZE, HEAD_SIZE,        \
@@ -3235,7 +3287,8 @@ void paged_attention_custom_launcher(
     torch::Tensor& block_tables, torch::Tensor& seq_lens,
     const std::optional<torch::Tensor>& query_start_loc, int max_seq_len,
     const std::optional<torch::Tensor>& alibi_slopes, torch::Tensor& k_scale,
-    torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale) {
+    torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
+    const std::optional<torch::Tensor>& sinks) {
   int num_seqs = block_tables.size(0);
   int num_heads = query.size(1);
   int head_size = query.size(2);
@@ -3255,6 +3308,12 @@ void paged_attention_custom_launcher(
   const float* alibi_slopes_ptr =
       alibi_slopes
           ? reinterpret_cast<const float*>(alibi_slopes.value().data_ptr())
+          : nullptr;
+
+  // NOTE: sinks is optional.
+  const float* sinks_ptr =
+      sinks
+          ? reinterpret_cast<const float*>(sinks.value().data_ptr())
           : nullptr;
 
   float* exp_sums_ptr = reinterpret_cast<float*>(exp_sums.data_ptr());
@@ -3391,7 +3450,7 @@ void paged_attention_custom_launcher_navi(
     torch::Tensor& block_tables, torch::Tensor& seq_lens,
     const std::optional<torch::Tensor>& query_start_loc, int max_seq_len,
     const std::optional<torch::Tensor>& alibi_slopes, torch::Tensor& k_scale,
-    torch::Tensor& v_scale) {
+    torch::Tensor& v_scale, const std::optional<torch::Tensor>& sinks) {
   int num_seqs = block_tables.size(0);
   int num_heads = query.size(1);
   int head_size = query.size(2);
@@ -3409,6 +3468,12 @@ void paged_attention_custom_launcher_navi(
 
   // NOTE: Navi does not support alibi_slopes.
   const float* alibi_slopes_ptr = nullptr;
+
+  // NOTE: sinks is optional.
+  const float* sinks_ptr =
+      sinks
+          ? reinterpret_cast<const float*>(sinks.value().data_ptr())
+          : nullptr;
 
   float* exp_sums_ptr = reinterpret_cast<float*>(exp_sums.data_ptr());
   float* max_logits_ptr = reinterpret_cast<float*>(max_logits.data_ptr());
@@ -3561,14 +3626,14 @@ void paged_attention_custom_launcher_navi(
                                     OUTT, PSIZE, ALIBI_ENABLED, MFMA_TYPE>( \
         out, exp_sums, max_logits, tmp_out, query, key_cache, value_cache,  \
         num_kv_heads, scale, block_tables, seq_lens, query_start_loc,       \
-        max_seq_len, alibi_slopes, k_scale, v_scale, fp8_out_scale);        \
+        max_seq_len, alibi_slopes, k_scale, v_scale, fp8_out_scale, sinks); \
   } else {                                                                  \
     paged_attention_custom_launcher_navi<T, KVT, KV_DTYPE, BLK_SIZE,        \
                                          HEAD_SIZE, OUTT, PSIZE,            \
                                          ALIBI_ENABLED, MFMA_TYPE>(         \
         out, exp_sums, max_logits, tmp_out, query, key_cache, value_cache,  \
         num_kv_heads, scale, block_tables, seq_lens, query_start_loc,       \
-        max_seq_len, alibi_slopes, k_scale, v_scale);                       \
+        max_seq_len, alibi_slopes, k_scale, v_scale, sinks);                \
   }
 
 #define CALL_CUSTOM_LAUNCHER_ALIBI(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE,    \
@@ -3655,7 +3720,7 @@ void paged_attention(
     torch::Tensor& query,       // [num_seqs, num_heads, head_size]
     torch::Tensor& key_cache,   // [num_blocks, num_heads, head_size/x, block_size, x]
     torch::Tensor& value_cache, // [num_blocks, num_heads, head_size, block_size]
-    int64_t num_kv_heads, 
+    int64_t num_kv_heads,
     double scale,
     torch::Tensor& block_tables, // [num_seqs, max_num_blocks_per_seq]
     torch::Tensor& seq_lens, // [num_seqs]
@@ -3665,7 +3730,9 @@ void paged_attention(
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
     torch::Tensor& v_scale,
     const std::optional<torch::Tensor>& fp8_out_scale,
-    const std::string& mfma_type) {
+    const std::string& mfma_type,
+    const std::optional<torch::Tensor>& sinks,
+    int64_t sliding_window) {
   // clang-format on
   bool is_navi = is_navi_gpu();
   const int head_size = query.size(2);
