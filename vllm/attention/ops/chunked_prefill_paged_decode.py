@@ -351,6 +351,8 @@ def chunked_prefill_paged_decode(
             k_scale=k_scale,
             v_scale=v_scale,
             fp8_out_scale=output_scale,
+            sinks=sinks,
+            sliding_window=sliding_window,
         )
     else:
         kernel_paged_attention_2d[

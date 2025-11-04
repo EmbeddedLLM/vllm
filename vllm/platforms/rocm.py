@@ -145,25 +145,22 @@ def use_rocm_custom_paged_attention(
     ON_GFX9 = any(arch in GPU_ARCH for arch in ["gfx90a", "gfx942", "gfx950"])
     ON_GFX11_GFX12 = any(arch in GPU_ARCH for arch in ["gfx11", "gfx12"])
 
-    # custom paged attn always supported on V0. On V1, requires sliding window
-    # disabled due to observed numerical discrepancy.
+    # custom paged attn always supported on V0. On V1, now supports sliding window
+    # and sinks after implementation
     if ON_GFX9:
         return (
-            (sliding_window == 0 or sliding_window == (-1, -1))
-            and (qtype == torch.half or qtype == torch.bfloat16)
+            (qtype == torch.half or qtype == torch.bfloat16)
             and (head_size == 64 or head_size == 128)
             and (block_size == 16 or block_size == 32)
             and (gqa_ratio >= 1 and gqa_ratio <= 16)
             and max_seq_len <= 128 * 1024
             and (envs.VLLM_ROCM_CUSTOM_PAGED_ATTN)
             and not (envs.VLLM_ROCM_USE_AITER_PAGED_ATTN and envs.VLLM_ROCM_USE_AITER)
-            and sinks is None
         )
 
     else:
         return (
             ON_GFX11_GFX12
-            and (sliding_window == 0 or sliding_window == (-1, -1))
             and (qtype == torch.half or qtype == torch.bfloat16)
             and head_size == 128
             and block_size == 16
@@ -172,7 +169,6 @@ def use_rocm_custom_paged_attention(
             and alibi_slopes is None
             and kv_cache_dtype == "auto"
             and envs.VLLM_ROCM_CUSTOM_PAGED_ATTN
-            and sinks is None
         )
 
 
