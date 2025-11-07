@@ -26,6 +26,80 @@ There is no extra information on creating a new Python environment for this devi
 Currently, there are no pre-built ROCm wheels.
 
 # --8<-- [end:pre-built-wheels]
+# --8<-- [start:python-only-build]
+
+## Python-Only Build (Without Compilation)
+
+For development workflows where you only modify Python code, you can use precompiled binaries to skip the lengthy compilation process.
+
+### Requirements
+
+- PyTorch 2.9.0 or 2.10.0 with ROCm 7.0
+- Python 3.10, 3.11, 3.12, or 3.13
+- Linux x86_64 platform
+- Access to precompiled wheels (via S3 or local file)
+
+### Installation Steps
+
+1. **Install PyTorch with ROCm**:
+
+    ```bash
+    pip install torch==2.10.0+rocm7.0 -f https://download.pytorch.org/whl/torch_stable.html
+    ```
+
+2. **Install vLLM with precompiled binaries**:
+
+    For production use (when S3 wheels are available):
+
+    ```bash
+    git clone https://github.com/vllm-project/vllm.git
+    cd vllm
+    VLLM_USE_PRECOMPILED=1 pip install -e .
+    ```
+
+    For development/testing with a local wheel:
+
+    ```bash
+    VLLM_USE_PRECOMPILED=1 VLLM_ROCM_WHEEL_URL=file:///path/to/wheel.whl pip install -e .
+    ```
+
+### Supported Configurations
+
+| PyTorch Version | ROCm Version | Python Version | Platform          |
+|-----------------|--------------|----------------|-------------------|
+| 2.9.0          | 7.0          | 3.10-3.13      | manylinux_2_17_x86_64 |
+| 2.10.0         | 7.0          | 3.10-3.13      | manylinux_2_17_x86_64 |
+
+### Benefits
+
+- **Fast installation**: Minutes instead of hours
+- **No compilation toolchain needed**: No need for ROCm development tools
+- **Ideal for Python development**: Perfect when you're only modifying Python code
+- **Editable installs**: Supports `pip install -e .` for development
+
+### Limitations
+
+!!! warning
+    - Cannot modify C++ or HIP kernel code
+    - Requires exact PyTorch and Python version match
+    - Precompiled wheel must exist for your specific configuration
+    - If you see "wheel not found", it will fall back to nightly build
+
+### Development Workflow
+
+For developers building their own precompiled wheels:
+
+1. Build the wheel using GitHub Actions workflow (see `.github/workflows/build-rocm-wheel-matrix.yml`)
+2. Download the wheel artifact from GitHub Actions
+3. Install using the local wheel:
+
+    ```bash
+    VLLM_USE_PRECOMPILED=1 VLLM_ROCM_WHEEL_URL=file:///path/to/vllm-*.whl pip install -e .
+    ```
+
+4. Make Python code changes - they will be reflected immediately without recompilation
+
+# --8<-- [end:python-only-build]
 # --8<-- [start:build-wheel-from-source]
 
 !!! tip

@@ -302,7 +302,9 @@ class precompiled_build_ext(build_ext):
     """Disables extension building when using precompiled binaries."""
 
     def run(self) -> None:
-        assert _is_cuda(), "VLLM_USE_PRECOMPILED is only supported for CUDA builds"
+        assert _is_cuda() or _is_hip(), (
+            "VLLM_USE_PRECOMPILED is only supported for CUDA and ROCm builds"
+        )
 
     def build_extensions(self) -> None:
         print("Skipping build_ext: using precompiled extensions.")
@@ -334,16 +336,26 @@ class precompiled_wheel_utils:
             package_data_patch = {}
 
             with zipfile.ZipFile(wheel_path) as wheel:
-                files_to_copy = [
-                    "vllm/_C.abi3.so",
-                    "vllm/_moe_C.abi3.so",
-                    "vllm/_flashmla_C.abi3.so",
-                    "vllm/_flashmla_extension_C.abi3.so",
-                    "vllm/_sparse_flashmla_C.abi3.so",
-                    "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
-                    "vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so",
-                    "vllm/cumem_allocator.abi3.so",
-                ]
+                # Define platform-specific files to copy
+                if _is_cuda():
+                    files_to_copy = [
+                        "vllm/_C.abi3.so",
+                        "vllm/_moe_C.abi3.so",
+                        "vllm/_flashmla_C.abi3.so",
+                        "vllm/_flashmla_extension_C.abi3.so",
+                        "vllm/_sparse_flashmla_C.abi3.so",
+                        "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
+                        "vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so",
+                        "vllm/cumem_allocator.abi3.so",
+                    ]
+                elif _is_hip():
+                    files_to_copy = [
+                        "vllm/_C.abi3.so",
+                        "vllm/_moe_C.abi3.so",
+                        "vllm/_rocm_C.abi3.so",
+                    ]
+                else:
+                    raise ValueError("Unsupported platform for precompiled builds")
 
                 compiled_regex = re.compile(
                     r"vllm/vllm_flash_attn/(?:[^/.][^/]*/)*(?!\.)[^/]*\.py"
@@ -658,25 +670,65 @@ package_data = {
 
 # If using precompiled, extract and patch package_data (in advance of setup)
 if envs.VLLM_USE_PRECOMPILED:
-    assert _is_cuda(), "VLLM_USE_PRECOMPILED is only supported for CUDA builds"
+    assert _is_cuda() or _is_hip(), (
+        "VLLM_USE_PRECOMPILED is only supported for CUDA and ROCm builds"
+    )
     wheel_location = os.getenv("VLLM_PRECOMPILED_WHEEL_LOCATION", None)
+    if wheel_location is None:
+        wheel_location = os.getenv("VLLM_ROCM_WHEEL_URL", None)
     if wheel_location is not None:
         wheel_url = wheel_location
     else:
         import platform
+        import sys
 
         arch = platform.machine()
-        if arch == "x86_64":
-            wheel_tag = "manylinux1_x86_64"
-        elif arch == "aarch64":
-            wheel_tag = "manylinux2014_aarch64"
+
+        if _is_cuda():
+            # CUDA wheel logic (existing)
+            if arch == "x86_64":
+                wheel_tag = "manylinux1_x86_64"
+            elif arch == "aarch64":
+                wheel_tag = "manylinux2014_aarch64"
+            else:
+                raise ValueError(f"Unsupported architecture: {arch}")
+            base_commit = precompiled_wheel_utils.get_base_commit_in_main_branch()
+            wheel_url = f"https://wheels.vllm.ai/{base_commit}/vllm-1.0.0.dev-cp38-abi3-{wheel_tag}.whl"
+            nightly_wheel_url = f"https://wheels.vllm.ai/nightly/vllm-1.0.0.dev-cp38-abi3-{wheel_tag}.whl"
+        elif _is_hip():
+            # ROCm wheel logic
+            if arch != "x86_64":
+                raise ValueError(
+                    f"ROCm precompiled wheels only support x86_64, got: {arch}"
+                )
+
+            wheel_tag = "manylinux_2_17_x86_64"
+
+            # Detect PyTorch version
+            torch_ver = torch.__version__.split("+")[0]  # e.g., "2.10.0"
+            torch_tag = torch_ver.replace(".", "")[:3]  # e.g., "210"
+
+            # Detect Python version
+            py_ver = f"{sys.version_info.major}{sys.version_info.minor}"  # e.g., "312"
+
+            # Detect ROCm version from PyTorch
+            rocm_ver = "70"  # Default to ROCm 7.0
+            if torch.version.hip:
+                rocm_ver_full = torch.version.hip.split(".")
+                if len(rocm_ver_full) >= 2:
+                    rocm_ver = (
+                        f"{rocm_ver_full[0]}{rocm_ver_full[1]}"  # e.g., "70" for 7.0
+                    )
+
+            # Construct wheel name with version tags
+            wheel_name = f"vllm-1.0.0.dev+rocm{rocm_ver}+torch{torch_tag}-cp{py_ver}-abi3-{wheel_tag}.whl"  # noqa: E501
+
+            base_commit = precompiled_wheel_utils.get_base_commit_in_main_branch()
+            wheel_url = f"https://wheels.vllm.ai/rocm/{base_commit}/{wheel_name}"
+            nightly_wheel_url = f"https://wheels.vllm.ai/rocm/nightly/{wheel_name}"
         else:
-            raise ValueError(f"Unsupported architecture: {arch}")
-        base_commit = precompiled_wheel_utils.get_base_commit_in_main_branch()
-        wheel_url = f"https://wheels.vllm.ai/{base_commit}/vllm-1.0.0.dev-cp38-abi3-{wheel_tag}.whl"
-        nightly_wheel_url = (
-            f"https://wheels.vllm.ai/nightly/vllm-1.0.0.dev-cp38-abi3-{wheel_tag}.whl"
-        )
+            raise ValueError("Unsupported platform for precompiled builds")
+
         from urllib.request import urlopen
 
         try:

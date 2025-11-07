@@ -1,0 +1,155 @@
+name: Build ROCm Wheel Matrix
+
+on:
+  workflow_dispatch:  # Manual trigger only
+    inputs:
+      upload_to_s3:
+        description: 'Upload wheels to S3 (requires AWS credentials)'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  build-rocm-wheels:
+    runs-on: ubuntu-latest
+    container:
+      image: rocm/dev-ubuntu-22.04:7.0-complete
+      options: --user root
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+        pytorch-version: ['2.9.0', '2.10.0']
+
+    name: Build (Python ${{ matrix.python-version }}, PyTorch ${{ matrix.pytorch-version }})
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: |
+          apt-get update
+          apt-get install -y software-properties-common
+          add-apt-repository -y ppa:deadsnakes/ppa
+          apt-get update
+          apt-get install -y python${{ matrix.python-version }} python${{ matrix.python-version }}-dev python${{ matrix.python-version }}-venv python3-pip
+          update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${{ matrix.python-version }} 1
+          update-alternatives --set python3 /usr/bin/python${{ matrix.python-version }}
+          python3 --version
+
+      - name: Install system dependencies
+        run: |
+          apt-get install -y ninja-build git curl
+
+      - name: Install PyTorch ${{ matrix.pytorch-version }} with ROCm 7.0
+        run: |
+          pip3 install torch==${{ matrix.pytorch-version }}+rocm7.0 -f https://download.pytorch.org/whl/torch_stable.html
+
+      - name: Verify PyTorch installation
+        run: |
+          python3 -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+          python3 -c "import torch; print(f'ROCm version: {torch.version.hip}')"
+          python3 -c "import sys; print(f'Python version: {sys.version}')"
+
+      - name: Install build dependencies
+        run: |
+          pip3 install --upgrade pip setuptools wheel
+          pip3 install cmake ninja packaging pybind11
+
+      - name: Build vLLM wheel
+        run: |
+          export VLLM_TARGET_DEVICE=rocm
+          export ROCM_PATH=/opt/rocm
+          export PATH=/opt/rocm/bin:$PATH
+          export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
+          python3 setup.py bdist_wheel --dist-dir=dist
+        env:
+          MAX_JOBS: 4
+
+      - name: Get wheel filename
+        id: wheel-info
+        run: |
+          WHEEL_FILE=$(ls dist/*.whl)
+          WHEEL_NAME=$(basename $WHEEL_FILE)
+          echo "wheel_file=$WHEEL_FILE" >> $GITHUB_OUTPUT
+          echo "wheel_name=$WHEEL_NAME" >> $GITHUB_OUTPUT
+          echo "Built wheel: $WHEEL_NAME"
+
+      - name: Rename wheel with version tags
+        run: |
+          # Extract version information
+          TORCH_VER="${{ matrix.pytorch-version }}"
+          TORCH_TAG=$(echo $TORCH_VER | tr -d '.')
+          TORCH_TAG=${TORCH_TAG:0:3}  # e.g., "29" or "210"
+
+          PY_VER="${{ matrix.python-version }}"
+          PY_TAG=$(echo $PY_VER | tr -d '.')
+
+          # Get current wheel name
+          CURRENT_WHEEL=$(ls dist/*.whl)
+
+          # Construct new wheel name with version tags
+          # Format: vllm-{version}+rocm70+torch{torch_tag}-cp{py_tag}-abi3-manylinux_2_17_x86_64.whl
+          NEW_WHEEL=$(echo $CURRENT_WHEEL | sed -E "s/(-cp[0-9]+)/+rocm70+torch${TORCH_TAG}\1/")
+
+          # Rename the wheel
+          mv $CURRENT_WHEEL $NEW_WHEEL
+
+          echo "Renamed wheel:"
+          ls -lh dist/
+
+      - name: Upload wheel as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-rocm70-torch${{ matrix.pytorch-version }}-py${{ matrix.python-version }}-wheel
+          path: dist/*.whl
+          retention-days: 30
+
+      - name: Upload to S3 (Optional)
+        if: ${{ github.event.inputs.upload_to_s3 == 'true' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-west-2
+        run: |
+          # Install AWS CLI
+          pip3 install awscli
+
+          # Get commit hash
+          COMMIT=$(git rev-parse HEAD)
+
+          # Upload to S3
+          aws s3 cp dist/*.whl s3://vllm-wheels/rocm/${COMMIT}/
+
+          echo "Uploaded wheel to s3://vllm-wheels/rocm/${COMMIT}/"
+
+      - name: Display wheel info
+        run: |
+          pip3 install pkginfo
+          python3 -m pkginfo dist/*.whl
+
+  summary:
+    needs: build-rocm-wheels
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Build Summary
+        run: |
+          echo "## ROCm Wheel Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Built wheels for:" >> $GITHUB_STEP_SUMMARY
+          echo "- Python versions: 3.10, 3.11, 3.12, 3.13" >> $GITHUB_STEP_SUMMARY
+          echo "- PyTorch versions: 2.9.0, 2.10.0" >> $GITHUB_STEP_SUMMARY
+          echo "- ROCm version: 7.0" >> $GITHUB_STEP_SUMMARY
+          echo "- Platform: manylinux_2_17_x86_64" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Total wheels: 8" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.upload_to_s3 }}" == "true" ]; then
+            echo "✅ Wheels uploaded to S3" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "📦 Wheels available as GitHub Actions artifacts" >> $GITHUB_STEP_SUMMARY
+          fi

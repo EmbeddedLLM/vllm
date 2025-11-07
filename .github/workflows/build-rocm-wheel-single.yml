@@ -1,0 +1,72 @@
+name: Build ROCm Wheel (Single Variant - Testing)
+
+on:
+  workflow_dispatch:  # Manual trigger only
+
+jobs:
+  build-rocm-wheel:
+    runs-on: ubuntu-latest
+    container:
+      image: rocm/dev-ubuntu-22.04:7.0-complete
+      options: --user root
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        run: |
+          apt-get update
+          apt-get install -y software-properties-common
+          add-apt-repository -y ppa:deadsnakes/ppa
+          apt-get update
+          apt-get install -y python3.12 python3.12-dev python3.12-venv python3-pip
+          update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
+          update-alternatives --set python3 /usr/bin/python3.12
+          python3 --version
+
+      - name: Install system dependencies
+        run: |
+          apt-get install -y ninja-build git curl
+
+      - name: Install PyTorch 2.10.0 with ROCm 7.0
+        run: |
+          pip3 install torch==2.10.0+rocm7.0 -f https://download.pytorch.org/whl/torch_stable.html
+
+      - name: Verify PyTorch installation
+        run: |
+          python3 -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+          python3 -c "import torch; print(f'ROCm version: {torch.version.hip}')"
+
+      - name: Install build dependencies
+        run: |
+          pip3 install --upgrade pip setuptools wheel
+          pip3 install cmake ninja packaging pybind11
+
+      - name: Build vLLM wheel
+        run: |
+          export VLLM_TARGET_DEVICE=rocm
+          export ROCM_PATH=/opt/rocm
+          export PATH=/opt/rocm/bin:$PATH
+          export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
+          python3 setup.py bdist_wheel --dist-dir=dist
+        env:
+          MAX_JOBS: 4
+
+      - name: List built wheels
+        run: |
+          ls -lh dist/
+          echo "Wheel name:"
+          ls dist/*.whl
+
+      - name: Upload wheel as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-rocm70-torch210-cp312-wheel
+          path: dist/*.whl
+          retention-days: 30
+
+      - name: Display wheel info
+        run: |
+          pip3 install pkginfo
+          python3 -m pkginfo dist/*.whl
