@@ -16,6 +16,10 @@ jobs:
 
       - name: Set up Python 3.12
         run: |
+          # Prevent interactive prompts during package installation
+          export DEBIAN_FRONTEND=noninteractive
+          export TZ=Etc/UTC        
+
           apt-get update
           apt-get install -y software-properties-common
           add-apt-repository -y ppa:deadsnakes/ppa
