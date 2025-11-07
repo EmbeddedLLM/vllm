@@ -9,41 +9,112 @@ jobs:
     container:
       image: rocm/dev-ubuntu-22.04:7.0-complete
       options: --user root
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12 and create virtual environment
+      - name: Install system dependencies
         run: |
           # Prevent interactive prompts during package installation
           export DEBIAN_FRONTEND=noninteractive
           export TZ=Etc/UTC
 
           apt-get update
-          apt-get install -y software-properties-common curl git ninja-build
+          apt-get install -y \
+            software-properties-common \
+            wget \
+            build-essential \
+            libnuma-dev \
+            gcc \
+            g++ \
+            make \
+            git \
+            curl \
+            ca-certificates \
+            patchelf
 
-          # Try to install Python from deadsnakes PPA
-          add-apt-repository -y ppa:deadsnakes/ppa
+      - name: Install Python ${{ matrix.python-version }}
+        run: |
+          # Prevent interactive prompts during package installation
+          export DEBIAN_FRONTEND=noninteractive
+          export TZ=Etc/UTC
+
+          PY_VER="${{ matrix.python-version }}"
+
+          # Check if Python dev package is available in Ubuntu repos
           apt-get update
+          if apt-cache show python${PY_VER}-dev 2>/dev/null | grep -q "Package: python${PY_VER}-dev"; then
+            echo "Installing Python ${PY_VER} from Ubuntu repositories"
+            apt-get install -y \
+              python${PY_VER} \
+              python${PY_VER}-dev \
+              python${PY_VER}-venv
+          else
+            # If not available in Ubuntu repos, install using pyenv
+            echo "Python ${PY_VER} not in Ubuntu repos, installing via pyenv from python.org"
 
-          # Install Python and venv
-          apt-get install -y python3.12 python3.12-dev python3.12-venv
-          python3.12 --version
+            # Install pyenv dependencies
+            apt-get install -y \
+              libssl-dev \
+              zlib1g-dev \
+              libbz2-dev \
+              libreadline-dev \
+              libsqlite3-dev \
+              libncursesw5-dev \
+              xz-utils \
+              tk-dev \
+              libxml2-dev \
+              libxmlsec1-dev \
+              libffi-dev \
+              liblzma-dev
+
+            # Install pyenv
+            export PYENV_ROOT="/root/.pyenv"
+            curl https://pyenv.run | bash
+            export PATH="$PYENV_ROOT/bin:$PATH"
+            eval "$(pyenv init -)"
+
+            # Install Python from official python.org releases
+            pyenv install ${PY_VER}
+            pyenv global ${PY_VER}
+
+            # Create symlink so python${PY_VER} command works
+            INSTALLED_VERSION=$(ls /root/.pyenv/versions/ | grep "^${PY_VER}")
+            ln -sf /root/.pyenv/versions/${INSTALLED_VERSION}/bin/python /usr/local/bin/python${PY_VER}
+            echo "Created symlink: /usr/local/bin/python${PY_VER} -> /root/.pyenv/versions/${INSTALLED_VERSION}/bin/python"
+          fi
+
+          # Verify installation
+          python${PY_VER} --version
+
+      - name: Create virtual environment and install build dependencies
+        run: |
+          PY_VER="${{ matrix.python-version }}"
 
           # Create virtual environment
-          python3.12 -m venv /opt/venv
+          python${PY_VER} -m venv /opt/venv
 
-          # Activate venv and verify
+          # Activate venv and install dependencies
           . /opt/venv/bin/activate
+
+          # Upgrade pip and install build tools
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install build setuptools_scm pybind11 numpy auditwheel
+
+          # Verify
           python --version
-          python -m pip --version
+          pip --version
 
       - name: Install PyTorch 2.10.0 with ROCm 7.0
         run: |
           . /opt/venv/bin/activate
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install torch==2.10.0+rocm7.0 -f https://download.pytorch.org/whl/torch_stable.html
+          python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/nightly/rocm7.0
 
       - name: Verify PyTorch installation
         run: |
