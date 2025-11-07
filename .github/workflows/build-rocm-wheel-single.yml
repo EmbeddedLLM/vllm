@@ -14,46 +14,56 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python 3.12 and create virtual environment
         run: |
           # Prevent interactive prompts during package installation
           export DEBIAN_FRONTEND=noninteractive
-          export TZ=Etc/UTC        
+          export TZ=Etc/UTC
 
           apt-get update
-          apt-get install -y software-properties-common
+          apt-get install -y software-properties-common curl git ninja-build
+
+          # Try to install Python from deadsnakes PPA
           add-apt-repository -y ppa:deadsnakes/ppa
           apt-get update
-          apt-get install -y python3.12 python3.12-dev python3.12-venv python3-pip
-          update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
-          update-alternatives --set python3 /usr/bin/python3.12
-          python3 --version
 
-      - name: Install system dependencies
-        run: |
-          apt-get install -y ninja-build git curl
+          # Install Python and venv
+          apt-get install -y python3.12 python3.12-dev python3.12-venv
+          python3.12 --version
+
+          # Create virtual environment
+          python3.12 -m venv /opt/venv
+
+          # Activate venv and verify
+          . /opt/venv/bin/activate
+          python --version
+          python -m pip --version
 
       - name: Install PyTorch 2.10.0 with ROCm 7.0
         run: |
-          pip3 install torch==2.10.0+rocm7.0 -f https://download.pytorch.org/whl/torch_stable.html
+          . /opt/venv/bin/activate
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install torch==2.10.0+rocm7.0 -f https://download.pytorch.org/whl/torch_stable.html
 
       - name: Verify PyTorch installation
         run: |
-          python3 -c "import torch; print(f'PyTorch version: {torch.__version__}')"
-          python3 -c "import torch; print(f'ROCm version: {torch.version.hip}')"
+          . /opt/venv/bin/activate
+          python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+          python -c "import torch; print(f'ROCm version: {torch.version.hip}')"
 
       - name: Install build dependencies
         run: |
-          pip3 install --upgrade pip setuptools wheel
-          pip3 install cmake ninja packaging pybind11
+          . /opt/venv/bin/activate
+          python -m pip install cmake ninja packaging pybind11
 
       - name: Build vLLM wheel
         run: |
+          . /opt/venv/bin/activate
           export VLLM_TARGET_DEVICE=rocm
           export ROCM_PATH=/opt/rocm
           export PATH=/opt/rocm/bin:$PATH
           export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
-          python3 setup.py bdist_wheel --dist-dir=dist
+          python setup.py bdist_wheel --dist-dir=dist
         env:
           MAX_JOBS: 4
 
@@ -72,5 +82,6 @@ jobs:
 
       - name: Display wheel info
         run: |
-          pip3 install pkginfo
-          python3 -m pkginfo dist/*.whl
+          . /opt/venv/bin/activate
+          python -m pip install pkginfo
+          python -m pkginfo dist/*.whl
