@@ -12,9 +12,6 @@ on:
 jobs:
   build-rocm-wheels:
     runs-on: ubuntu-latest
-    container:
-      image: rocm/dev-ubuntu-22.04:7.0-complete
-      options: --user root
 
     strategy:
       fail-fast: false
@@ -27,65 +24,73 @@ jobs:
     name: Build (Python ${{ matrix.python-version }}, PyTorch nightly)
 
     steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          # Keep tool-cache since we might need it
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false  # Keep Docker since we need it
+          swap-storage: false
+
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }} and create virtual environment
+      - name: Run build in ROCm container
         run: |
-          # Prevent interactive prompts during package installation
-          export DEBIAN_FRONTEND=noninteractive
-          export TZ=Etc/UTC
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            rocm/dev-ubuntu-22.04:7.0-complete \
+            bash -c '
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+              export TZ=Etc/UTC
 
-          apt-get update
-          apt-get install -y software-properties-common curl git ninja-build
+              # Install system dependencies
+              apt-get update
+              apt-get install -y software-properties-common curl git ninja-build
 
-          # Try to install Python from deadsnakes PPA
-          add-apt-repository -y ppa:deadsnakes/ppa
-          apt-get update
+              # Install Python
+              PY_VER="${{ matrix.python-version }}"
+              add-apt-repository -y ppa:deadsnakes/ppa
+              apt-get update
+              apt-get install -y python${PY_VER} python${PY_VER}-dev python${PY_VER}-venv
 
-          # Install Python and venv
-          apt-get install -y python${{ matrix.python-version }} python${{ matrix.python-version }}-dev python${{ matrix.python-version }}-venv
-          python${{ matrix.python-version }} --version
+              # Create virtual environment
+              python${PY_VER} -m venv /opt/venv
+              . /opt/venv/bin/activate
 
-          # Create virtual environment
-          python${{ matrix.python-version }} -m venv /opt/venv
+              # Install build dependencies
+              python -m pip install --upgrade pip setuptools wheel
+              python -m pip install cmake ninja packaging pybind11
 
-          # Activate venv and verify
-          . /opt/venv/bin/activate
-          python --version
-          python -m pip --version
+              # Install PyTorch nightly
+              # Currently using nightly builds - stable releases will be available later
+              # Once stable releases are available, switch matrix to pytorch-version and update to:
+              # python -m pip install torch==VERSION+rocm7.0 -f https://download.pytorch.org/whl/torch_stable.html
+              python -m pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/rocm7.0
 
-      - name: Install PyTorch nightly with ROCm 7.0
-        run: |
-          . /opt/venv/bin/activate
-          python -m pip install --upgrade pip setuptools wheel
-          # Currently using nightly builds - stable releases will be available later
-          # Once stable releases are available, switch matrix to pytorch-version and update to:
-          # python -m pip install torch==VERSION+rocm7.0 -f https://download.pytorch.org/whl/torch_stable.html
-          python -m pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/rocm7.0
+              # Verify PyTorch
+              python -c "import torch; print(f\"PyTorch: {torch.__version__}\")"
+              python -c "import torch; print(f\"ROCm: {torch.version.hip}\")"
+              python -c "import sys; print(f\"Python: {sys.version}\")"
 
-      - name: Verify PyTorch installation
-        run: |
-          . /opt/venv/bin/activate
-          python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
-          python -c "import torch; print(f'ROCm version: {torch.version.hip}')"
-          python -c "import sys; print(f'Python version: {sys.version}')"
+              # Build vLLM wheel
+              export VLLM_TARGET_DEVICE=rocm
+              export ROCM_PATH=/opt/rocm
+              export PATH=/opt/rocm/bin:$PATH
+              export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
+              export MAX_JOBS=4
 
-      - name: Install build dependencies
-        run: |
-          . /opt/venv/bin/activate
-          python -m pip install cmake ninja packaging pybind11
+              python setup.py bdist_wheel --dist-dir=dist
 
-      - name: Build vLLM wheel
-        run: |
-          . /opt/venv/bin/activate
-          export VLLM_TARGET_DEVICE=rocm
-          export ROCM_PATH=/opt/rocm
-          export PATH=/opt/rocm/bin:$PATH
-          export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
-          python setup.py bdist_wheel --dist-dir=dist
-        env:
-          MAX_JOBS: 4
+              # List built wheel
+              ls -lh dist/
+            '
 
       - name: List built wheel
         run: |
@@ -108,9 +113,8 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-west-2
         run: |
-          . /opt/venv/bin/activate
           # Install AWS CLI
-          python -m pip install awscli
+          pip install awscli
 
           # Get commit hash
           COMMIT=$(git rev-parse HEAD)
@@ -122,8 +126,7 @@ jobs:
 
       - name: Display wheel info
         run: |
-          . /opt/venv/bin/activate
-          python -m pip install pkginfo
+          pip install pkginfo
           python -m pkginfo dist/*.whl
 
   summary:
