@@ -110,11 +110,12 @@ jobs:
           python --version
           pip --version
 
-      - name: Install PyTorch 2.10.0 with ROCm 7.0
+      - name: Install PyTorch with ROCm 7.0
         run: |
           . /opt/venv/bin/activate
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/nightly/rocm7.0
+          # Currently using nightly builds - stable releases will be available later
+          # Once stable releases are available, update to: torch==2.X.0+rocm7.0
+          python -m pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/rocm7.0
 
       - name: Verify PyTorch installation
         run: |
@@ -147,7 +148,7 @@ jobs:
       - name: Upload wheel as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: vllm-rocm70-torch210-cp312-wheel
+          name: vllm-rocm70-torch-nightly-py${{ matrix.python-version }}-wheel
           path: dist/*.whl
           retention-days: 30
 
