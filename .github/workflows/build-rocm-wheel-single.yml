@@ -51,7 +51,9 @@ jobs:
                 git \
                 curl \
                 ca-certificates \
-                patchelf
+                patchelf \ 
+                sqlite3 libsqlite3-dev libfmt-dev libmsgpack-dev libsuitesparse-dev \
+                apt-transport-https ca-certificates wget curl
 
               # Install Python
               PY_VER="${{ matrix.python-version }}"
@@ -68,7 +70,15 @@ jobs:
 
               # Install build dependencies
               python -m pip install --upgrade pip setuptools wheel
-              python -m pip install build setuptools_scm pybind11 numpy auditwheel
+              python -m pip install cmake ninja packaging build setuptools_scm pybind11 numpy auditwheel
+
+              # Remove sccache as done in Dockerfile.rocm
+              apt-get purge -y sccache || true
+              python -m pip uninstall -y sccache || true
+              rm -f "$(which sccache)" || true
+
+              # Install ROCm requirements
+              python -m pip install -r requirements/rocm.txt 
 
               # Install PyTorch
               # Currently using nightly builds - stable releases will be available later
