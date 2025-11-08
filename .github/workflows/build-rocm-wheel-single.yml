@@ -35,7 +35,7 @@ jobs:
             rocm/dev-ubuntu-22.04:7.0-complete \
             bash -c '
               set -e
-              # Install system dependencies
+              # Install system dependencies (matching Dockerfile.rocm)
               export DEBIAN_FRONTEND=noninteractive
               export TZ=Etc/UTC
 
@@ -51,9 +51,13 @@ jobs:
                 git \
                 curl \
                 ca-certificates \
-                patchelf \ 
-                sqlite3 libsqlite3-dev libfmt-dev libmsgpack-dev libsuitesparse-dev \
-                apt-transport-https ca-certificates wget curl
+                patchelf \
+                sqlite3 \
+                libsqlite3-dev \
+                libfmt-dev \
+                libmsgpack-dev \
+                libsuitesparse-dev \
+                apt-transport-https
 
               # Install Python
               PY_VER="${{ matrix.python-version }}"
