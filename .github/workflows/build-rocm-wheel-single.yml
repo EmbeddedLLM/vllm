@@ -124,4 +124,4 @@ jobs:
       - name: Display wheel info
         run: |
           pip install pkginfo
-          python -m pkginfo dist/*.whl
+          pkginfo dist/*.whl
