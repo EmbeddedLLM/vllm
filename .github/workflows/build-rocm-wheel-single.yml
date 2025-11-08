@@ -81,13 +81,15 @@ jobs:
               python -m pip uninstall -y sccache || true
               rm -f "$(which sccache)" || true
 
+              # Install ROCm requirements (torch is already satisfied with ROCm version)
+              python -m pip install -r requirements/rocm.txt
+
+              python -m pip uninstall -y torch torchvision torchaudio
+
               # Install PyTorch FIRST (before requirements) to ensure ROCm version is used
               # Currently using nightly builds - stable releases will be available later
               # Once stable releases are available, update to: torch==2.X.0+rocm7.0
               python -m pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/rocm7.0
-
-              # Install ROCm requirements (torch is already satisfied with ROCm version)
-              python -m pip install -r requirements/rocm.txt
 
               # Verify PyTorch
               python -c "import torch; print(f\"PyTorch: {torch.__version__}, ROCm: {torch.version.hip}\")"
