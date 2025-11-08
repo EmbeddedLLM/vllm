@@ -12,17 +12,17 @@ jobs:
         python-version: ["3.12"]
 
     steps:
-      - name: Free Disk Space (Ubuntu)
-        uses: jlumbroso/free-disk-space@main
-        with:
-          # Keep tool-cache since we might need it
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: false  # Keep Docker since we need it
-          swap-storage: false
+      # - name: Free Disk Space (Ubuntu)
+      #   uses: jlumbroso/free-disk-space@main
+      #   with:
+      #     # Keep tool-cache since we might need it
+      #     tool-cache: false
+      #     android: true
+      #     dotnet: true
+      #     haskell: true
+      #     large-packages: true
+      #     docker-images: false  # Keep Docker since we need it
+      #     swap-storage: false
 
       - name: Checkout code
         uses: actions/checkout@v4
