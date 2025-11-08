@@ -5,7 +5,7 @@ on:
 
 jobs:
   build-rocm-wheel:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-l
     strategy:
       fail-fast: false
       matrix:
