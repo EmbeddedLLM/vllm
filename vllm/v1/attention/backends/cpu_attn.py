@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from typing import Optional
+from typing import ClassVar, Optional
 
 import numpy as np
 import torch
@@ -40,23 +40,16 @@ logger = init_logger(__name__)
 
 class TorchSDPABackend(AttentionBackend):
     accept_output_buffer: bool = False
+    supported_dtypes: ClassVar[list[torch.dtype]] = [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ]
 
     @classmethod
-    def get_supported_dtypes(cls) -> list[torch.dtype]:
-        return [torch.float16, torch.bfloat16, torch.float32]
-
-    @classmethod
-    def validate_head_size(cls, head_size: int) -> None:
+    def get_supported_head_sizes(cls) -> list[int]:
         attn_impl = _get_paged_attn_impl()
-        is_valid, supported_head_sizes = attn_impl.validate_head_size(head_size)
-        if not is_valid:
-            attn_type = cls.__name__.removesuffix("Backend")
-            raise ValueError(
-                f"Head size {head_size} is not supported by {attn_type}. "
-                f"Supported head sizes are: {supported_head_sizes}. "
-                "Set VLLM_ATTENTION_BACKEND=FLEX_ATTENTION to use "
-                "FlexAttention backend which supports all head sizes."
-            )
+        return attn_impl.get_supported_head_sizes()
 
     @staticmethod
     def get_name() -> str:
@@ -65,10 +58,6 @@ class TorchSDPABackend(AttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["TorchSDPABackendImpl"]:
         return TorchSDPABackendImpl
-
-    @staticmethod
-    def get_metadata_cls() -> type["AttentionMetadata"]:
-        return TorchSDPAMetadata
 
     @staticmethod
     def get_builder_cls() -> type["TorchSDPAMetadataBuilderV1"]:
@@ -412,7 +401,7 @@ class TorchSDPAMetadataBuilderV1(AttentionMetadataBuilder[TorchSDPAMetadata]):
             num_decode_tokens=num_decode_tokens,
             slot_mapping=slot_mapping,
             # to ensure inference when chunked_prefill is disabled
-            seq_lens=seq_lens_cpu.tolist(),
+            seq_lens=seq_lens_cpu.tolist()[num_decodes:],  # prefill
             decode_seq_lens_tensor=seq_lens_cpu[:num_decodes],  # decode
             decode_max_seq_len=max_decode_seq_len,  # decode
             decode_block_tables=block_table_tensor[:num_decodes],  # decode
@@ -617,7 +606,6 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
                     prefill_meta.prefill_block_tables,
                     self.alibi_slopes,
                 )
-
         if decode_meta := attn_metadata.decode_metadata:
             assert attn_type != AttentionType.ENCODER_ONLY, (
                 "Encoder-only models should not have decode metadata."
@@ -686,7 +674,12 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
         causal_attn = attn_type == AttentionType.DECODER
 
         seq_lens_q, seq_lens_kv = attn_metadata.get_seq_lens(attn_type)
-        start_q, start_kv = 0, 0
+        # Incoming Q and KV contain decoded tokens as well, hence start at an offset
+        # equal to num_decode_tokens since decode requests appear first
+        start_q, start_kv = (
+            attn_metadata.num_decode_tokens,
+            attn_metadata.num_decode_tokens,
+        )
         for seq_len_q, seq_len_kv, mask in zip(seq_lens_q, seq_lens_kv, attn_masks):
             end_q = start_q + seq_len_q
             end_kv = start_kv + seq_len_kv
@@ -759,9 +752,8 @@ def _make_sliding_window_bias(
 
 class _PagedAttention:
     @staticmethod
-    def validate_head_size(head_size: int) -> tuple[bool, list[int]]:
-        SUPPORT_HS = [32, 64, 80, 96, 112, 128, 192, 256]
-        return head_size in SUPPORT_HS, SUPPORT_HS
+    def get_supported_head_sizes() -> list[int]:
+        return [32, 64, 80, 96, 112, 128, 192, 256]
 
     @staticmethod
     def get_kv_cache_shape(
@@ -861,8 +853,8 @@ class _PagedAttention:
 
 class _IPEXPagedAttention(_PagedAttention):
     @staticmethod
-    def validate_head_size(head_size: int) -> tuple[bool, list[int]]:
-        return True, []
+    def get_supported_head_sizes() -> list[int]:
+        return []
 
     @staticmethod
     def split_kv_cache(
