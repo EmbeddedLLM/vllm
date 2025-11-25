@@ -40,6 +40,7 @@ QuantizationMethods = Literal[
     "petit_nvfp4",
     "cpu_gptq",
     "cpu_awq",
+    "sparse",
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
@@ -100,6 +101,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
 
     # lazy import to avoid triggering `torch.compile` too early
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
+    from vllm.model_executor.layers.sparsity import SparseQuantizationConfig
 
     from .auto_round import AutoRoundConfig
     from .awq import AWQConfig
@@ -164,6 +166,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "petit_nvfp4": PetitNvFp4Config,
         "cpu_gptq": CPUGPTQConfig,
         "cpu_awq": CPUAWQConfig,
+        "sparse": SparseQuantizationConfig,
     }
     # Update the `method_to_config` with customized quantization methods.
     method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
