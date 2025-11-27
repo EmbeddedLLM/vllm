@@ -13,8 +13,10 @@ from vllm.attention.backends.abstract import (
     AttentionType,
     MultipleOf,
 )
+from vllm.attention.ops.common import cp_lse_ag_out_rs
 from vllm.attention.ops.merge_attn_states import merge_attn_states
 from vllm.config import VllmConfig
+from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
@@ -23,6 +25,7 @@ from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    get_dcp_local_seq_lens,
     split_decodes_prefills_and_extends,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -174,11 +177,20 @@ logger = init_logger(__name__)
 
 
 @dataclass
+class AiterMHADcpMetadata:
+    paged_kv_indices: torch.Tensor
+    paged_kv_indptr: torch.Tensor
+    max_seq_len: int
+
+
+@dataclass
 class AiterFlashAttentionDecodeMetadata:
     max_query_len: int
     min_query_len: int
     max_seq_len: int
     query_start_loc: torch.Tensor
+
+    dcp_metadata: AiterMHADcpMetadata | None = None
 
 
 @dataclass
@@ -278,10 +290,28 @@ class AiterFlashAttentionMetadataBuilder(
         self.aot_sliding_window: tuple[int, int] | None = None
         self.total_tokens: int = 0
 
+        try:
+            self.dcp_world_size = get_dcp_group().world_size
+            self.dcp_rank = get_dcp_group().rank_in_group
+        except AssertionError:
+            # DCP might not be initialized in testing
+            self.dcp_world_size = 1
+            self.dcp_rank = 0
+
+        global _CP_TOKENS_PER_ITER_ROCM
+        if self.dcp_world_size > 1:
+            _CP_TOKENS_PER_ITER_ROCM = (
+                _CP_TOKENS_PER_ITER_ROCM * 2 // self.dcp_world_size
+            )
+
         self.extend_workspace = torch.empty(
             [2, _CP_TOKENS_PER_ITER_ROCM, self.num_heads_kv, self.headdim],
             dtype=self.model_config.dtype,
             device=device,
+        )
+
+        self.dcp_kv_cache_interleave_size = (
+            self.parallel_config.dcp_kv_cache_interleave_size
         )
 
     def build_for_cudagraph_capture(
@@ -316,18 +346,71 @@ class AiterFlashAttentionMetadataBuilder(
         ) = split_ret
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-
         seq_lens = common_attn_metadata.seq_lens_cpu
-
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        block_table_tensor = common_attn_metadata.block_table_tensor
+        page_size = self.block_size
 
         decode_metadata = None
         if num_decodes > 0:
+            dcp_metadata = None
+            if self.dcp_world_size > 1:
+                block_table_tensor = block_table_tensor[:num_decodes, ...]
+                query_lens_for_decode = query_lens_cpu[:num_decodes]
+                seq_lens_for_decode = common_attn_metadata.seq_lens_cpu[:num_decodes]
+                computed_kv_lens = seq_lens_for_decode - query_lens_for_decode
+
+                dcp_seq_lens = get_dcp_local_seq_lens(
+                    computed_kv_lens,
+                    self.dcp_world_size,
+                    self.dcp_rank,
+                    self.dcp_kv_cache_interleave_size,
+                ).to(self.device)
+
+                dcp_max_seq_len = dcp_seq_lens.max().item()
+
+                bs, _ = block_table_tensor.shape
+                block_table_tensor = (
+                    block_table_tensor.unsqueeze(-1).expand(-1, -1, page_size)
+                    * page_size
+                )
+                block_table_tensor = (
+                    block_table_tensor
+                    + torch.arange(
+                        0,
+                        page_size,
+                        device=block_table_tensor.device,
+                        dtype=block_table_tensor.dtype,
+                    )[None, None, :]
+                )
+                block_table_tensor = block_table_tensor.view(bs, -1)
+
+                mask = torch.arange(
+                    block_table_tensor.size(1),
+                    dtype=block_table_tensor.dtype,
+                    device=self.device,
+                ).unsqueeze(0) < dcp_seq_lens.unsqueeze(1)
+                paged_kv_indices = block_table_tensor[mask]
+
+                paged_kv_indptr = torch.cat(
+                    [
+                        torch.zeros(1, dtype=dcp_seq_lens.dtype, device=self.device),
+                        dcp_seq_lens.cumsum(dim=0, dtype=torch.int32),
+                    ]
+                )
+
+                dcp_metadata = AiterMHADcpMetadata(
+                    paged_kv_indices=paged_kv_indices,
+                    paged_kv_indptr=paged_kv_indptr,
+                    max_seq_len=dcp_max_seq_len,
+                )
+
             decode_metadata = AiterFlashAttentionDecodeMetadata(
                 max_query_len=query_lens_cpu[:num_decodes].max().item(),
                 min_query_len=query_lens_cpu[:num_decodes].min().item(),
                 max_seq_len=seq_lens[:num_decodes].max().item(),
                 query_start_loc=common_attn_metadata.query_start_loc[: num_decodes + 1],
+                dcp_metadata=dcp_metadata,
             )
 
         prefill_metadata = None
@@ -349,6 +432,14 @@ class AiterFlashAttentionMetadataBuilder(
             query_lens_for_extend = query_lens_cpu[num_extends_slice]
             seq_lens_for_extend = common_attn_metadata.seq_lens_cpu[num_extends_slice]
             computed_kv_lens = seq_lens_for_extend - query_lens_for_extend
+
+            if self.dcp_world_size > 1:
+                computed_kv_lens = get_dcp_local_seq_lens(
+                    computed_kv_lens,
+                    self.dcp_world_size,
+                    self.dcp_rank,
+                    self.dcp_kv_cache_interleave_size,
+                )
 
             # allocate the equal amount of workspace for
             # each chunk prefill request
@@ -480,6 +571,8 @@ class AiterFlashAttentionBackend(AttentionBackend):
 
 
 class AiterFlashAttentionImpl(AttentionImpl):
+    can_return_lse_for_decode: bool = True
+
     def __init__(
         self,
         num_heads: int,
@@ -566,6 +659,14 @@ class AiterFlashAttentionImpl(AttentionImpl):
         token_to_batch = chunk_context_metadata.token_to_batch
         total_token_per_batch = chunk_context_metadata.total_token_per_batch
         key_fetched, value_fetched = workspace[0], workspace[1]
+
+        use_dcp = self.dcp_world_size > 1
+        query_for_context = query
+
+        if use_dcp:
+            query = query.contiguous()
+            query_for_context = get_dcp_group().all_gather(query, dim=1)
+
         chunked_output = None
         chunked_lse = None
         for chunk_idx in range(num_chunks):
@@ -586,7 +687,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
             )
 
             suf_out, suf_lse = aiter.flash_attn_varlen_func(
-                q=query,
+                q=query_for_context,
                 k=key_fetched,
                 v=value_fetched,
                 cu_seqlens_q=cu_seqlens_q,
@@ -618,12 +719,98 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 chunked_output = tmp_output
                 chunked_lse = tmp_lse
 
+        if use_dcp:
+            assert chunked_lse is not None
+
+            # FA returns LSE in shape [H, B] but cp_lse_ag_out_rs wants [B, H]
+            chunked_output, chunked_lse = cp_lse_ag_out_rs(
+                chunked_output,
+                chunked_lse.transpose(0, 1),
+                get_dcp_group(),
+                return_lse=True,
+            )
+            chunked_lse = chunked_lse.transpose(0, 1).contiguous()
+
         merge_attn_states(
             output=output,
             prefix_output=chunked_output,
             prefix_lse=chunked_lse,
             suffix_output=out,
             suffix_lse=lse,
+        )
+
+    def _forward_with_dcp(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: AiterFlashAttentionMetadata,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert attn_metadata.decode_metadata is not None
+
+        cu_seqlens_q = attn_metadata.decode_metadata.query_start_loc
+        max_seqlen_q = attn_metadata.decode_metadata.max_query_len
+        query = query.contiguous()
+        query_across_dcp = get_dcp_group().all_gather(query, dim=1)
+
+        dcp_metadata = attn_metadata.decode_metadata.dcp_metadata
+        assert dcp_metadata is not None
+
+        context_attn_out, context_lse = aiter.mha_batch_prefill_func(
+            q=query_across_dcp,
+            k=key_cache.view(-1, self.num_kv_heads, self.head_size),
+            v=value_cache.view(-1, self.num_kv_heads, self.head_size),
+            cu_seqlens_q=cu_seqlens_q,
+            kv_indptr=dcp_metadata.paged_kv_indptr,
+            kv_page_indices=dcp_metadata.paged_kv_indices,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=dcp_metadata.max_seq_len,
+            dropout_p=0.0,
+            softmax_scale=self.scale,
+            causal=True,
+            return_lse=True,
+            window_size=self.sliding_window,
+            alibi_slopes=self.alibi_slopes,
+        )
+
+        context_attn_out_cor, context_lse_cor = cp_lse_ag_out_rs(
+            context_attn_out,
+            context_lse.transpose(0, 1),
+            get_dcp_group(),
+            return_lse=True,
+        )
+        context_lse_cor = context_lse_cor.transpose(0, 1).contiguous()
+
+        query_attn_out, query_lse = aiter.flash_attn_varlen_func(
+            q=query,
+            k=key,
+            v=value,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_q,
+            min_seqlen_q=1,
+            dropout_p=0.0,
+            softmax_scale=self.scale,
+            causal=True,
+            window_size=self.sliding_window,
+            alibi_slopes=self.alibi_slopes,
+            return_lse=True,
+        )
+
+        assert context_attn_out_cor.shape == query_attn_out.shape
+        assert context_lse_cor.shape == query_lse.shape
+        merge_attn_states(
+            output,
+            context_attn_out_cor,
+            context_lse_cor,
+            query_attn_out,
+            query_lse,
         )
 
     def forward(
@@ -773,6 +960,20 @@ class AiterFlashAttentionImpl(AttentionImpl):
             # calculate for decodes
             if num_decodes > 0:
                 assert attn_metadata.decode_metadata is not None
+                if self.dcp_world_size > 1:
+                    self._forward_with_dcp(
+                        query[:num_decode_tokens],
+                        key[:num_decode_tokens],
+                        value[:num_decode_tokens],
+                        key_cache,
+                        value_cache,
+                        output[:num_decode_tokens],
+                        attn_metadata,
+                        layer._k_scale,
+                        layer._v_scale,
+                    )
+                    return output
+
                 _, num_heads, head_size = query.shape
                 nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
                 num_seqs = attn_metadata.seq_lens.shape[0]
