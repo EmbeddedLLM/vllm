@@ -36,7 +36,6 @@ def flash_attn_maxseqlen_wrapper(
             from flash_attn import flash_attn_varlen_func
         else:
             from vllm.attention.utils.fa_utils import flash_attn_varlen_func
-    q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
     output = flash_attn_varlen_func(
         q,
         k,
@@ -48,10 +47,7 @@ def flash_attn_maxseqlen_wrapper(
         dropout_p=0.0,
         causal=False,
     )
-    context_layer = einops.rearrange(
-        output, "(b s) h d -> s b (h d)", b=batch_size
-    ).contiguous()
-    return context_layer
+    return output
 
 
 def flash_attn_maxseqlen_wrapper_fake(
@@ -64,8 +60,8 @@ def flash_attn_maxseqlen_wrapper_fake(
     is_rocm_aiter: bool,
     use_upstream_fa: bool,
 ) -> torch.Tensor:
-    b, s, h, d = q.shape
-    return torch.empty((s, b, h * d), dtype=q.dtype, device=q.device)
+    bs, h, d = q.shape
+    return torch.empty((bs, h, d), dtype=q.dtype, device=q.device)
 
 
 direct_register_custom_op(
@@ -85,9 +81,11 @@ def vit_flash_attn_wrapper(
     is_rocm_aiter: bool,
     use_upstream_fa: bool,
 ) -> torch.Tensor:
-    return torch.ops.vllm.flash_attn_maxseqlen_wrapper(
+    q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+    output = torch.ops.vllm.flash_attn_maxseqlen_wrapper(
         q, k, v, cu_seqlens, max_seqlen, batch_size, is_rocm_aiter, use_upstream_fa
     )
+    return einops.rearrange(output, "(b s) h d -> s b (h d)", b=batch_size).contiguous()
 
 
 # TODO: Once we have a torch 2.10, we can use tensor slices
