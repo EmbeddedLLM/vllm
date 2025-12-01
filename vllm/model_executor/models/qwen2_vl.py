@@ -288,6 +288,81 @@ def apply_rotary_pos_emb_vision(
     return output
 
 
+def apply_rotary_2c_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    inplace: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    CUDA implementation of apply_rotary_2c for vision transformers.
+    Applies rotary embedding to q and k tensors simultaneously.
+    
+    Arguments:
+        q: (batch, seqlen, nheads, headdim)
+        k: (batch, seqlen, nheads, headdim)
+        cos: (seqlen, rotary_dim / 2) - precomputed cosine values
+        sin: (seqlen, rotary_dim / 2) - precomputed sine values
+        inplace: whether to modify q and k in-place
+    Returns:
+        out_q: (batch, seqlen, nheads, headdim)
+        out_k: (batch, seqlen, nheads, headdim)
+    """
+    output_q = q if inplace else torch.empty_like(q)
+    output_k = k if inplace else torch.empty_like(k)
+    
+    rotary_dim = int(cos.shape[1] * 2)
+    headdim = q.shape[-1]
+    
+    # Copy non-rotary dimensions if not inplace
+    if rotary_dim < headdim and not inplace:
+        output_q[..., rotary_dim:].copy_(q[..., rotary_dim:])
+        output_k[..., rotary_dim:].copy_(k[..., rotary_dim:])
+    
+    # Ensure cos/sin have the same dtype as q/k for the kernel
+    cos_cast = cos.to(q.dtype)
+    sin_cast = sin.to(q.dtype)
+    
+    # Call the CUDA kernel
+    torch.ops._C.apply_vision_rotary_2c(
+        output_q, output_k, q, k, cos_cast, sin_cast, rotary_dim
+    )
+    
+    return output_q, output_k
+
+
+def apply_rotary_pos_emb_vision_2c_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply rotary positional embedding to vision Q/K tensors using CUDA kernel.
+    
+    This is an optimized alternative to apply_rotary_pos_emb_vision that
+    processes Q and K tensors simultaneously without concatenation.
+    
+    Arguments:
+        q: (batch, seqlen, nheads, headdim) - query tensor
+        k: (batch, seqlen, nheads, headdim) - key tensor  
+        cos: (seqlen, rotary_dim) - precomputed cosine values (full rotary_dim)
+        sin: (seqlen, rotary_dim) - precomputed sine values (full rotary_dim)
+    Returns:
+        out_q: rotated query tensor
+        out_k: rotated key tensor
+    """
+    # The cos/sin from vLLM are shape [seqlen, rotary_dim] but we need
+    # [seqlen, rotary_dim/2] since the kernel handles the half-splitting
+    rotary_dim = cos.shape[-1]
+    cos_half = cos[..., :rotary_dim // 2]
+    sin_half = sin[..., :rotary_dim // 2]
+    
+    out_q, out_k = apply_rotary_2c_cuda(q, k, cos_half, sin_half)
+    return out_q, out_k
+
+
 class Qwen2VisionAttention(nn.Module):
     def __init__(
         self,

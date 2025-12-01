@@ -223,6 +223,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                 Tensor cos_sin_cache, bool is_neox) -> ()");
   ops.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
 
+  // Vision rotary embedding for Qwen2/3-VL (2-component version)
+  // Applies rotary embedding to q and k tensors simultaneously
+  ops.def(
+    "apply_vision_rotary_2c(Tensor! out_q, Tensor! out_k,"
+    "                       Tensor in_q, Tensor in_k,"
+    "                       Tensor cos, Tensor sin, int rotary_dim) -> ()");
+  ops.impl("apply_vision_rotary_2c", torch::kCUDA, &apply_vision_rotary_2c);
+
   // Quantization ops
 #ifndef USE_ROCM
   // Quantized GEMM for AWQ.

@@ -132,6 +132,12 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
                       std::optional<torch::Tensor> key, int64_t head_size,
                       torch::Tensor& cos_sin_cache, bool is_neox);
 
+
+void apply_vision_rotary_2c(torch::Tensor& out_q, torch::Tensor& out_k,
+                            const torch::Tensor& in_q, const torch::Tensor& in_k,
+                            const torch::Tensor& cos, const torch::Tensor& sin,
+                            int64_t rotary_dim);
+
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 
 void silu_and_mul_quant(torch::Tensor& out, torch::Tensor& input,
