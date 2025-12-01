@@ -342,6 +342,70 @@ class Qwen3_VisionPatchMerger_NoPostShuffleNorm(Qwen3_VisionPatchMerger):
         return self._forward_linear(x)
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "h_idxs": 0,
+        "w_idxs": 0,
+    },
+    enable_if=should_torch_compile_mm_vit,
+)
+class DummyGraph(nn.Module):
+    def __init__(
+        self,
+        num_grid_per_side: int,
+        pos_emb: nn.Embedding,
+        dtype: torch.dtype,
+    ):
+        super().__init__()
+        self.num_grid_per_side = num_grid_per_side
+        self.pos_embed = pos_emb
+        self.dtype = dtype
+
+    def forward(
+        self,
+        h_idxs: torch.Tensor,
+        w_idxs: torch.Tensor,
+    ) -> torch.Tensor:
+        h_floor = h_idxs.to(torch.long)
+        w_floor = w_idxs.to(torch.long)
+        h_ceil = torch.clamp(h_floor + 1, max=self.num_grid_per_side - 1)
+        w_ceil = torch.clamp(w_floor + 1, max=self.num_grid_per_side - 1)
+
+        dh = h_idxs - h_floor
+        dw = w_idxs - w_floor
+
+        # Create meshgrid view for all h, w vars
+        dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
+        h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
+        h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
+
+        # original computation of weights
+        # w00 = (1 - dh_grid) * (1 - dw_grid)
+        # w01 = (1 - dh_grid) * dw_grid
+        # w10 = dh_grid * (1 - dw_grid)
+        # w11 = dh_grid * dw_grid
+        # we reuse w11 here to avoid duplicate
+        # dh_grid * dw_grid computation
+        w11 = dh_grid * dw_grid
+        w10 = dh_grid - w11
+        w01 = dw_grid - w11
+        w00 = 1 - dh_grid - w01
+
+        h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
+        w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
+        h_grid_idx = h_grid * self.num_grid_per_side
+
+        indices = (h_grid_idx + w_grid).reshape(4, -1)
+        weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
+        weights = weights.to(dtype=self.dtype)
+
+        embeds = self.pos_embed(indices)
+        embeds *= weights
+        combined = embeds.sum(dim=0)
+
+        return combined
+
+
 class Qwen3_VisionTransformer(nn.Module):
     def __init__(
         self,
@@ -383,7 +447,15 @@ class Qwen3_VisionTransformer(nn.Module):
                 hidden_size=self.hidden_size,
             )
 
-        self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
+        with set_model_tag("DummyGraph"):
+            self.pos_embed = nn.Embedding(
+                self.num_position_embeddings, self.hidden_size
+            )
+            self.whatever_this_is = DummyGraph(
+                num_grid_per_side=self.num_grid_per_side,
+                pos_emb=self.pos_embed,
+                dtype=self.dtype,
+            )
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
@@ -529,42 +601,7 @@ class Qwen3_VisionTransformer(nn.Module):
                 0, num_grid_per_side - 1, w, dtype=torch.float32, device=self.device
             )
 
-            h_floor = h_idxs.to(torch.long)
-            w_floor = w_idxs.to(torch.long)
-            h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
-            w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
-
-            dh = h_idxs - h_floor
-            dw = w_idxs - w_floor
-
-            # Create meshgrid view for all h, w vars
-            dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
-            h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
-            h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
-
-            # original computation of weights
-            # w00 = (1 - dh_grid) * (1 - dw_grid)
-            # w01 = (1 - dh_grid) * dw_grid
-            # w10 = dh_grid * (1 - dw_grid)
-            # w11 = dh_grid * dw_grid
-            # we reuse w11 here to avoid duplicate
-            # dh_grid * dw_grid computation
-            w11 = dh_grid * dw_grid
-            w10 = dh_grid - w11
-            w01 = dw_grid - w11
-            w00 = 1 - dh_grid - w01
-
-            h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
-            w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
-            h_grid_idx = h_grid * num_grid_per_side
-
-            indices = (h_grid_idx + w_grid).reshape(4, -1)
-            weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
-            weights = weights.to(dtype=self.dtype)
-
-            embeds = self.pos_embed(indices)
-            embeds *= weights
-            combined = embeds.sum(dim=0)
+            combined = self.whatever_this_is(h_idxs, w_idxs)
 
             combined = combined.reshape(
                 h // m_size, m_size, w // m_size, m_size, hidden_dim
