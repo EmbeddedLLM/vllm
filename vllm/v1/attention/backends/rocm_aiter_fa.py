@@ -17,7 +17,6 @@ from vllm.attention.ops.merge_attn_states import merge_attn_states
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import get_cu_count
 from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,
@@ -186,20 +185,18 @@ class AiterFlashAttentionPrefillMetadata:
     max_query_len: int
     min_query_len: int
     max_seq_len: int
+    paged_kv_indices: torch.Tensor
+    paged_kv_indptr: torch.Tensor
     query_start_loc: torch.Tensor
 
 
 @dataclass
-class AiterChunkContextMetadata:
-    workspace: torch.Tensor
-    cu_seq_lens_chunk: torch.Tensor
-    chunk_starts: torch.Tensor
-    token_to_batch: torch.Tensor
-    seq_tot: list[int]
-    max_seq_lens: list[int]
-    seq_lens: torch.Tensor
-    num_chunks: int
-    total_token_per_batch: list[int]
+class AiterMHAMetadata:
+    """Metadata for MHA batch prefill with paged KV cache"""
+
+    paged_kv_indices: torch.Tensor
+    paged_kv_indptr: torch.Tensor
+    max_seq_len: int
 
 
 @dataclass
@@ -208,7 +205,9 @@ class AiterFlashAttentionChunkPrefillMetadata:
     min_query_len: int
     max_seq_len: int
     query_start_loc: torch.Tensor
-    chunk_context_metadata: AiterChunkContextMetadata
+    mha_metadata: AiterMHAMetadata
+    q_indices: torch.Tensor
+    q_indptr: torch.Tensor
 
 
 @dataclass
@@ -318,7 +317,6 @@ class AiterFlashAttentionMetadataBuilder(
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 
         seq_lens = common_attn_metadata.seq_lens_cpu
-
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
         decode_metadata = None
@@ -332,14 +330,36 @@ class AiterFlashAttentionMetadataBuilder(
 
         prefill_metadata = None
         if num_prefills > 0:
+            seq_lens_prefill = seq_lens[num_decodes + num_extends :]
             query_lens_for_prefill = query_lens_cpu[num_decodes + num_extends :]
             query_start_loc_device = common_attn_metadata.query_start_loc[
                 num_decodes + num_extends :
             ]
+
+            # For pure prefill, K/V are contiguous tensors, not paged cache
+            # Create identity mapping: treat each token as its own "page"
+            # This allows mha_batch_prefill_func to work with contiguous K/V
+            total_prefill_tokens = seq_lens_prefill.sum().item()
+
+            # Create identity indices [0, 1, 2, ..., total_prefill_tokens-1]
+            paged_kv_indices = torch.arange(
+                total_prefill_tokens, dtype=torch.int32, device=seq_lens.device
+            )
+
+            # Create indptr that maps each sequence to its token range
+            paged_kv_indptr = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32, device=seq_lens.device),
+                    seq_lens_prefill.cumsum(dim=0, dtype=torch.int32),
+                ]
+            )
+
             prefill_metadata = AiterFlashAttentionPrefillMetadata(
                 max_query_len=query_lens_for_prefill.max().item(),
                 min_query_len=query_lens_for_prefill.min().item(),
-                max_seq_len=seq_lens[num_decodes + num_extends :].max().item(),
+                paged_kv_indices=paged_kv_indices.to(self.device),
+                paged_kv_indptr=paged_kv_indptr.to(self.device),
+                max_seq_len=seq_lens_prefill.max().item(),
                 query_start_loc=query_start_loc_device - query_start_loc_device[0],
             )
 
@@ -350,66 +370,67 @@ class AiterFlashAttentionMetadataBuilder(
             seq_lens_for_extend = common_attn_metadata.seq_lens_cpu[num_extends_slice]
             computed_kv_lens = seq_lens_for_extend - query_lens_for_extend
 
-            # allocate the equal amount of workspace for
-            # each chunk prefill request
-            max_context_chunk = _CP_TOKENS_PER_ITER_ROCM // num_extends
-            num_chunks = cdiv(computed_kv_lens.max().item(), max_context_chunk)
+            page_size = self.block_size
+            block_table_tensor = common_attn_metadata.block_table_tensor
+            block_table_tensor = block_table_tensor[num_extends_slice, ...]
 
-            chunk_starts = (
-                torch.arange(num_chunks, dtype=torch.int32)
-                .unsqueeze(1)
-                .expand(-1, num_extends)
-                * max_context_chunk
+            bs, _ = block_table_tensor.shape
+            block_table_tensor = (
+                block_table_tensor.unsqueeze(-1).expand(-1, -1, page_size) * page_size
             )
-            chunk_ends = torch.min(
-                computed_kv_lens.unsqueeze(0), chunk_starts + max_context_chunk
+            block_table_tensor = (
+                block_table_tensor
+                + torch.arange(
+                    0,
+                    page_size,
+                    device=block_table_tensor.device,
+                    dtype=block_table_tensor.dtype,
+                )[None, None, :]
             )
-            chunk_seq_lens = (chunk_ends - chunk_starts).clamp(
-                min=0
-            )  # [num_chunks, num_extends]
-            cu_seq_lens_cpu = torch.zeros(
-                [num_chunks, num_extends + 1], dtype=torch.int32, pin_memory=True
-            )
-            torch.cumsum(
-                chunk_seq_lens, dim=1, out=cu_seq_lens_cpu[:, 1:], dtype=torch.int32
-            )
-            max_cum_tokens = cu_seq_lens_cpu[:, -1].max().item()
+            block_table_tensor = block_table_tensor.view(bs, -1)
 
-            range_idx = torch.arange(max_cum_tokens, dtype=torch.int32)[None, None, :]
-            idx_to_batch_tensor = range_idx == cu_seq_lens_cpu[:, 1:][:, :, None]
-            idx_to_batch_tensor = idx_to_batch_tensor.sum(
-                dim=1
-            )  # [num_chunks, max_cum_tokens]
-            token_to_batch_tensor = torch.cumsum(idx_to_batch_tensor, dim=1)
+            # Create MHA metadata for cached context
+            mask = torch.arange(
+                block_table_tensor.size(1),
+                dtype=block_table_tensor.dtype,
+                device=computed_kv_lens.device,
+            ).unsqueeze(0) < computed_kv_lens.unsqueeze(1)
+            paged_kv_indices = block_table_tensor[mask]
 
-            chunk_context_metadata = AiterChunkContextMetadata(
-                workspace=self.extend_workspace,
-                cu_seq_lens_chunk=cu_seq_lens_cpu.to(self.device, non_blocking=True),
-                chunk_starts=chunk_starts.to(self.device, non_blocking=True),
-                seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
-                max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
-                seq_lens=chunk_seq_lens,
-                token_to_batch=token_to_batch_tensor.to(self.device, non_blocking=True),
-                num_chunks=num_chunks,
-                total_token_per_batch=cu_seq_lens_cpu[:, -1].tolist(),
+            paged_kv_indptr = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32, device=computed_kv_lens.device),
+                    computed_kv_lens.cumsum(dim=0, dtype=torch.int32),
+                ]
+            )
+
+            mha_metadata = AiterMHAMetadata(
+                paged_kv_indices=paged_kv_indices.to(self.device),
+                paged_kv_indptr=paged_kv_indptr.to(self.device),
+                max_seq_len=computed_kv_lens.max().item(),
             )
 
             query_start_loc_device = common_attn_metadata.query_start_loc[
                 num_decodes : num_decodes + num_extends + 1
             ]
-            seq_lens_device = common_attn_metadata.seq_lens[num_extends_slice]
-            cu_seq_lens = torch.zeros(
-                num_extends + 1, dtype=torch.int32, device=seq_lens_device.device
+
+            # Create identity indices for query tokens (used in extend attention)
+            num_extend_tokens = query_lens_for_extend.sum().item()
+            q_indices = torch.arange(
+                num_extend_tokens, dtype=torch.int32, device=self.device
             )
-            torch.cumsum(
-                seq_lens_device, dim=0, dtype=cu_seq_lens.dtype, out=cu_seq_lens[1:]
+            q_indptr = (query_start_loc_device - query_start_loc_device[0]).to(
+                torch.int32
             )
+
             extend_metadata = AiterFlashAttentionChunkPrefillMetadata(
                 max_query_len=query_lens_for_extend.max().item(),
                 min_query_len=query_lens_for_extend.min().item(),
                 max_seq_len=seq_lens[num_extends_slice].max().item(),
                 query_start_loc=query_start_loc_device - query_start_loc_device[0],
-                chunk_context_metadata=chunk_context_metadata,
+                mha_metadata=mha_metadata,
+                q_indices=q_indices,
+                q_indptr=q_indptr,
             )
 
         num_actual_kv_tokens = torch.sum(seq_lens).item()
@@ -524,104 +545,64 @@ class AiterFlashAttentionImpl(AttentionImpl):
 
     def extend_forward(
         self,
-        attn_metadata: AiterFlashAttentionMetadata,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         output: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
-        min_seqlen_q: int,
-        block_table: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        k_scale: float,
-        v_scale: float,
-    ):
-        out, lse = aiter.flash_attn_varlen_func(
+        attn_metadata: AiterFlashAttentionMetadata,
+    ) -> torch.Tensor:
+        assert attn_metadata.extend_metadata is not None
+
+        cu_seqlens_q = attn_metadata.extend_metadata.query_start_loc
+        max_seqlen_q = attn_metadata.extend_metadata.max_query_len
+
+        # Step 1: Attention on new tokens (Q attending to new K/V with causal mask)
+        out, lse = aiter.mha_batch_prefill_func(
             q=query,
             k=key,
             v=value,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_q,
+            kv_indptr=attn_metadata.extend_metadata.q_indptr,
+            kv_page_indices=attn_metadata.extend_metadata.q_indices,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_q,
-            min_seqlen_q=min_seqlen_q,
             dropout_p=0.0,
             softmax_scale=self.scale,
             causal=True,
+            return_lse=True,
             window_size=self.sliding_window,
             alibi_slopes=self.alibi_slopes,
-            return_lse=True,
         )
-        assert attn_metadata.extend_metadata is not None
-        chunk_context_metadata = attn_metadata.extend_metadata.chunk_context_metadata
-        num_chunks = chunk_context_metadata.num_chunks
-        workspace = chunk_context_metadata.workspace
-        cu_seqlens_kv = chunk_context_metadata.cu_seq_lens_chunk
-        max_seqlens = chunk_context_metadata.max_seq_lens
-        chunk_starts = chunk_context_metadata.chunk_starts
-        token_to_batch = chunk_context_metadata.token_to_batch
-        total_token_per_batch = chunk_context_metadata.total_token_per_batch
-        key_fetched, value_fetched = workspace[0], workspace[1]
-        chunked_output = None
-        chunked_lse = None
-        for chunk_idx in range(num_chunks):
-            cp_mha_gather_cache(
-                key_cache=key_cache,
-                value_cache=value_cache,
-                key=key_fetched,
-                value=value_fetched,
-                block_tables=block_table,
-                k_scales=k_scale,
-                v_scales=v_scale,
-                cu_seqlens_kv=cu_seqlens_kv[chunk_idx],
-                token_to_batch=token_to_batch[chunk_idx],
-                seq_starts=chunk_starts[chunk_idx],
-                dequant=False,
-                kv_cache_layout="NHD",
-                total_tokens=total_token_per_batch[chunk_idx],
-            )
 
-            suf_out, suf_lse = aiter.flash_attn_varlen_func(
-                q=query,
-                k=key_fetched,
-                v=value_fetched,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_kv[chunk_idx],
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlens[chunk_idx],
-                min_seqlen_q=min_seqlen_q,
-                dropout_p=0.0,
-                softmax_scale=self.scale,
-                causal=False,
-                window_size=self.sliding_window,
-                alibi_slopes=self.alibi_slopes,
-                return_lse=True,
-            )
-            if chunked_output is None:
-                chunked_output = suf_out
-                chunked_lse = suf_lse
-            else:
-                tmp_output = torch.empty_like(out)
-                tmp_lse = torch.empty_like(lse)
-                merge_attn_states(
-                    output=tmp_output,
-                    output_lse=tmp_lse,
-                    prefix_output=chunked_output,
-                    prefix_lse=chunked_lse,
-                    suffix_output=suf_out,
-                    suffix_lse=suf_lse,
-                )
-                chunked_output = tmp_output
-                chunked_lse = tmp_lse
+        # Step 2: Attention on cached context (Q attending to cached K/V)
+        mha_metadata = attn_metadata.extend_metadata.mha_metadata
+        key_cache_flat = key_cache.view(-1, self.num_kv_heads, self.head_size)
+        value_cache_flat = value_cache.view(-1, self.num_kv_heads, self.head_size)
 
+        context_attn_out, context_lse = aiter.mha_batch_prefill_func(
+            q=query,
+            k=key_cache_flat,
+            v=value_cache_flat,
+            cu_seqlens_q=cu_seqlens_q,
+            kv_indptr=mha_metadata.paged_kv_indptr,
+            kv_page_indices=mha_metadata.paged_kv_indices,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=mha_metadata.max_seq_len,
+            dropout_p=0.0,
+            softmax_scale=self.scale,
+            causal=False,  # No causal mask for cached context
+            return_lse=True,
+            window_size=self.sliding_window,
+            alibi_slopes=self.alibi_slopes,
+        )
+
+        # Step 3: Merge attention on new tokens with attention on cached context
         merge_attn_states(
             output=output,
-            prefix_output=chunked_output,
-            prefix_lse=chunked_lse,
+            prefix_output=context_attn_out,
+            prefix_lse=context_lse,
             suffix_output=out,
             suffix_lse=lse,
         )
@@ -720,16 +701,15 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 prefill_query = query[num_decode_tokens + num_extend_tokens :]
                 prefill_key = key[num_decode_tokens + num_extend_tokens :]
                 prefill_value = value[num_decode_tokens + num_extend_tokens :]
-
-                aiter.flash_attn_varlen_func(
+                aiter.mha_batch_prefill_func(
                     q=prefill_query,
                     k=prefill_key,
                     v=prefill_value,
                     cu_seqlens_q=attn_metadata.prefill_metadata.query_start_loc,
-                    cu_seqlens_k=attn_metadata.prefill_metadata.query_start_loc,
+                    kv_indptr=attn_metadata.prefill_metadata.paged_kv_indptr,
+                    kv_page_indices=attn_metadata.prefill_metadata.paged_kv_indices,
                     max_seqlen_q=attn_metadata.prefill_metadata.max_query_len,
                     max_seqlen_k=attn_metadata.prefill_metadata.max_seq_len,
-                    min_seqlen_q=1,
                     dropout_p=0.0,
                     softmax_scale=self.scale,
                     causal=True,
@@ -749,25 +729,13 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 extend_values = value[extend_tokens_slice]
                 extend_outputs = output[extend_tokens_slice]
                 self.extend_forward(
-                    attn_metadata=attn_metadata,
                     query=extend_querys,
                     key=extend_keys,
                     value=extend_values,
                     key_cache=key_cache,
                     value_cache=value_cache,
                     output=extend_outputs,
-                    cu_seqlens_q=attn_metadata.extend_metadata.query_start_loc,
-                    max_seqlen_q=attn_metadata.extend_metadata.max_query_len,
-                    max_seqlen_k=attn_metadata.extend_metadata.max_seq_len,
-                    min_seqlen_q=1,
-                    block_table=attn_metadata.block_table[
-                        num_decodes : num_decodes + num_extends
-                    ],
-                    slot_mapping=attn_metadata.slot_mapping[
-                        num_decodes : num_decodes + num_extends
-                    ],
-                    k_scale=layer._k_scale,
-                    v_scale=layer._v_scale,
+                    attn_metadata=attn_metadata,
                 )
 
             # calculate for decodes
