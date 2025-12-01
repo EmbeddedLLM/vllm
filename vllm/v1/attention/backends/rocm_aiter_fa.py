@@ -13,8 +13,9 @@ from vllm.attention.backends.abstract import (
     AttentionType,
     MultipleOf,
 )
+from vllm.attention.layer import Attention
 from vllm.attention.ops.merge_attn_states import merge_attn_states
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.platform_utils import get_cu_count
@@ -56,58 +57,55 @@ if current_platform.is_rocm():
         head_size,
         x,
         max_block_num,
-        num_tokens,
-        num_programs,
         DEQUANT: tl.constexpr,
         PAGE_SIZE: tl.constexpr,
         CACHE_FORMAT: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
-        bid = tl.program_id(0)
+        token_id = tl.program_id(0)
         col_offsets = tl.arange(0, BLOCK_SIZE)
         if DEQUANT:
             k_scale = tl.load(k_scale_ptr)
             v_scale = tl.load(v_scale_ptr)
 
-        for token_id in tl.range(bid, num_tokens, num_programs):
-            key_ptr_offset = key_ptr + token_id * head_size * num_heads
-            value_ptr_offset = value_ptr + token_id * head_size * num_heads
-            batch_idx = tl.load(token_to_batch_ptr + token_id)
-            batch_start = tl.load(seq_start_ptr + batch_idx)
-            token_start = tl.load(cu_seqlens_kv_ptr + batch_idx)
-            batch_offset = token_id - token_start + batch_start
-            block_offset = batch_offset // PAGE_SIZE
-            block_id = tl.load(
-                block_table_ptr + max_block_num * batch_idx + block_offset
+        key_ptr_offset = key_ptr + token_id * head_size * num_heads
+        value_ptr_offset = value_ptr + token_id * head_size * num_heads
+        batch_idx = tl.load(token_to_batch_ptr + token_id)
+        batch_start = tl.load(seq_start_ptr + batch_idx)
+        token_start = tl.load(cu_seqlens_kv_ptr + batch_idx)
+        batch_offset = token_id - token_start + batch_start
+        block_offset = batch_offset // PAGE_SIZE
+        block_id = tl.load(
+            block_table_ptr + max_block_num * batch_idx + block_offset
+        ).to(tl.int64)
+        slot_id = batch_offset % PAGE_SIZE
+
+        if CACHE_FORMAT == "NHD":
+            # for kv cache layout as
+            # K: [num_blocks, page_size, num_head, head_dim]
+            # V: [num_blocks, page_size, num_head, head_dim]
+            key_cache_ptr_offset = (
+                key_cache_ptr
+                + block_id * num_heads * head_size * PAGE_SIZE
+                + slot_id * num_heads * head_size
             )
-            slot_id = batch_offset % PAGE_SIZE
+            value_cache_ptr_offset = (
+                value_cache_ptr
+                + block_id * num_heads * head_size * PAGE_SIZE
+                + slot_id * num_heads * head_size
+            )
 
-            if CACHE_FORMAT == "NHD":
-                # for kv cache layout as
-                # K: [num_blocks, page_size, num_head, head_dim]
-                # V: [num_blocks, page_size, num_head, head_dim]
-                key_cache_ptr_offset = (
-                    key_cache_ptr
-                    + block_id * num_heads * head_size * PAGE_SIZE
-                    + slot_id * num_heads * head_size
-                )
-                value_cache_ptr_offset = (
-                    value_cache_ptr
-                    + block_id * num_heads * head_size * PAGE_SIZE
-                    + slot_id * num_heads * head_size
-                )
-
-                for i in tl.range(0, head_size * num_heads, BLOCK_SIZE):
-                    mask = (col_offsets + i) < head_size * num_heads
-                    k_reg = tl.load(key_cache_ptr_offset + col_offsets + i, mask=mask)
-                    v_reg = tl.load(value_cache_ptr_offset + col_offsets + i, mask=mask)
-                    if DEQUANT:
-                        k_dtype = k_reg.dtype
-                        v_dtype = v_reg.dtype
-                        k_reg = (k_reg.to(tl.float32) * k_scale).to(k_dtype)
-                        v_reg = (v_reg.to(tl.float32) * v_scale).to(v_dtype)
-                    tl.store(key_ptr_offset + col_offsets + i, k_reg, mask=mask)
-                    tl.store(value_ptr_offset + col_offsets + i, v_reg, mask=mask)
+            for i in tl.range(0, head_size * num_heads, BLOCK_SIZE):
+                mask = (col_offsets + i) < head_size * num_heads
+                k_reg = tl.load(key_cache_ptr_offset + col_offsets + i, mask=mask)
+                v_reg = tl.load(value_cache_ptr_offset + col_offsets + i, mask=mask)
+                if DEQUANT:
+                    k_dtype = k_reg.dtype
+                    v_dtype = v_reg.dtype
+                    k_reg = (k_reg.to(tl.float32) * k_scale).to(k_dtype)
+                    v_reg = (v_reg.to(tl.float32) * v_scale).to(v_dtype)
+                tl.store(key_ptr_offset + col_offsets + i, k_reg, mask=mask)
+                tl.store(value_ptr_offset + col_offsets + i, v_reg, mask=mask)
 
     def cp_mha_gather_cache(
         key_cache: torch.Tensor,
@@ -142,9 +140,7 @@ if current_platform.is_rocm():
         page_size = key_cache.shape[1]
         num_heads = key_cache.shape[2]
 
-        NUM_PRGMS = num_programs(total_tokens)
-        BLOCK_SIZE = block_size(key_cache, head_dim)
-        grid = lambda meta: (NUM_PRGMS,)
+        grid = lambda meta: (total_tokens,)
         cp_mha_gather_cache_kernel[grid](
             key_cache,
             value_cache,
@@ -160,12 +156,10 @@ if current_platform.is_rocm():
             head_dim,
             x,
             block_tables.size(1),
-            total_tokens,
-            NUM_PRGMS,
             DEQUANT=dequant,
             PAGE_SIZE=page_size,
             CACHE_FORMAT=kv_cache_layout,
-            BLOCK_SIZE=BLOCK_SIZE,
+            BLOCK_SIZE=head_dim,
         )
 
 
@@ -277,11 +271,19 @@ class AiterFlashAttentionMetadataBuilder(
         self.aot_sliding_window: tuple[int, int] | None = None
         self.total_tokens: int = 0
 
-        self.extend_workspace = torch.empty(
-            [2, _CP_TOKENS_PER_ITER_ROCM, self.num_heads_kv, self.headdim],
-            dtype=self.model_config.dtype,
-            device=device,
-        )
+        sliding_window_configs: set[tuple[int, int] | None] = set()
+        layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+        for layer in layers.values():
+            assert isinstance(layer.impl, AiterFlashAttentionImpl)
+            sliding_window_configs.add(layer.impl.sliding_window)
+
+        while len(sliding_window_configs) > 0:
+            sliding_window_config = sliding_window_configs.pop()
+            if sliding_window_config is not None and sliding_window_config[0] != -1:
+                assert self.aot_sliding_window is None, (
+                    "Aiter Flash ATTENTION can only support one valid sliding window!"
+                )
+                self.aot_sliding_window = sliding_window_config
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -468,7 +470,10 @@ class AiterFlashAttentionMetadataBuilder(
 class AiterFlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
-    supported_kernel_block_sizes: ClassVar[list[int | MultipleOf]] = [MultipleOf(16)]
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        return [MultipleOf(16)]
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -522,9 +527,9 @@ class AiterFlashAttentionImpl(AttentionImpl):
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
         if sliding_window is None:
-            self.sliding_window = [-1, -1]
+            self.sliding_window = (-1, -1)
         else:
-            self.sliding_window = [sliding_window - 1, 0]
+            self.sliding_window = (sliding_window - 1, 0)
         self.kv_cache_dtype = kv_cache_dtype
         if logits_soft_cap is None:
             # In flash-attn, setting logits_soft_cap as 0 means no soft cap.
@@ -535,12 +540,9 @@ class AiterFlashAttentionImpl(AttentionImpl):
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
-        if attn_type != AttentionType.DECODER:
+        if attn_type not in [AttentionType.DECODER, AttentionType.ENCODER_DECODER]:
             raise NotImplementedError(
-                "Encoder self-attention and "
-                "encoder/decoder cross-attention "
-                "are not implemented for "
-                "FlashAttentionImpl"
+                "Encoder self-attention is not implemented for FlashAttentionImpl"
             )
 
     def extend_forward(
@@ -656,7 +658,14 @@ class AiterFlashAttentionImpl(AttentionImpl):
         # performance to make sure it does not introduce any overhead.
         num_actual_tokens = attn_metadata.num_actual_tokens
         key_cache, value_cache = kv_cache.unbind(0)
-        if self.kv_sharing_target_layer_name is None:
+        # key and value may be None in the case of cross attention. They are
+        # calculated once based on the output from the encoder and then cached
+        # in KV cache.
+        if (
+            self.kv_sharing_target_layer_name is None
+            and key is not None
+            and value is not None
+        ):
             # Reshape the input keys and values and store them in the cache.
             # Skip this if sharing KV cache with an earlier attention layer.
             # NOTE(woosuk): Here, key and value are padded while slot_mapping
@@ -682,8 +691,10 @@ class AiterFlashAttentionImpl(AttentionImpl):
 
         # decode:extend:prefill
         query = query[:num_actual_tokens]
-        key = key[:num_actual_tokens]
-        value = value[:num_actual_tokens]
+        if key is not None:
+            key = key[:num_actual_tokens]
+        if value is not None:
+            value = value[:num_actual_tokens]
 
         output_actual_tokens = output[:num_actual_tokens]
 
@@ -740,6 +751,36 @@ class AiterFlashAttentionImpl(AttentionImpl):
 
             # calculate for decodes
             if num_decodes > 0:
+                assert attn_metadata.decode_metadata is not None
+                if self.sliding_window[0] != -1:
+                    from aiter.ops.triton.unified_attention import (
+                        unified_attention,
+                    )
+
+                    descale_shape = (
+                        attn_metadata.query_start_loc[:num_decodes].shape[0] - 1,
+                        key_cache.shape[2],
+                    )
+                    unified_attention(
+                        q=query[:num_decode_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[:num_decode_tokens],
+                        cu_seqlens_q=attn_metadata.query_start_loc[:num_decodes],
+                        max_seqlen_q=1,  # optimize this
+                        seqused_k=attn_metadata.seq_lens[:num_decodes],
+                        max_seqlen_k=attn_metadata.max_seq_len,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=self.sliding_window,
+                        block_table=attn_metadata.block_table[:num_decodes],
+                        softcap=self.logits_soft_cap,
+                        q_descale=None,
+                        k_descale=layer._k_scale.expand(descale_shape),
+                        v_descale=layer._v_scale.expand(descale_shape),
+                    )
+                    return
                 assert attn_metadata.decode_metadata is not None
                 _, num_heads, head_size = query.shape
                 nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
