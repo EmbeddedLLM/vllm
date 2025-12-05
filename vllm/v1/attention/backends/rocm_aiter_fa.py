@@ -179,8 +179,6 @@ class AiterFlashAttentionPrefillMetadata:
     max_query_len: int
     min_query_len: int
     max_seq_len: int
-    paged_kv_indices: torch.Tensor
-    paged_kv_indptr: torch.Tensor
     query_start_loc: torch.Tensor
 
 
@@ -200,8 +198,6 @@ class AiterFlashAttentionChunkPrefillMetadata:
     max_seq_len: int
     query_start_loc: torch.Tensor
     mha_metadata: AiterMHAMetadata
-    q_indices: torch.Tensor
-    q_indptr: torch.Tensor
 
 
 @dataclass
@@ -332,36 +328,15 @@ class AiterFlashAttentionMetadataBuilder(
 
         prefill_metadata = None
         if num_prefills > 0:
-            seq_lens_prefill = seq_lens[num_decodes + num_extends :]
             query_lens_for_prefill = query_lens_cpu[num_decodes + num_extends :]
             query_start_loc_device = common_attn_metadata.query_start_loc[
                 num_decodes + num_extends :
             ]
 
-            # For pure prefill, K/V are contiguous tensors, not paged cache
-            # Create identity mapping: treat each token as its own "page"
-            # This allows mha_batch_prefill_func to work with contiguous K/V
-            total_prefill_tokens = seq_lens_prefill.sum().item()
-
-            # Create identity indices [0, 1, 2, ..., total_prefill_tokens-1]
-            paged_kv_indices = torch.arange(
-                total_prefill_tokens, dtype=torch.int32, device=seq_lens.device
-            )
-
-            # Create indptr that maps each sequence to its token range
-            paged_kv_indptr = torch.cat(
-                [
-                    torch.zeros(1, dtype=torch.int32, device=seq_lens.device),
-                    seq_lens_prefill.cumsum(dim=0, dtype=torch.int32),
-                ]
-            )
-
             prefill_metadata = AiterFlashAttentionPrefillMetadata(
                 max_query_len=query_lens_for_prefill.max().item(),
                 min_query_len=query_lens_for_prefill.min().item(),
-                paged_kv_indices=paged_kv_indices.to(self.device),
-                paged_kv_indptr=paged_kv_indptr.to(self.device),
-                max_seq_len=seq_lens_prefill.max().item(),
+                max_seq_len=seq_lens.max().item(),
                 query_start_loc=query_start_loc_device - query_start_loc_device[0],
             )
 
@@ -391,7 +366,6 @@ class AiterFlashAttentionMetadataBuilder(
             )
             block_table_tensor = block_table_tensor.view(bs, -1)
 
-            # Create MHA metadata for cached context
             mask = torch.arange(
                 block_table_tensor.size(1),
                 dtype=block_table_tensor.dtype,
@@ -416,23 +390,12 @@ class AiterFlashAttentionMetadataBuilder(
                 num_decodes : num_decodes + num_extends + 1
             ]
 
-            # Create identity indices for query tokens (used in extend attention)
-            num_extend_tokens = query_lens_for_extend.sum().item()
-            q_indices = torch.arange(
-                num_extend_tokens, dtype=torch.int32, device=self.device
-            )
-            q_indptr = (query_start_loc_device - query_start_loc_device[0]).to(
-                torch.int32
-            )
-
             extend_metadata = AiterFlashAttentionChunkPrefillMetadata(
                 max_query_len=query_lens_for_extend.max().item(),
                 min_query_len=query_lens_for_extend.min().item(),
                 max_seq_len=seq_lens[num_extends_slice].max().item(),
                 query_start_loc=query_start_loc_device - query_start_loc_device[0],
                 mha_metadata=mha_metadata,
-                q_indices=q_indices,
-                q_indptr=q_indptr,
             )
 
         num_actual_kv_tokens = torch.sum(seq_lens).item()
@@ -561,21 +524,21 @@ class AiterFlashAttentionImpl(AttentionImpl):
         max_seqlen_q = attn_metadata.extend_metadata.max_query_len
 
         # Step 1: Attention on new tokens (Q attending to new K/V with causal mask)
-        out, lse = aiter.mha_batch_prefill_func(
+        out, lse = aiter.flash_attn_varlen_func(
             q=query,
             k=key,
             v=value,
             cu_seqlens_q=cu_seqlens_q,
-            kv_indptr=attn_metadata.extend_metadata.q_indptr,
-            kv_page_indices=attn_metadata.extend_metadata.q_indices,
+            cu_seqlens_k=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_q,
+            min_seqlen_q=1,
             dropout_p=0.0,
             softmax_scale=self.scale,
             causal=True,
-            return_lse=True,
             window_size=self.sliding_window,
             alibi_slopes=self.alibi_slopes,
+            return_lse=True,
         )
 
         # Step 2: Attention on cached context (Q attending to cached K/V)
@@ -712,15 +675,16 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 prefill_query = query[num_decode_tokens + num_extend_tokens :]
                 prefill_key = key[num_decode_tokens + num_extend_tokens :]
                 prefill_value = value[num_decode_tokens + num_extend_tokens :]
-                aiter.mha_batch_prefill_func(
+
+                aiter.flash_attn_varlen_func(
                     q=prefill_query,
                     k=prefill_key,
                     v=prefill_value,
                     cu_seqlens_q=attn_metadata.prefill_metadata.query_start_loc,
-                    kv_indptr=attn_metadata.prefill_metadata.paged_kv_indptr,
-                    kv_page_indices=attn_metadata.prefill_metadata.paged_kv_indices,
+                    cu_seqlens_k=attn_metadata.prefill_metadata.query_start_loc,
                     max_seqlen_q=attn_metadata.prefill_metadata.max_query_len,
                     max_seqlen_k=attn_metadata.prefill_metadata.max_seq_len,
+                    min_seqlen_q=1,
                     dropout_p=0.0,
                     softmax_scale=self.scale,
                     causal=True,
