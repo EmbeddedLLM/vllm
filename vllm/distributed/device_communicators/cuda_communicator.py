@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from importlib.util import find_spec
 
 import torch
 from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed.device_communicators.all_reduce_utils import (
     should_nccl_symm_mem_allreduce,
 )
@@ -71,6 +73,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device=self.device,
             )
 
+        if current_platform.is_rocm():
+            if (
+                rocm_aiter_ops.is_custom_allreduce_enabled()
+                and find_spec("aiter.dist.device_communicators.custom_all_reduce")
+                is not None
+            ):
+                from aiter.dist.device_communicators.custom_all_reduce import (
+                    CustomAllreduce as AiterCustomAllreduce,
+                )
+            else:
+                AiterCustomAllreduce = None
+        else:
+            AiterCustomAllreduce = None
+
+        self.aiter_ca_comm: AiterCustomAllreduce | None = None
+
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             self.ca_comm = CustomAllreduce(
@@ -88,6 +106,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 # If it's a rocm, 'use_custom_allreduce==True' means it must
                 # currently be an MI300 series.
                 self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+
+                # Initialize aiter's custom allreduce implementation.
+                # This communicator contains aiter's collective fusion ops
+                # like all-reduce + RMSNorm.
+                # This communicator is controlled by the
+                # VLLM_ROCM_USE_AITER_CUSTOM_ALL_REDUCE environment variable.
+                if AiterCustomAllreduce is not None:
+                    self.aiter_ca_comm = AiterCustomAllreduce(
+                        group=self.cpu_group,
+                        device=self.device,
+                    )
 
         if self.use_all2all:
             if self.all2all_backend == "naive":

@@ -8,7 +8,6 @@ import torch._inductor.pattern_matcher as pm
 from torch import fx
 from torch._inductor.pattern_matcher import PatternMatcherPass
 
-import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
@@ -26,17 +25,10 @@ logger = init_logger(__name__)
 def is_rocm_aiter_allreduce_rmsnorm_enabled() -> bool:
     if not current_platform.is_rocm():
         return False
-    if not envs.VLLM_ROCM_USE_AITER:
-        return False
-
-    try:
-        from importlib.util import find_spec
-
-        if find_spec("aiter") is None:
-            return False
-    except ImportError:
-        return False
-    return True
+    return (
+        rocm_aiter_ops.is_rmsnorm_enabled()
+        and rocm_aiter_ops.is_custom_allreduce_enabled()
+    )
 
 
 def _can_use_fused_ar_rms(input_: torch.Tensor, world_size: int) -> bool:
@@ -65,18 +57,16 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
 
     device_comm = group.device_communicator
     if device_comm is not None:
-        ca_comm = getattr(device_comm, "ca_comm", None)
-        use_aiter_ca = getattr(device_comm, "use_aiter_custom_allreduce", False)
+        aiter_ca_comm = getattr(device_comm, "aiter_ca_comm", None)
 
         if (
-            use_aiter_ca
-            and ca_comm is not None
-            and not ca_comm.disabled
-            and ca_comm.should_custom_ar(input_)
+            aiter_ca_comm is not None
+            and not aiter_ca_comm.disabled
+            and aiter_ca_comm.should_custom_ar(input_)
             and _can_use_fused_ar_rms(input_, device_comm.world_size)
-            and hasattr(ca_comm, "custom_fused_ar_rms")
+            and hasattr(aiter_ca_comm, "custom_fused_ar_rms")
         ):
-            out, res_out = ca_comm.custom_fused_ar_rms(
+            out, res_out = aiter_ca_comm.custom_fused_ar_rms(
                 input_, residual, weight, epsilon
             )
             return out, res_out
@@ -117,19 +107,18 @@ def _rocm_aiter_fused_allreduce_rmsnorm_no_residual_impl(
 
     device_comm = group.device_communicator
     if device_comm is not None:
-        ca_comm = getattr(device_comm, "ca_comm", None)
-        use_aiter_ca = getattr(device_comm, "use_aiter_custom_allreduce", False)
+        aiter_ca_comm = getattr(device_comm, "aiter_ca_comm", None)
 
         if (
-            use_aiter_ca
-            and ca_comm is not None
-            and not ca_comm.disabled
-            and ca_comm.should_custom_ar(input_)
+            aiter_ca_comm is not None
+            and not aiter_ca_comm.disabled
+            and aiter_ca_comm.should_custom_ar(input_)
             and _can_use_fused_ar_rms(input_, device_comm.world_size)
-            and hasattr(ca_comm, "custom_fused_ar_rms")
+            and hasattr(aiter_ca_comm, "custom_fused_ar_rms")
         ):
-            # Use AITER's fused all-reduce + RMSNorm kernel
-            out, _ = ca_comm.custom_fused_ar_rms(input_, residual, weight, epsilon)
+            out, _ = aiter_ca_comm.custom_fused_ar_rms(
+                input_, residual, weight, epsilon
+            )
             return out
 
     # Fallback: launch all-reduce and rmsnorm separately
