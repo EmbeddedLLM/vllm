@@ -264,13 +264,12 @@ class RocmPlatform(Platform):
         # Handle automatic backend selection based on environment variables
         if selected_backend is None:
             # Priority 1: Check for AITER Unified Attention (must check before MHA)
-            if envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION:
+            if rocm_aiter_ops.is_triton_unified_attn_enabled():
                 logger.info("Using Aiter Unified Attention backend.")
                 return AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN.get_path()
 
             # Priority 2: Check for AITER MHA (Flash Attention)
-            # Only use if explicitly enabled (not just VLLM_ROCM_USE_AITER=1)
-            if envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_MHA and on_gfx9():
+            if rocm_aiter_ops.is_mha_enabled():
                 logger.info("Using Aiter Flash Attention backend.")
                 return AttentionBackendEnum.ROCM_AITER_FA.get_path()
 
@@ -278,16 +277,6 @@ class RocmPlatform(Platform):
             if envs.VLLM_V1_USE_PREFILL_DECODE_ATTENTION:
                 logger.info("Using Rocm Attention backend.")
                 return AttentionBackendEnum.ROCM_ATTN.get_path()
-
-            # Priority 4: Check for AITER enabled without specific flags
-            # This defaults to AITER FA only if MHA is not explicitly disabled
-            if (
-                envs.VLLM_ROCM_USE_AITER
-                and on_gfx9()
-                and envs.VLLM_ROCM_USE_AITER_MHA is not False
-            ):
-                logger.info("Using Aiter Flash Attention backend.")
-                return AttentionBackendEnum.ROCM_AITER_FA.get_path()
 
             # Priority 5: If model is Encoder-only self-attention type
             if (
@@ -430,7 +419,7 @@ class RocmPlatform(Platform):
 
         if cache_config and cache_config.block_size is None:
             if (
-                envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION and envs.VLLM_ROCM_USE_AITER
+                rocm_aiter_ops.is_triton_unified_attn_enabled()
                 # NOTE: This block has been deprecated
                 # or get_env_variable_attn_backend()
                 # == AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN

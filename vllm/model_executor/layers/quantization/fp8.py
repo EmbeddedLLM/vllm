@@ -189,7 +189,7 @@ def get_fp8_moe_backend(
             logger.info_once("Using DeepGEMM backend for FP8 MoE", scope="local")
             return Fp8MoeBackend.DEEPGEMM
 
-    if envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_MOE:
+    if rocm_aiter_ops.is_fused_moe_enabled():
         logger.info_once("Using ROCm AITER backend for FP8 MoE", scope="local")
         return Fp8MoeBackend.AITER
 
