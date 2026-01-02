@@ -173,6 +173,7 @@ class AiterFlashAttentionDecodeMetadata:
     min_query_len: int
     max_seq_len: int
     query_start_loc: torch.Tensor
+    workspace: torch.Tensor
 
 
 @dataclass
@@ -257,7 +258,7 @@ class AiterFlashAttentionMetadata:
 class AiterFlashAttentionMetadataBuilder(
     AttentionMetadataBuilder[AiterFlashAttentionMetadata]
 ):
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold: int = 1
 
     def __init__(
@@ -304,6 +305,30 @@ class AiterFlashAttentionMetadataBuilder(
             device=device,
         )
 
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        # Pre-allocate workspace_buffer for decode operations (full graph mode support)
+        self.decode_workspace = self._build_decode_workspace_buffer()
+
+    def _build_decode_workspace_buffer(self) -> torch.Tensor:
+        mtp = self.reorder_batch_threshold - 1
+        max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+        max_model_len = self.model_config.max_model_len
+        max_num_partitions = (
+            max_model_len + _PARTITION_SIZE_ROCM - 1
+        ) // _PARTITION_SIZE_ROCM
+        nbytes_per_qo_elem = torch.finfo(self.model_config.dtype).bits // 8
+        workspace_buffer_size = (
+            max_num_seqs * mtp * self.num_heads_q * max_num_partitions * self.headdim
+        ) * nbytes_per_qo_elem + 2 * (
+            max_num_seqs * mtp * self.num_heads_q * max_num_partitions
+        ) * 4
+
+        return torch.empty(
+            workspace_buffer_size,
+            dtype=torch.uint8,
+            device=self.device,
+        )
+
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ):
@@ -324,6 +349,7 @@ class AiterFlashAttentionMetadataBuilder(
         split_ret = split_decodes_prefills_and_extends(
             common_attn_metadata,
             decode_threshold=self.reorder_batch_threshold,
+            require_uniform=True,
         )
 
         (
@@ -348,6 +374,7 @@ class AiterFlashAttentionMetadataBuilder(
                 min_query_len=query_lens_cpu[:num_decodes].min().item(),
                 max_seq_len=seq_lens[:num_decodes].max().item(),
                 query_start_loc=common_attn_metadata.query_start_loc[: num_decodes + 1],
+                workspace=self.decode_workspace,
             )
 
         prefill_metadata = None
@@ -926,7 +953,8 @@ class AiterFlashAttentionImpl(AttentionImpl):
 
             # calculate for decodes
             if num_decodes > 0:
-                assert attn_metadata.decode_metadata is not None
+                decode_metadata = attn_metadata.decode_metadata
+                assert decode_metadata is not None
                 if self.sliding_window[0] != -1:
                     from aiter.ops.triton.unified_attention import (
                         unified_attention,
@@ -956,21 +984,9 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         v_descale=layer._v_scale.expand(descale_shape),
                     )
                     return
-                assert attn_metadata.decode_metadata is not None
-                _, num_heads, head_size = query.shape
-                nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
-                num_seqs = attn_metadata.seq_lens.shape[0]
-                max_num_partitions = (
-                    attn_metadata.max_seq_len + _PARTITION_SIZE_ROCM - 1
-                ) // _PARTITION_SIZE_ROCM
-
-                workspace_buffer = torch.empty(
-                    (num_seqs * num_heads * max_num_partitions * head_size)
-                    * nbytes_per_qo_elem
-                    + 2 * (num_seqs * num_heads * max_num_partitions) * 4,
-                    dtype=torch.uint8,
-                    device=output.device,
-                )
+                # mtp (multi-token prediction) is needed for speculative decoding
+                mtp = decode_metadata.max_query_len
+                workspace_buffer = decode_metadata.workspace
 
                 torch.ops.aiter.paged_attention_v1(
                     output[:num_decode_tokens],
@@ -980,7 +996,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     value_cache,
                     self.scale,
                     attn_metadata.block_table[:num_decodes],
-                    attn_metadata.query_start_loc[:num_decodes],
+                    decode_metadata.query_start_loc,
                     attn_metadata.seq_lens[:num_decodes],
                     attn_metadata.max_seq_len,
                     self.alibi_slopes,
@@ -991,6 +1007,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     layer._v_scale,
                     None,
                     _PARTITION_SIZE_ROCM,
+                    mtp=mtp,
                 )
         else:
             raise NotImplementedError(

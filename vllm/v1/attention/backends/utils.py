@@ -847,6 +847,7 @@ def subclass_attention_backend_with_overrides(
 def split_decodes_prefills_and_extends(
     common_attn_metadata: CommonAttentionMetadata,
     decode_threshold: int = 1,
+    require_uniform: bool = False,
 ) -> tuple[int, int, int, int, int, int]:
     """
     Assuming a reordered batch, finds the boundary between prefill and decode
@@ -856,6 +857,10 @@ def split_decodes_prefills_and_extends(
         common_attn_metadata: CommonAttentionMetadata object containing the
             batch metadata.
         decode_threshold: The maximum query length to be considered a decode.
+        require_uniform: If True, requires that all decode requests have the
+            same query length. When set, some queries may be considered prefills
+            or extends even if they are <= decode_threshold,
+            in order to ensure uniformity.
 
     Returns:
         num_decodes: The number of decode requests.
@@ -871,11 +876,27 @@ def split_decodes_prefills_and_extends(
     query_start_loc = common_attn_metadata.query_start_loc_cpu
     seq_lens = common_attn_metadata.seq_lens_cpu
 
-    if max_query_len <= decode_threshold:
+    if max_query_len <= decode_threshold and (
+        not require_uniform or decode_threshold <= 1
+    ):
         return num_reqs, 0, 0, num_tokens, 0, 0
 
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
-    is_prefill_or_extend = query_lens > decode_threshold
+    if query_lens[0].item() > decode_threshold:
+        # first request is not decode, so no decode requests
+        return 0, 0, num_reqs, 0, 0, num_tokens
+
+    if require_uniform:
+        # check if we are in a padded uniform batch; this is used for full-CGs, some
+        # requests may have a query length of 0 but since they are padding its fine
+        # to treat them as decodes (ensures num_decodes matches the captured size)
+        if torch.all((query_lens == query_lens[0]) | (query_lens == 0)):
+            assert num_reqs * query_lens[0] == num_tokens, "tokens not padded correctly"
+            return num_reqs, 0, 0, num_tokens, 0, 0  # all decodes
+        is_prefill_or_extend = query_lens != query_lens[0]
+    else:
+        is_prefill_or_extend = query_lens > decode_threshold
+
     is_prefill = (seq_lens == query_lens) & is_prefill_or_extend
     first_extend = is_prefill_or_extend.int().argmax(dim=-1).item()
     first_prefill = is_prefill.int().argmax(dim=-1).item()
