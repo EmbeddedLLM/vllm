@@ -310,7 +310,7 @@ class AiterFlashAttentionMetadataBuilder(
         self.decode_workspace = self._build_decode_workspace_buffer()
 
     def _build_decode_workspace_buffer(self) -> torch.Tensor:
-        mtp = self.reorder_batch_threshold - 1
+        mtp = self.reorder_batch_threshold
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         max_model_len = self.model_config.max_model_len
         max_num_partitions = (
