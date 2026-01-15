@@ -183,8 +183,9 @@ steps:
       # Build base image first
       - "DOCKER_BUILDKIT=1 docker build --build-arg max_jobs=16 --tag rocm/vllm-dev:base-$BUILDKITE_COMMIT --target final --progress plain -f docker/Dockerfile.rocm_base ."
       # Build vLLM ROCm image using the base
-      - "DOCKER_BUILDKIT=1 docker build --build-arg max_jobs=16 --build-arg BASE_IMAGE=rocm/vllm-dev:base-$BUILDKITE_COMMIT --tag public.ecr.aws/q9t5s3a7/vllm-release-repo:$BUILDKITE_COMMIT-rocm --target vllm-openai --progress plain -f docker/Dockerfile.rocm ."
+      - "DOCKER_BUILDKIT=1 docker build --build-arg max_jobs=16 --build-arg BASE_IMAGE=rocm/vllm-dev:base-$BUILDKITE_COMMIT --tag public.ecr.aws/q9t5s3a7/vllm-release-repo:$BUILDKITE_COMMIT-rocm --tag public.ecr.aws/q9t5s3a7/vllm-release-repo:$(buildkite-agent meta-data get release-version)-rocm --target vllm-openai --progress plain -f docker/Dockerfile.rocm ."
       - "docker push public.ecr.aws/q9t5s3a7/vllm-release-repo:$BUILDKITE_COMMIT-rocm"
+      - "docker push public.ecr.aws/q9t5s3a7/vllm-release-repo:$(buildkite-agent meta-data get release-version)-rocm"
 
   
   - label: "Build and publish nightly multi-arch image to DockerHub"
