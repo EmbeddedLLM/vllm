@@ -4,6 +4,7 @@
 
 from dataclasses import dataclass
 from typing import ClassVar
+from functools import cache
 
 import torch
 
@@ -29,13 +30,25 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+
+logger = init_logger(__name__)
+
+
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 if current_platform.is_rocm():
     import aiter
-    from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon, get_recommended_splits
 
     from vllm.triton_utils import tl, triton
+    
+    try:
+        from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon, get_recommended_splits
+        from triton.experimental import gluon
+        from triton.experimental.gluon import language as gl
+    except ImportError:
+        logger.warning("Gluon is not available, pa_decode_gluon will not be used")
+        pa_decode_gluon = None
+        get_recommended_splits = None
 
     def block_size(x, head_dim):
         return min(65536 // x.element_size(), triton.next_power_of_2(head_dim))
@@ -294,9 +307,11 @@ if current_platform.is_rocm():
             QUANT=QUANT,
             IS_FNUZ=current_platform.fp8_dtype() == torch.float8_e4m3fnuz,
         )
-
-
-logger = init_logger(__name__)
+        
+    @cache
+    def pa_can_use_gluon(self) -> bool:
+        # gluon PA is only supported on CDNA3 GPUs
+        return current_platform.on_gfx942() and pa_decode_gluon is not None
 
 
 @dataclass
@@ -440,8 +455,7 @@ class AiterFlashAttentionMetadataBuilder(
             dtype=self.model_config.dtype,
             device=device,
         )
-        self.k_scale: dict[str, torch.Tensor] = {}
-        self.v_scale: dict[str, torch.Tensor] = {}
+        self.scale = torch.tensor([1.0], dtype=torch.float, device=self.device)
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -464,9 +478,10 @@ class AiterFlashAttentionMetadataBuilder(
             common_attn_metadata,
             decode_threshold=self.reorder_batch_threshold,
         )
+        # Allocate scales for fp8 shuffle kv cache with shuffle_kv_cache enabled
         if (
             rocm_aiter_ops.is_shuffle_kv_cache_enabled()
-            and len(self.k_scale) == 0
+            and self.scale.numel() == 1
             and self.vllm_config.cache_config.cache_dtype.startswith("fp8")
         ):
             layers = get_layers_from_vllm_config(self.vllm_config, Attention)
@@ -479,18 +494,11 @@ class AiterFlashAttentionMetadataBuilder(
                 .shape
             )
             num_blocks = kv_cache_shape[1]
-            for layer_names in layers:
-                self.k_scale[layer_names] = torch.ones(
-                    [num_blocks, self.num_heads_kv, self.block_size],
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-                self.v_scale[layer_names] = torch.ones(
-                    [num_blocks, self.num_heads_kv, self.block_size],
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-
+            self.scale = torch.ones(
+                [num_blocks, self.num_heads_kv, self.block_size],
+                dtype=torch.float32,
+                device=self.device,
+            )
         (
             num_decodes,
             num_extends,
@@ -672,8 +680,8 @@ class AiterFlashAttentionMetadataBuilder(
             use_cascade=use_cascade,
             common_prefix_len=common_prefix_len,
             total_tokens=self.total_tokens,
-            k_scale=self.k_scale,
-            v_scale=self.v_scale,
+            k_scale=self.scale,
+            v_scale=self.scale,
         )
         return attn_metadata
 
@@ -834,8 +842,8 @@ class AiterFlashAttentionImpl(AttentionImpl):
         min_seqlen_q: int,
         block_table: torch.Tensor,
         slot_mapping: torch.Tensor,
-        k_scale: float,
-        v_scale: float,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
     ):
         if self.sliding_window[0] != -1:
             self.extend_for_sliding_window(
@@ -1017,12 +1025,8 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     value_cache,
                     attn_metadata.slot_mapping,
                     self.kv_cache_dtype,
-                    attn_metadata.k_scale[layer.layer_name]
-                    if attn_metadata.k_scale is not None
-                    else layer._k_scale,
-                    attn_metadata.v_scale[layer.layer_name]
-                    if attn_metadata.v_scale is not None
-                    else layer._v_scale,
+                    attn_metadata.k_scale,
+                    attn_metadata.v_scale,
                 )
             else:
                 torch.ops._C_cache_ops.reshape_and_cache_flash(
@@ -1087,6 +1091,11 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 extend_keys = key[extend_tokens_slice]
                 extend_values = value[extend_tokens_slice]
                 extend_outputs = output[extend_tokens_slice]
+                k_scale = layer._k_scale
+                v_scale = layer._v_scale
+                if rocm_aiter_ops.is_shuffle_kv_cache_enabled():
+                    k_scale = attn_metadata.k_scale
+                    v_scale = attn_metadata.v_scale
                 self.extend_forward(
                     attn_metadata=attn_metadata,
                     query=extend_querys,
@@ -1105,12 +1114,8 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     slot_mapping=attn_metadata.slot_mapping[
                         num_decodes : num_decodes + num_extends
                     ],
-                    k_scale=attn_metadata.k_scale[layer.layer_name]
-                    if attn_metadata.k_scale is not None
-                    else layer._k_scale,
-                    v_scale=attn_metadata.v_scale[layer.layer_name]
-                    if attn_metadata.v_scale is not None
-                    else layer._v_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
                 )
 
             # calculate for decodes
@@ -1166,11 +1171,12 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     new_key_cache = key_cache.view_as(k_cache_template)
                     new_value_cache = value_cache.view_as(v_cache_template)
                     
+                    # TODO: Make this dispatching workable with cudagraphs
+                    # max_seq_len = attn_metadata.max_seq_len
+                    # use_gluon = num_decode_tokens < 8 and max_seq_len / num_decode_tokens > 2048 if self.kv_cache_dtype.startswith("fp8") else 
+                    # use_gluon = use_gluon and pa_can_use_gluon()
                     
-                    if False:
-                        k_scale = attn_metadata.k_scale[layer.layer_name] if attn_metadata.k_scale is not None else layer._k_scale
-                        v_scale = attn_metadata.v_scale[layer.layer_name] if attn_metadata.v_scale is not None else layer._v_scale
-
+                    if True:
                         _, num_q_heads_total, _ = query.shape
                         query_group_size = num_q_heads_total // num_kv_heads
                         assert num_q_heads_total % num_kv_heads == 0
@@ -1193,6 +1199,8 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             *intermediate_shape, head_size, dtype=query.dtype, device=query.device
                         )
                         
+                        k_scale = attn_metadata.k_scale
+                        v_scale = attn_metadata.v_scale
                         per_tensor = k_scale.numel() == 1
                         if not per_tensor:
                             k_scale = k_scale.unsqueeze(-1)
@@ -1234,12 +1242,8 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             block_tables_stride0=attn_metadata.block_table[
                                 :num_decodes
                             ].stride(0),
-                            K_QScale=attn_metadata.k_scale[layer.layer_name]
-                            if attn_metadata.k_scale is not None
-                            else layer._k_scale,
-                            V_QScale=attn_metadata.v_scale[layer.layer_name]
-                            if attn_metadata.v_scale is not None
-                            else layer._v_scale,
+                            K_QScale=attn_metadata.k_scale,
+                            V_QScale=attn_metadata.v_scale,
                             out_=output[:num_decode_tokens],
                         )
                 else:

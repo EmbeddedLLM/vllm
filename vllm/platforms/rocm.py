@@ -107,6 +107,12 @@ def on_gfx9() -> bool:
 
 
 @cache
+def on_gfx942() -> bool:
+    GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
+    return any(arch in GPU_ARCH for arch in ["gfx942"])
+
+
+@cache
 def on_gfx950() -> bool:
     GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
     return any(arch in GPU_ARCH for arch in ["gfx950"])
@@ -537,7 +543,6 @@ class RocmPlatform(Platform):
         # only device 0 is checked, this assumes MI300 platforms are homogeneous
         return "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
 
-    @cache
     @classmethod
     def fp8_dtype(cls) -> torch.dtype:
         if cls.is_fp8_fnuz():
