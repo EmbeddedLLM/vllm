@@ -3,6 +3,7 @@
 """Attention layer with AiterFlashAttention."""
 
 from dataclasses import dataclass
+from functools import cache
 from typing import ClassVar
 
 import torch
@@ -29,12 +30,24 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+logger = init_logger(__name__)
+
+
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 if current_platform.is_rocm():
     import aiter
 
     from vllm.triton_utils import tl, triton
+
+    try:
+        from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon, get_recommended_splits
+        from triton.experimental import gluon
+        from triton.experimental.gluon import language as gl
+    except ImportError:
+        logger.warning("Gluon is not available, pa_decode_gluon will not be used")
+        pa_decode_gluon = None
+        get_recommended_splits = None
 
     def block_size(x, head_dim):
         return min(65536 // x.element_size(), triton.next_power_of_2(head_dim))
@@ -298,8 +311,11 @@ if current_platform.is_rocm():
             IS_FNUZ=current_platform.fp8_dtype() == torch.float8_e4m3fnuz,
         )
 
-
-logger = init_logger(__name__)
+    @cache
+    def pa_can_use_gluon() -> bool:
+        # gluon PA is only supported on CDNA3 GPUs
+        from vllm.platforms.rocm import on_gfx942
+        return on_gfx942() and pa_decode_gluon is not None
 
 
 @dataclass
@@ -1158,19 +1174,89 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     )
                     new_key_cache = key_cache.view_as(k_cache_template)
                     new_value_cache = value_cache.view_as(v_cache_template)
-                    aiter.pa_fwd_asm(
-                        Q=query[:num_decode_tokens],
-                        K=new_key_cache,
-                        V=new_value_cache,
-                        block_tables=attn_metadata.block_table[:num_decodes],
-                        context_lens=attn_metadata.seq_lens[:num_decodes],
-                        block_tables_stride0=attn_metadata.block_table[
-                            :num_decodes
-                        ].stride(0),
-                        K_QScale=attn_metadata.k_scale,
-                        V_QScale=attn_metadata.v_scale,
-                        out_=output[:num_decode_tokens],
+
+                    # TODO: Fix this
+                    # The gluon PA implementation is faster when num_decodes is small
+                    # for long context lengths (> 2048), but context lengths is not a
+                    # cudagraph-dispatching parameter.
+                    # Therefore, we dispatch the gluon PA when num_decodes is small,
+                    # and allow users to disable it if needed.
+                    use_gluon = (
+                        rocm_aiter_ops.is_mha_shuffle_kv_cache_dispatching_enabled()
+                        and pa_can_use_gluon()
+                        # and num_decode_tokens <= 8
                     )
+
+                    if use_gluon:
+                        _, num_q_heads_total, _ = query.shape
+                        query_group_size = num_q_heads_total // num_kv_heads
+                        assert num_q_heads_total % num_kv_heads == 0
+                        context_partition_size = 128
+                        max_context_partition_num = get_recommended_splits(num_decode_tokens, num_kv_heads)
+                        # Output buffers
+                        intermediate_shape = (
+                            num_decode_tokens,
+                            num_kv_heads,
+                            max_context_partition_num,
+                            query_group_size,
+                        )
+                        exp_sums = torch.empty(
+                            intermediate_shape, dtype=torch.float32, device=query.device
+                        )
+                        max_logits = torch.empty(
+                            intermediate_shape, dtype=torch.float32, device=query.device
+                        )
+                        temporary_output = torch.empty(
+                            *intermediate_shape, head_size, dtype=query.dtype, device=query.device
+                        )
+                        
+                        k_scale = attn_metadata.k_scale
+                        v_scale = attn_metadata.v_scale
+                        per_tensor = k_scale.numel() == 1
+                        if not per_tensor:
+                            k_scale = k_scale.unsqueeze(-1)
+                            v_scale = v_scale.unsqueeze(-1)
+                        compute_type = current_platform.fp8_dtype() if self.kv_cache_dtype.startswith("fp8") else query.dtype
+
+                        q_slice = query[:num_decode_tokens]
+                        o_slice = output[:num_decode_tokens]
+                        pa_decode_gluon(
+                            output=o_slice,
+                            query=q_slice,
+                            key_cache=new_key_cache,
+                            value_cache=new_value_cache,
+                            context_lengths=attn_metadata.seq_lens[:num_decodes],
+                            block_tables=attn_metadata.block_table[:num_decodes],
+                            softmax_scale=self.scale,
+                            query_length=1,
+                            max_context_partition_num=max_context_partition_num,
+                            context_partition_size=context_partition_size,
+                            compute_type=compute_type,
+                            query_scale=None,
+                            key_scale=k_scale if self.kv_cache_dtype.startswith("fp8") else None,
+                            value_scale=v_scale if self.kv_cache_dtype.startswith("fp8") else None,
+                            exp_sums=exp_sums,
+                            max_logits=max_logits,
+                            temporary_output=temporary_output,
+                            alibi_slopes=None,
+                            sinks=None,
+                            sliding_window=-1,
+                            ps=True,
+                        )
+                    else:
+                        aiter.pa_fwd_asm(
+                            Q=query[:num_decode_tokens],
+                            K=new_key_cache,
+                            V=new_value_cache,
+                            block_tables=attn_metadata.block_table[:num_decodes],
+                            context_lens=attn_metadata.seq_lens[:num_decodes],
+                            block_tables_stride0=attn_metadata.block_table[
+                                :num_decodes
+                            ].stride(0),
+                            K_QScale=attn_metadata.k_scale,
+                            V_QScale=attn_metadata.v_scale,
+                            out_=output[:num_decode_tokens],
+                        )
                 else:
                     _, num_heads, head_size = query.shape
                     nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
