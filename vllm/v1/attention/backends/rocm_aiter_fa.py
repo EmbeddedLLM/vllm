@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with AiterFlashAttention."""
 
+import importlib
 from dataclasses import dataclass
 from functools import cache
 from typing import ClassVar
@@ -40,11 +41,19 @@ if current_platform.is_rocm():
 
     from vllm.triton_utils import tl, triton
 
+    _aiter_gluon_pa_not_found = False
     try:
-        from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon, get_recommended_splits
-        from triton.experimental import gluon
-        from triton.experimental.gluon import language as gl
+        from aiter.ops.triton.gluon.pa_decode_gluon import (
+            get_recommended_splits,
+            pa_decode_gluon,
+        )
     except ImportError:
+        _aiter_gluon_pa_not_found = True
+
+    if _aiter_gluon_pa_not_found or (
+        importlib.util.find_spec("triton.experimental.gluon") is None
+        or importlib.util.find_spec("triton.experimental.gluon.language") is None
+    ):
         logger.warning("Gluon is not available, pa_decode_gluon will not be used")
         pa_decode_gluon = None
         get_recommended_splits = None
@@ -315,6 +324,7 @@ if current_platform.is_rocm():
     def pa_can_use_gluon() -> bool:
         # gluon PA is only supported on CDNA3 GPUs
         from vllm.platforms.rocm import on_gfx942
+
         return on_gfx942() and pa_decode_gluon is not None
 
 
@@ -770,6 +780,10 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 "Encoder self-attention is not implemented for FlashAttentionImpl"
             )
 
+        self._gluon_intermediate_buffers: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+
     def extend_for_sliding_window(
         self,
         attn_metadata: AiterFlashAttentionMetadata,
@@ -1175,16 +1189,22 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     new_key_cache = key_cache.view_as(k_cache_template)
                     new_value_cache = value_cache.view_as(v_cache_template)
 
-                    # TODO: Fix this
-                    # The gluon PA implementation is faster when num_decodes is small
-                    # for long context lengths (> 2048), but context lengths is not a
-                    # cudagraph-dispatching parameter.
-                    # Therefore, we dispatch the gluon PA when num_decodes is small,
-                    # and allow users to disable it if needed.
+                    # The gluon PA implementation is faster when
+                    #  - num_decode_tokens is small (<= 8), and
+                    #  - context lengths are long (> 2048),
+                    # but context length is not a cudagraph dispatchable parameter.
+                    # Therefore, we expose the control of PA kernel switching to users
+                    # via the environment variable
+                    # `VLLM_ROCM_USE_AITER_MHA_FAVOR_LONG_CONTEXT`.
+                    # When it is enabled, we dispatch gluon PA when num_decode_tokens
+                    # is small (<= 8), and dispatch the ASM PA when num_decode_tokens
+                    # is large. Users can set the flag according to their use cases:
+                    # Set to 1 if they prioritize performance on long context lengths,
+                    # or 0 for performance for short context.
                     use_gluon = (
                         rocm_aiter_ops.is_mha_shuffle_kv_cache_dispatching_enabled()
                         and pa_can_use_gluon()
-                        # and num_decode_tokens <= 8
+                        and num_decode_tokens <= 8
                     )
 
                     if use_gluon:
@@ -1192,31 +1212,53 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         query_group_size = num_q_heads_total // num_kv_heads
                         assert num_q_heads_total % num_kv_heads == 0
                         context_partition_size = 128
-                        max_context_partition_num = get_recommended_splits(num_decode_tokens, num_kv_heads)
-                        # Output buffers
-                        intermediate_shape = (
-                            num_decode_tokens,
-                            num_kv_heads,
-                            max_context_partition_num,
-                            query_group_size,
+                        max_context_partition_num = get_recommended_splits(
+                            num_decode_tokens, num_kv_heads
                         )
-                        exp_sums = torch.empty(
-                            intermediate_shape, dtype=torch.float32, device=query.device
+
+                        # Create scratch buffers for Gluon PA intermediate tensors
+                        # This is created during warmup
+                        buffer_key = num_decode_tokens
+                        if buffer_key not in self._gluon_intermediate_buffers:
+                            intermediate_shape = (
+                                num_decode_tokens,
+                                num_kv_heads,
+                                max_context_partition_num,
+                                query_group_size,
+                            )
+                            self._gluon_intermediate_buffers[buffer_key] = (
+                                torch.empty(
+                                    intermediate_shape,
+                                    dtype=torch.float32,
+                                    device=query.device,
+                                ),
+                                torch.empty(
+                                    intermediate_shape,
+                                    dtype=torch.float32,
+                                    device=query.device,
+                                ),
+                                torch.empty(
+                                    *intermediate_shape,
+                                    head_size,
+                                    dtype=query.dtype,
+                                    device=query.device,
+                                ),
+                            )
+                        exp_sums, max_logits, temporary_output = (
+                            self._gluon_intermediate_buffers[buffer_key]
                         )
-                        max_logits = torch.empty(
-                            intermediate_shape, dtype=torch.float32, device=query.device
-                        )
-                        temporary_output = torch.empty(
-                            *intermediate_shape, head_size, dtype=query.dtype, device=query.device
-                        )
-                        
+
                         k_scale = attn_metadata.k_scale
                         v_scale = attn_metadata.v_scale
                         per_tensor = k_scale.numel() == 1
                         if not per_tensor:
                             k_scale = k_scale.unsqueeze(-1)
                             v_scale = v_scale.unsqueeze(-1)
-                        compute_type = current_platform.fp8_dtype() if self.kv_cache_dtype.startswith("fp8") else query.dtype
+                        compute_type = (
+                            current_platform.fp8_dtype()
+                            if self.kv_cache_dtype.startswith("fp8")
+                            else query.dtype
+                        )
 
                         q_slice = query[:num_decode_tokens]
                         o_slice = output[:num_decode_tokens]
@@ -1233,8 +1275,12 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             context_partition_size=context_partition_size,
                             compute_type=compute_type,
                             query_scale=None,
-                            key_scale=k_scale if self.kv_cache_dtype.startswith("fp8") else None,
-                            value_scale=v_scale if self.kv_cache_dtype.startswith("fp8") else None,
+                            key_scale=k_scale
+                            if self.kv_cache_dtype.startswith("fp8")
+                            else None,
+                            value_scale=v_scale
+                            if self.kv_cache_dtype.startswith("fp8")
+                            else None,
                             exp_sums=exp_sums,
                             max_logits=max_logits,
                             temporary_output=temporary_output,
