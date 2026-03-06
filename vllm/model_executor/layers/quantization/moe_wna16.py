@@ -62,6 +62,11 @@ class MoeWNA16Config(QuantizationConfig):
         from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinConfig
 
         if self.linear_quant_method == "gptq":
+            safe_init_config = full_config.copy()
+            safe_init_config.setdefault("desc_act", False)
+            safe_init_config.setdefault("sym", True)
+        
+            from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinConfig
             self.use_marlin = GPTQMarlinConfig.is_gptq_marlin_compatible(full_config)
         elif self.linear_quant_method in ("awq", "awq_marlin"):
             capability_tuple = current_platform.get_device_capability()
@@ -103,20 +108,29 @@ class MoeWNA16Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "MoeWNA16Config":
-        linear_quant_method = cls.get_from_keys(config, ["quant_method"])
-        weight_bits = cls.get_from_keys(config, ["bits"])
-        group_size = cls.get_from_keys(config, ["group_size"])
-        lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
-        if linear_quant_method == "gptq":
-            has_zp = not cls.get_from_keys(config, ["sym"])
+        linear_quant_method = cls.get_from_keys(config, ["quant_method"]).lower()
+        
+        if "auto-round" in linear_quant_method:
+            linear_quant_method = "gptq"
+            weight_bits = cls.get_from_keys(config, ["bits"])
+            group_size = cls.get_from_keys(config, ["group_size"])
+            lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
+            has_zp = not cls.get_from_keys_or(config, ["sym"], default=True)
             modules_to_not_convert = []
-        elif linear_quant_method in ("awq", "awq_marlin"):
-            has_zp = cls.get_from_keys(config, ["zero_point"])
-            modules_to_not_convert = cls.get_from_keys_or(
-                config, ["modules_to_not_convert"], None
-            )
         else:
-            raise ValueError("moe_wna16 only support gptq and awq.")
+            weight_bits = cls.get_from_keys(config, ["bits"])
+            group_size = cls.get_from_keys(config, ["group_size"])
+            lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
+            if linear_quant_method == "gptq":
+                has_zp = not cls.get_from_keys(config, ["sym"])
+                modules_to_not_convert = []
+            elif linear_quant_method in ("awq", "awq_marlin"):
+                has_zp = cls.get_from_keys(config, ["zero_point"])
+                modules_to_not_convert = cls.get_from_keys_or(
+                    config, ["modules_to_not_convert"], None
+                )
+            else:
+                raise ValueError("moe_wna16 only support gptq and awq.")
 
         return cls(
             linear_quant_method,
@@ -133,7 +147,7 @@ class MoeWNA16Config(QuantizationConfig):
         cls, hf_quant_cfg, user_quant
     ) -> QuantizationMethods | None:
         can_convert = cls.is_moe_wna16_compatible(hf_quant_cfg)
-        if can_convert and user_quant == "moe_wna16":
+        if can_convert and (user_quant in ("moe_wna16", "gptq") or user_quant is None):
             return cls.get_name()
         return None
 
@@ -144,6 +158,8 @@ class MoeWNA16Config(QuantizationConfig):
         num_bits = quant_config.get("bits")
         desc_act = quant_config.get("desc_act")
 
+        is_autoround = "auto-round" in quant_method
+
         capability_tuple = current_platform.get_device_capability()
         device_capability = (
             -1 if capability_tuple is None else capability_tuple.to_int()
@@ -153,7 +169,7 @@ class MoeWNA16Config(QuantizationConfig):
 
         awq_min_capability = AWQConfig.get_min_capability()
 
-        gptq_compatible = quant_method == "gptq" and not desc_act and num_bits in [4, 8]
+        gptq_compatible = (quant_method == "gptq" or is_autoround) and not desc_act and num_bits in [4, 8]
         awq_compatible = (
             quant_method == "awq"
             and num_bits == 4
@@ -181,14 +197,15 @@ class MoeWNA16Config(QuantizationConfig):
             )
 
             if self.linear_quant_method == "gptq":
+                safe_config = self.full_config.copy()
+                safe_config.setdefault("desc_act", False)
+                safe_config.setdefault("sym", True)
+                
                 if self.use_marlin:
-                    return GPTQMarlinConfig.from_config(
-                        self.full_config
-                    ).get_quant_method(layer, prefix)
+                    return GPTQMarlinConfig.from_config(safe_config).get_quant_method(layer, prefix)
                 else:
-                    return GPTQConfig.from_config(self.full_config).get_quant_method(
-                        layer, prefix
-                    )
+                    return GPTQConfig.from_config(safe_config).get_quant_method(layer, prefix)
+                
             elif self.linear_quant_method in ("awq", "awq_marlin"):
                 if self.use_marlin and check_marlin_supports_layer(
                     layer, self.group_size
@@ -372,7 +389,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from vllm.model_executor.layers.fused_moe import fused_experts
 
-        assert layer.activation == MoEActivation.SILU, (
+        assert layer.activation in [MoEActivation.SILU, MoEActivation.SWIGLUSTEP], (
             f"Only SiLU activation is supported, not {layer.activation}."
         )
 
@@ -386,7 +403,8 @@ class MoeWNA16Method(FusedMoEMethodBase):
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
-            quant_config=self.moe_quant_config,
+            quant_config=self.get_fused_moe_quant_config(layer),
+            activation=layer.activation,
         )
 
     @staticmethod
@@ -489,19 +507,17 @@ class MoeWNA16Method(FusedMoEMethodBase):
                     layer.group_size_div_factor, 1
                 )
 
-            if "w13_qzeros" in weight_name:
-                tensor = loaded_weight.view(layer.tp_size, -1, loaded_weight.size(1))[
-                    tp_rank
-                ]
+            if "w13" in weight_name:
+                tensor = loaded_weight.view(layer.tp_size, -1, loaded_weight.size(1))[tp_rank]
                 if shard_id == "w1":
-                    param.data[expert_id, : shard_size // 2] = tensor
+                    param.data[expert_id, :shard_size] = tensor
                 else:
-                    param.data[expert_id, shard_size // 2 :] = tensor
+                    param.data[expert_id, shard_size : 2 * shard_size] = tensor
                 return True if return_success else None
-            elif "w2_qzeros" in weight_name:
-                param.data[expert_id] = loaded_weight.view(
-                    loaded_weight.size(0), layer.tp_size, -1
-                )[:, tp_rank]
+
+            elif "w2" in weight_name:
+                tensor = loaded_weight.view(loaded_weight.size(0), layer.tp_size, -1).transpose(0, 1)[tp_rank]
+                param.data[expert_id] = tensor.contiguous()
                 return True if return_success else None
             else:
                 # Delegate to the original loader, passing return_success

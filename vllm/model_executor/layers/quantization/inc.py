@@ -436,6 +436,9 @@ class INCConfig(QuantizationConfig):
         cls, hf_quant_cfg, user_quant
     ) -> "QuantizationMethods | None":
         """Override the `auto-round` method to `inc`."""
+        if current_platform.is_rocm():
+            return None
+        
         is_auto_round_format = hf_quant_cfg.get("quant_method", None) == "auto-round"
         if is_auto_round_format:
             return cls.get_name()
