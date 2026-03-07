@@ -483,12 +483,14 @@ class MoeWNA16Method(FusedMoEMethodBase):
                     loaded_weight = convert_awq_tensor(loaded_weight, "qzeros")
                 else:
                     loaded_weight = loaded_weight.T
+
             elif layer.quant_config.linear_quant_method == "gptq":
                 assert layer.quant_config.weight_bits in [4, 8]
                 if "weight" in weight_name:
-                    loaded_weight = loaded_weight.T.contiguous().view(torch.uint8)
+                    if loaded_weight.element_size() > 1:
+                        loaded_weight = loaded_weight.T.contiguous()
+                        loaded_weight = loaded_weight.view(torch.uint8)
                 elif "zeros" in weight_name:
-                    # add 1 to gptq qzeros to align with awq
                     loaded_weight = loaded_weight.view(torch.uint8)
                     if layer.quant_config.weight_bits == 4:
                         loaded_weight = convert_gptq_int4_qzeros(loaded_weight).T
@@ -497,28 +499,38 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 else:
                     loaded_weight = loaded_weight.T
 
-            # repeat the qzeros/scales to fit new group size
-            if (
-                layer.group_size_div_factor > 1
-                and "qzeros" in weight_name
-                or "scales" in weight_name
-            ):
+            if (layer.group_size_div_factor > 1 and 
+                ("qzeros" in weight_name or "scales" in weight_name)):
                 loaded_weight = loaded_weight.repeat_interleave(
                     layer.group_size_div_factor, 1
                 )
 
+            
             if "w13" in weight_name:
-                tensor = loaded_weight.view(layer.tp_size, -1, loaded_weight.size(1))[tp_rank]
+                expected_n = param.data.shape[1] // 2
+                expected_k = param.data.shape[2]
+                if loaded_weight.shape[0] != expected_n:
+                    loaded_weight = loaded_weight[
+                        tp_rank * expected_n : (tp_rank + 1) * expected_n
+                    ]
+                    loaded_weight = loaded_weight.reshape(-1, expected_k)
                 if shard_id == "w1":
-                    param.data[expert_id, :shard_size] = tensor
+                    param.data[expert_id, :expected_n] = loaded_weight
                 else:
-                    param.data[expert_id, shard_size : 2 * shard_size] = tensor
+                    param.data[expert_id, expected_n : 2 * expected_n] = loaded_weight
                 return True if return_success else None
 
             elif "w2" in weight_name:
-                tensor = loaded_weight.view(loaded_weight.size(0), layer.tp_size, -1).transpose(0, 1)[tp_rank]
-                param.data[expert_id] = tensor.contiguous()
+                expected_n = param.data.shape[1]
+                expected_k = param.data.shape[2]
+                if loaded_weight.shape[1] != expected_k:
+                    loaded_weight = loaded_weight[
+                        :, tp_rank * expected_k : (tp_rank + 1) * expected_k
+                    ]
+                param.data[expert_id] = loaded_weight.contiguous()
                 return True if return_success else None
+
+
             else:
                 # Delegate to the original loader, passing return_success
                 return weight_loader(

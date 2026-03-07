@@ -317,6 +317,16 @@ class FusedMoEBlock(nn.Module):
             self.physical_expert_start + self.n_local_physical_experts
         )
 
+
+
+        raw_moe_int_size = getattr(config, "moe_intermediate_size", 1280)
+        if raw_moe_int_size == 4096:
+            self.moe_intermediate_size = 1280
+        else:
+            self.moe_intermediate_size = raw_moe_int_size
+
+        logger.info(f"FIXED: Step3.5 MoE Layer {self.layer_idx} intermediate_size corrected from {raw_moe_int_size} to {self.moe_intermediate_size}")
+
         if self.tp_size > config.moe_num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -378,7 +388,7 @@ class FusedMoEBlock(nn.Module):
             num_experts=config.moe_num_experts,
             top_k=config.moe_top_k,
             hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
+            intermediate_size=self.moe_intermediate_size,
             reduce_results=False,
             renormalize=config.norm_expert_weight,
             quant_config=quant_config,
