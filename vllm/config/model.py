@@ -926,13 +926,11 @@ class ModelConfig:
             if self.quantization is None:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
-                raise ValueError(
-                    "Quantization method specified in the model config "
-                    f"({quant_method}) does not match the quantization "
-                    f"method specified in the `quantization` argument "
-                    f"({self.quantization})."
-                )
-
+                logger.warning(
+                "Quantization method mismatch! Model config says %s, "
+                "but you specified %s. Using %s.",
+                quant_method, self.quantization, self.quantization
+            )
         if self.quantization is not None:
             if self.quantization not in supported_quantization:
                 raise ValueError(

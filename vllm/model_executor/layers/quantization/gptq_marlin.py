@@ -194,8 +194,8 @@ class GPTQMarlinConfig(QuantizationConfig):
 
         weight_bits = cls.get_from_keys(config, ["bits"])
         group_size = cls.get_from_keys(config, ["group_size"])
-        desc_act = cls.get_from_keys(config, ["desc_act"])
-        is_sym = cls.get_from_keys(config, ["sym"])
+        desc_act = cls.get_from_keys_or(config, ["desc_act"], default=False)
+        is_sym = cls.get_from_keys_or(config, ["sym"], default=True)
         lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
         modules_in_block_to_quantize = cls.get_from_keys_or(
             config, ["modules_in_block_to_quantize"], default=None

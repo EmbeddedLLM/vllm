@@ -61,7 +61,7 @@ class MoeWNA16Config(QuantizationConfig):
         from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
         from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinConfig
 
-        if self.linear_quant_method == "gptq":
+        if self.linear_quant_method in ("gptq", "gptq_marlin"):
             self.use_marlin = GPTQMarlinConfig.is_gptq_marlin_compatible(full_config)
         elif self.linear_quant_method in ("awq", "awq_marlin"):
             capability_tuple = current_platform.get_device_capability()
@@ -107,8 +107,9 @@ class MoeWNA16Config(QuantizationConfig):
         weight_bits = cls.get_from_keys(config, ["bits"])
         group_size = cls.get_from_keys(config, ["group_size"])
         lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
-        if linear_quant_method == "gptq":
-            has_zp = not cls.get_from_keys(config, ["sym"])
+        if linear_quant_method in ("gptq", "gptq_marlin"):
+            is_sym = cls.get_from_keys_or(config, ["sym"], default=True)
+            has_zp = not is_sym
             modules_to_not_convert = []
         elif linear_quant_method in ("awq", "awq_marlin"):
             has_zp = cls.get_from_keys(config, ["zero_point"])
@@ -116,7 +117,7 @@ class MoeWNA16Config(QuantizationConfig):
                 config, ["modules_to_not_convert"], None
             )
         else:
-            raise ValueError("moe_wna16 only support gptq and awq.")
+            raise ValueError(f"moe_wna16 only support gptq and awq. Current: {linear_quant_method}")
 
         return cls(
             linear_quant_method,
@@ -180,7 +181,7 @@ class MoeWNA16Config(QuantizationConfig):
                 GPTQMarlinConfig,
             )
 
-            if self.linear_quant_method == "gptq":
+            if self.linear_quant_method in ("gptq", "gptq_marlin"):
                 if self.use_marlin:
                     return GPTQMarlinConfig.from_config(
                         self.full_config
@@ -372,11 +373,11 @@ class MoeWNA16Method(FusedMoEMethodBase):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from vllm.model_executor.layers.fused_moe import fused_experts
 
-        assert layer.activation == MoEActivation.SILU, (
-            f"Only SiLU activation is supported, not {layer.activation}."
+        assert layer.activation in [MoEActivation.SILU, MoEActivation.SWIGLUSTEP], (
+            f"Only SiLU and SWIGLUSTEP activations are supported, not {layer.activation}."
         )
 
-        return fused_experts(
+        res =  fused_experts(
             x,
             layer.w13_qweight,
             layer.w2_qweight,
@@ -387,7 +388,14 @@ class MoeWNA16Method(FusedMoEMethodBase):
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
             quant_config=self.moe_quant_config,
+            activation=layer.activation,
         )
+
+        if shared_experts_input is not None:
+            out = res[0] if isinstance(res, tuple) else res
+            out.add_(shared_experts_input)
+
+        return res
 
     @staticmethod
     def get_weight_loader(layer, weight_loader):
@@ -452,8 +460,10 @@ class MoeWNA16Method(FusedMoEMethodBase):
 
             device = get_tp_group().device
             tp_rank = get_tensor_model_parallel_rank()
+            tp_size = layer.tp_size
             loaded_weight = loaded_weight.to(device)
             shard_size = layer.intermediate_size_per_partition
+            group_size = layer.group_size
 
             # convert gptq and awq weight to a standard format
             # awq_marlin uses the same weight format as awq
@@ -489,20 +499,29 @@ class MoeWNA16Method(FusedMoEMethodBase):
                     layer.group_size_div_factor, 1
                 )
 
-            if "w13_qzeros" in weight_name:
-                tensor = loaded_weight.view(layer.tp_size, -1, loaded_weight.size(1))[
-                    tp_rank
-                ]
-                if shard_id == "w1":
-                    param.data[expert_id, : shard_size // 2] = tensor
-                else:
-                    param.data[expert_id, shard_size // 2 :] = tensor
-                return True if return_success else None
-            elif "w2_qzeros" in weight_name:
-                param.data[expert_id] = loaded_weight.view(
-                    loaded_weight.size(0), layer.tp_size, -1
-                )[:, tp_rank]
-                return True if return_success else None
+            dest = param.data[expert_id]
+            src = loaded_weight
+
+            if "w13" in weight_name:
+                target_k_dest = dest.shape[0] // 2
+                if src.shape[0] == target_k_dest * 2 * tp_size:
+                    w1 = src[:target_k_dest * tp_size].view(tp_size, target_k_dest, -1)[tp_rank]
+                    w3 = src[target_k_dest * tp_size:].view(tp_size, target_k_dest, -1)[tp_rank]
+                    src = torch.cat([w1, w3], dim=0)
+                r0 = min(src.shape[0], dest.shape[0])
+                r1 = min(src.shape[1], dest.shape[1])
+                dest[:r0, :r1].copy_(src[:r0, :r1])
+                return True
+
+            elif "w2" in weight_name:
+                if src.shape[1] == dest.shape[1] * tp_size:
+                    src = src.view(src.shape[0], tp_size, -1)[:, tp_rank]
+                r0 = min(src.shape[0], dest.shape[0])
+                r1 = min(src.shape[1], dest.shape[1])
+                dest[:r0, :r1].copy_(src[:r0, :r1])
+                return True
+            
+            
             else:
                 # Delegate to the original loader, passing return_success
                 return weight_loader(

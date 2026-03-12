@@ -128,7 +128,7 @@ class GPTQConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
-        return [torch.half]
+        return [torch.half, torch.bfloat16]
 
     @classmethod
     # Need to figure it out
@@ -146,7 +146,7 @@ class GPTQConfig(QuantizationConfig):
 
         weight_bits = cls.get_from_keys(config, ["bits"])
         group_size = cls.get_from_keys(config, ["group_size"])
-        desc_act = cls.get_from_keys(config, ["desc_act"])
+        desc_act = cls.get_from_keys_or(config, ["desc_act"], default=False)
         lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
         autoround_version = cls.get_from_keys_or(
             config, ["autoround_version"], default=""
