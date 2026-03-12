@@ -208,6 +208,7 @@ docker run -it --rm \
 --device /dev/dri \
 -v <path/to/your/models>:/app/models \
 -e HF_HOME="/app/models" \
+--entrypoint bash \
 rocm/vllm-dev:nightly
 ```
 
