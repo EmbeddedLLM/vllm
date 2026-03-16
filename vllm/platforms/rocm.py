@@ -261,8 +261,6 @@ def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
 def on_gfx1x() -> bool:
     return _ON_GFX1X
 
-def on_gfx12x()-> bool:
-    return _ON_GFX12X
 
 def on_gfx12x() -> bool:
     return _ON_GFX12X
