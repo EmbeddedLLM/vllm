@@ -1199,6 +1199,7 @@ class rocm_aiter_ops:
         return cls._AITER_ENABLED and cls._TRITON_UNQUANT_GEMM
 
     @staticmethod
+    @aiter_ops_supported_arch([on_mi3xx, on_gfx12x])
     def register_ops_once() -> None:
         global _OPS_REGISTERED
         if not _OPS_REGISTERED:
