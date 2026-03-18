@@ -8,6 +8,7 @@ from torch._ops import OpOverload
 
 import vllm.envs as envs
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx12x, on_mi3xx
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_aiter_sparse_attn_indexer,
@@ -56,19 +57,45 @@ def is_aiter_found_and_supported() -> bool:
     return False
 
 
-def if_aiter_supported(func: Callable) -> Callable:
-    """Decorator that only executes the function if
-    ROCm AITER package is supported and enabled on gfx9 archs.
+def aiter_ops_supported_arch(
+    arch_checks: list[Callable[[], bool]],
+):
+    """
+    Decorator factory that only executes the function if ROCm AITER package
+    is supported and any of the specified arch checks pass.
+
+    Args:
+        arch_checks: List of callable predicates that return bool.
+                    Must explicitly specify which archs are supported.
+                    Examples:
+                    - [on_mi3xx]: MI300 series only (gfx942, gfx950)
+                    - [on_mi3xx, on_gfx12x]: MI300 OR gfx12x
+                    - [on_gfx9]: All gfx9 archs (gfx90a, gfx942, gfx950)
+
+    Usage:
+        @aiter_ops_supported_arch([on_mi3xx])  # MI300 series only
+        def is_enabled(): ...
+
+        @aiter_ops_supported_arch([on_mi3xx, on_gfx12x])  # MI300 OR gfx12x
+        def is_linear_enabled(): ...
     """
 
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        if is_aiter_found_and_supported():
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # First check: platform and library availability
+            if not (current_platform.is_rocm() and IS_AITER_FOUND):
+                return None
+
+            # Execute if any arch check passes
+            if not any(check() for check in arch_checks):
+                return None
+
             return func(*args, **kwargs)
 
-        return None
+        return wrapper
 
-    return wrapper
+    return decorator
 
 
 def _rocm_aiter_fused_moe_impl(
@@ -953,15 +980,19 @@ class rocm_aiter_ops:
         after monkey patching the env variables in the unit test.
 
     Check Functions:
-        All check functions (is_*_enabled) are decorated with @if_aiter_supported,
-        which verifies: (1) platform is ROCm, (2) device arch is gfx9, and
-        (3) aiter library is installed. The check function then also verifies
+        All check functions (is_*_enabled) are decorated with @aiter_ops_supported_arch([...]),
+        which verifies: (1) platform is ROCm, (2) device arch matches the specified list,
+        and (3) aiter library is installed. The check function then also verifies
         the corresponding environment variable is enabled.
         i.e.                                             ___
         is_enabled() == current_platform.is_rocm() and      |     checked by
-                        current_platform.is_on_gfx9() and   | @if_aiter_supported
+                        (on_mi3xx() or ...) and             | @aiter_ops_supported_arch([...])
                         IS_AITER_FOUND and   _______________|
                         cls._AITER_ENABLED   -----> Check by the logic in `is_enabled()`
+
+        Note: Arch checks must be explicitly specified:
+            @aiter_ops_supported_arch([on_mi3xx])              # MI300 series only
+            @aiter_ops_supported_arch([on_mi3xx, on_gfx12x])   # MI300 OR gfx12x
 
     Example:
         from vllm._aiter_ops import rocm_aiter_ops
@@ -1089,86 +1120,86 @@ class rocm_aiter_ops:
         return mapping.get(name)
 
     @classmethod
-    @if_aiter_supported
+    @aiter_ops_supported_arch([on_mi3xx, on_gfx12x])
     def is_enabled(cls) -> bool:
         return cls._AITER_ENABLED
 
     @classmethod
-    @if_aiter_supported
+    @aiter_ops_supported_arch([on_mi3xx, on_gfx12x])
     def is_linear_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._LINEAR_ENABLED
 
     @classmethod
-    @if_aiter_supported
+    @aiter_ops_supported_arch([on_mi3xx, on_gfx12x])
     def is_linear_fp8_enabled(cls) -> bool:
         return cls.is_linear_enabled()
 
     @classmethod
-    @if_aiter_supported
+    @aiter_ops_supported_arch([on_mi3xx, on_gfx12x])
     def is_rmsnorm_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._RMSNORM_ENABLED
 
     @classmethod
-    @if_aiter_supported
+    @aiter_ops_supported_arch([on_mi3xx])
     def is_fused_moe_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._FMOE_ENABLED
 
     @classmethod
-    @if_aiter_supported
+    @aiter_ops_supported_arch([on_mi3xx])
     def is_fusion_moe_shared_experts_enabled(cls) -> bool:
         return cls.is_fused_moe_enabled() and cls._MOE_SHARED_EXPERTS_ENABLED
 
     @classmethod
-    @if_aiter_supported
+    @aiter_ops_supported_arch([on_mi3xx])
     def is_mla_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._MLA_ENABLED
 
     @classmethod
-    @if_aiter_supported
+    @aiter_ops_supported_arch([on_mi3xx])
     def is_mha_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._MHA_ENABLED
 
     @classmethod
-    @if_aiter_supported
+    @aiter_ops_supported_arch([on_mi3xx])
     def is_shuffle_kv_cache_enabled(cls) -> bool:
         return cls._SHUFFLE_KV_CACHE_ENABLED
 
     @classmethod
-    @if_aiter_supported
+    @aiter_ops_supported_arch([on_mi3xx, on_gfx12x])
     def is_triton_unified_attn_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._TRITON_UNIFIED_ATTN_ENABLED
 
     @classmethod
-    @if_aiter_supported
+    @aiter_ops_supported_arch([on_mi3xx])
     def is_fp8bmm_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._FP8BMM_ENABLED
 
     @classmethod
-    @if_aiter_supported
+    @aiter_ops_supported_arch([on_mi3xx])
     def is_fp4bmm_enabled(cls) -> bool:
         from vllm.platforms.rocm import on_gfx950
 
         return cls._AITER_ENABLED and cls._FP4BMM_ENABLED and on_gfx950()
 
     @classmethod
-    @if_aiter_supported
+    @aiter_ops_supported_arch([on_mi3xx])
     def is_asm_fp4_gemm_dynamic_quant_enabled(cls) -> bool:
         from vllm.platforms.rocm import on_gfx950
 
         return cls._AITER_ENABLED and cls._FP4_GEMM_DYNAMIC_QUANT_ASM and on_gfx950()
 
     @classmethod
-    @if_aiter_supported
+    @aiter_ops_supported_arch([on_mi3xx])
     def is_triton_rotary_embed_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._TRITON_ROTARY_EMBED
 
     @classmethod
-    @if_aiter_supported
+    @aiter_ops_supported_arch([on_mi3xx])
     def is_triton_gemm_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._TRITON_UNQUANT_GEMM
 
     @staticmethod
-    @if_aiter_supported
+    @aiter_ops_supported_arch([on_mi3xx, on_gfx12x])
     def register_ops_once() -> None:
         global _OPS_REGISTERED
         if not _OPS_REGISTERED:
