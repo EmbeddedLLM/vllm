@@ -31,12 +31,11 @@ fi
 
 # Get DockerHub bearer token
 echo "Getting DockerHub bearer token..."
-set +x
+
 BEARER_TOKEN=$(curl -s -X POST \
     -H "Content-Type: application/json" \
     -d "{\"username\": \"$DOCKERHUB_USERNAME\", \"password\": \"$DOCKERHUB_TOKEN\"}" \
     "https://hub.docker.com/v2/users/login" | jq -r '.token')
-set -x
 
 if [ -z "$BEARER_TOKEN" ] || [ "$BEARER_TOKEN" = "null" ]; then
     echo "Error: Failed to get DockerHub bearer token"
