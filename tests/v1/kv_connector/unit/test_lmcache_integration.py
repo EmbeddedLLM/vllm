@@ -193,6 +193,48 @@ def test_sampling_params_interface():
     assert sampling_params.extra_args["kv_transfer_params"] == kv_transfer_params
 
 
+@pytest.mark.skipif(
+    current_platform.is_rocm(), reason="Requires libcudart.so, not available on ROCm"
+)
+def test_extract_request_configs_includes_cache_salt_tag():
+    from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration.vllm_v1_adapter import (
+        extract_request_configs,
+    )
+    from vllm.sampling_params import SamplingParams
+
+    sampling_params = SamplingParams(
+        extra_args={
+            "kv_transfer_params": {
+                "lmcache.tag.user": "example_user_1",
+                "lmcache.ttl": 60,
+                "other": "ignored",
+            }
+        }
+    )
+
+    assert extract_request_configs(sampling_params, "test_salt") == {
+        "lmcache.tag.user": "example_user_1",
+        "lmcache.ttl": 60,
+        "lmcache.tag.cache_salt": "test_salt",
+    }
+
+
+@pytest.mark.skipif(
+    current_platform.is_rocm(), reason="Requires libcudart.so, not available on ROCm"
+)
+def test_extract_request_configs_returns_salt_without_kv_transfer_params():
+    from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration.vllm_v1_adapter import (
+        extract_request_configs,
+    )
+    from vllm.sampling_params import SamplingParams
+
+    sampling_params = SamplingParams()
+
+    assert extract_request_configs(sampling_params, "test_salt") == {
+        "lmcache.tag.cache_salt": "test_salt",
+    }
+
+
 def test_tp_interface():
     # protect against interface changes
     import inspect

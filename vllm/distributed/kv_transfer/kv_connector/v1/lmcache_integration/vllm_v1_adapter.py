@@ -99,21 +99,31 @@ class DisaggSpec:
 tmp_disagg_tracker: dict[str, DisaggSpec] = {}
 
 
-def extract_request_configs(sampling_params: SamplingParams) -> dict | None:
+def extract_request_configs(
+    sampling_params: SamplingParams | None,
+    cache_salt: str | None = None,
+) -> dict | None:
     request_configs = None
     if (
-        sampling_params.extra_args is not None
+        sampling_params is not None
+        and sampling_params.extra_args is not None
         and "kv_transfer_params" in sampling_params.extra_args
     ):
         kv_transfer_params = sampling_params.extra_args.get("kv_transfer_params")
-        if kv_transfer_params is None:
-            return None
-        assert isinstance(kv_transfer_params, dict)
-        for k, v in kv_transfer_params.items():
-            if k.startswith("lmcache."):
-                if request_configs is None:
-                    request_configs = {}
-                request_configs[k] = v
+        if kv_transfer_params is not None:
+            assert isinstance(kv_transfer_params, dict)
+            for k, v in kv_transfer_params.items():
+                if k.startswith("lmcache."):
+                    if request_configs is None:
+                        request_configs = {}
+                    request_configs[k] = v
+
+    # LMCache only includes `lmcache.tag.*` entries in cache identity.
+    if cache_salt is not None:
+        if request_configs is None:
+            request_configs = {}
+        request_configs["lmcache.tag.cache_salt"] = cache_salt
+
     return request_configs
 
 
@@ -159,6 +169,7 @@ class RequestTracker:
         num_tokens_to_compute: int,
         lmcache_cached_tokens: int,
         skip_save: bool,
+        cache_salt: str | None = None,
     ) -> "RequestTracker":
         """Create the request tracker from a new request.
 
@@ -190,10 +201,9 @@ class RequestTracker:
         # NOTE: Initialized in `update_state_after_alloc`
         disagg_spec = tmp_disagg_tracker.pop(new_request.req_id, None)
 
-        if new_request.sampling_params:
-            request_configs = extract_request_configs(new_request.sampling_params)
-        else:
-            request_configs = None
+        request_configs = extract_request_configs(
+            new_request.sampling_params, cache_salt
+        )
 
         mm_hashes, mm_positions = extract_mm_features(new_request, modify=True)
 
@@ -1172,10 +1182,9 @@ class LMCacheConnectorV1Impl:
             apply_mm_hashes_to_token_ids(token_ids_tensor, mm_hashes, mm_positions)
             token_ids = token_ids_tensor.tolist()
 
-        if request.sampling_params:
-            request_configs = extract_request_configs(request.sampling_params)
-        else:
-            request_configs = None
+        request_configs = extract_request_configs(
+            request.sampling_params, request.cache_salt
+        )
 
         if self.skip_last_n_tokens > 0:
             assert token_ids is not None
@@ -1329,6 +1338,10 @@ class LMCacheConnectorV1Impl:
             if load_spec is not None:
                 lmcache_cached_tokens = load_spec.lmcache_cached_tokens
             request_priority = self._requests_priority.pop(request.req_id, 0)
+            original_request = self._unfinished_requests.get(request.req_id)
+            cache_salt = (
+                original_request.cache_salt if original_request is not None else None
+            )
 
             skip_save = force_skip_save or (
                 self.config.priority_limit is not None
@@ -1341,6 +1354,7 @@ class LMCacheConnectorV1Impl:
                 num_tokens_to_compute,
                 lmcache_cached_tokens,
                 skip_save,
+                cache_salt=cache_salt,
             )
             self._request_trackers[request.req_id] = request_tracker
 
