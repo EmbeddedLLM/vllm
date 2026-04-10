@@ -364,16 +364,17 @@ steps:
     commands:
       - |
         set -euo pipefail
-
         # Generate cache key
         CACHE_KEY=$$(.buildkite/scripts/cache-rocm-base-wheels.sh key)
         ECR_CACHE_TAG="public.ecr.aws/q9t5s3a7/vllm-release-repo:$${CACHE_KEY}-rocm-base"
-
+        ECR_TEMP_TAG="public.ecr.aws/q9t5s3a7/vllm-release-repo:$${CACHE_KEY}-rocm-base-temp-$${BUILDKITE_BUILD_NUMBER}"
+        
         echo "========================================"
         echo "ROCm Base Build Configuration"
         echo "========================================"
         echo "  CACHE_KEY: $${CACHE_KEY}"
         echo "  ECR_CACHE_TAG: $${ECR_CACHE_TAG}"
+        echo "  ECR_TEMP_TAG: $${ECR_TEMP_TAG}"
         echo "========================================"
         
         # Login to ECR
@@ -384,7 +385,6 @@ steps:
         WHEELS_EXIST=false
         
         # Check ECR for Docker image
-
         if docker manifest inspect "$${ECR_CACHE_TAG}" > /dev/null 2>&1; then
           IMAGE_EXISTS=true
           echo "ECR image cache HIT"
@@ -396,7 +396,8 @@ steps:
           WHEELS_EXIST=true
           echo "S3 wheels cache HIT"
         fi
-
+        
+        # Force rebuild (remove these lines if you want normal cache behavior)
         IMAGE_EXISTS=false
         WHEELS_EXIST=false
         
@@ -405,29 +406,30 @@ steps:
           echo ""
           echo "FULL CACHE HIT - Reusing both image and wheels"
           echo ""
-
           # Download wheels
           .buildkite/scripts/cache-rocm-base-wheels.sh download
-          
           # Save ECR tag for downstream jobs
           buildkite-agent meta-data set "rocm-base-image-tag" "$${ECR_CACHE_TAG}"
-          
+        
         # Scenario 2: Full rebuild needed
         else
           echo ""
-          echo " CACHE MISS - Building from scratch..."
+          echo "CACHE MISS - Building from scratch..."
           echo ""
           
-          # Build full base image and push to ECR
+          # Build full base image and push to TEMPORARY tag first
+          echo "Building and pushing to temporary tag: $${ECR_TEMP_TAG}"
           DOCKER_BUILDKIT=1 docker buildx build \
             --file docker/Dockerfile.rocm_base \
-            --tag "$${ECR_CACHE_TAG}" \
+            --tag "$${ECR_TEMP_TAG}" \
             --build-arg USE_SCCACHE=1 \
             --build-arg SCCACHE_BUCKET_NAME=vllm-build-sccache \
             --build-arg SCCACHE_REGION_NAME=us-west-2 \
             --build-arg SCCACHE_S3_NO_CREDENTIALS=0 \
             --push \
             .
+          
+          echo "✓ Temporary image built and pushed successfully"
           
           # Build wheel extraction stage
           DOCKER_BUILDKIT=1 docker buildx build \
@@ -441,21 +443,48 @@ steps:
             --load \
             .
           
+          echo "✓ Wheel extraction stage built successfully"
+          
           # Extract and upload wheels
           mkdir -p artifacts/rocm-base-wheels
           cid=$(docker create rocm-base-debs:$${BUILDKITE_BUILD_NUMBER})
           docker cp $${cid}:/app/debs/. artifacts/rocm-base-wheels/
           docker rm $${cid}
-          
           .buildkite/scripts/cache-rocm-base-wheels.sh upload
-
-          # Cache base docker image to ECR
+          
+          echo "✓ Wheels extracted and uploaded successfully"
+          
+          # NOW delete the old image if it exists (safe because new one is already built)
+          if [ "$${IMAGE_EXISTS}" = "true" ]; then
+            echo ""
+            echo "Deleting old ECR image: $${ECR_CACHE_TAG}"
+            aws ecr-public batch-delete-image \
+              --repository-name vllm-release-repo \
+              --region us-east-1 \
+              --image-ids imageTag=$${CACHE_KEY}-rocm-base || echo "Warning: Failed to delete old image (may not exist)"
+            echo "✓ Old image deleted"
+          fi
+          
+          # Pull the temporary image and re-tag it with the final tag
+          echo ""
+          echo "Re-tagging temporary image to final tag"
+          docker pull "$${ECR_TEMP_TAG}"
+          docker tag "$${ECR_TEMP_TAG}" "$${ECR_CACHE_TAG}"
           docker push "$${ECR_CACHE_TAG}"
+          
+          echo "✓ Final image tagged and pushed: $${ECR_CACHE_TAG}"
+          
+          # Clean up temporary tag
+          echo "Cleaning up temporary tag"
+          aws ecr-public batch-delete-image \
+            --repository-name vllm-release-repo \
+            --region us-east-1 \
+            --image-ids imageTag=$${CACHE_KEY}-rocm-base-temp-$${BUILDKITE_BUILD_NUMBER} || echo "Warning: Failed to delete temp image"
           
           buildkite-agent meta-data set "rocm-base-image-tag" "$${ECR_CACHE_TAG}"
           
           echo ""
-          echo " Build complete - Image and wheels cached"
+          echo "✓ Build complete - Image and wheels cached"
         fi
         
     artifact_paths:
