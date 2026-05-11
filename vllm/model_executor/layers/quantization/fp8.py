@@ -49,6 +49,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
     process_fp8_input_tensor_strategy_moe,
+    process_fp8_weight_block_strategy,
     process_fp8_weight_tensor_strategy,
     process_fp8_weight_tensor_strategy_moe,
     validate_fp8_block_shape,
@@ -71,6 +72,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
 )
+from vllm.model_executor.linear_params import Fp8LinearParams
 from vllm.model_executor.model_loader.reload.layerwise import (
     initialize_online_processing,
 )
@@ -254,7 +256,7 @@ def _copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:
     set_weight_attrs(new, attrs_to_set)
 
 
-class Fp8LinearMethod(LinearMethodBase):
+class Fp8LinearMethod(LinearMethodBase[Fp8LinearParams]):
     """Linear method for FP8.
     Supports loading FP8 checkpoints with static weight scale and
     dynamic/static activation scale.
@@ -342,22 +344,22 @@ class Fp8LinearMethod(LinearMethodBase):
         weight = create_fp8_weight_parameter(
             output_size_per_partition, input_size_per_partition, weight_loader
         )
-        layer.register_parameter("weight", weight)
 
-        # WEIGHT SCALE
+        weight_scale = None
+        weight_scale_inv = None
         if not self.block_quant:
-            scale = create_fp8_scale_parameter(
+            weight_scale = create_fp8_scale_parameter(
                 PerTensorScaleParameter,
                 output_partition_sizes,
                 input_size_per_partition,
                 None,
                 weight_loader,
             )
-            layer.register_parameter("weight_scale", scale)
         else:
             assert not self.act_q_static
             assert self.weight_block_size is not None
-            scale = create_fp8_scale_parameter(
+            # The weight_scale_inv name is intentional for deepseekv3.
+            weight_scale_inv = create_fp8_scale_parameter(
                 BlockQuantScaleParameter,
                 output_partition_sizes,
                 input_size_per_partition,
@@ -365,14 +367,21 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_loader,
                 scale_dtype=(torch.float8_e8m0fnu if self.is_scale_e8m0 else None),
             )
-            # The weight_scale_inv name is intentional for deepseekv3
-            layer.register_parameter("weight_scale_inv", scale)
 
-        # INPUT ACTIVATION SCALE
+        input_scale = None
         if self.act_q_static:
-            scale = create_fp8_input_scale(output_partition_sizes, weight_loader)
-            set_weight_attrs(scale, {"scale_type": "input_scale"})
-            layer.register_parameter("input_scale", scale)
+            input_scale = create_fp8_input_scale(output_partition_sizes, weight_loader)
+            set_weight_attrs(input_scale, {"scale_type": "input_scale"})
+
+        # Field-name registration: any mismatch between the dataclass schema
+        # and the kwargs passed here fails loud at registration time.
+        Fp8LinearParams.register_params_in_layer(
+            layer,
+            weight=weight,
+            weight_scale=weight_scale,
+            weight_scale_inv=weight_scale_inv,
+            input_scale=input_scale,
+        )
 
         self.fp8_linear = init_fp8_linear_kernel(
             activation_quant_key=self.activation_quant_key,
@@ -380,55 +389,43 @@ class Fp8LinearMethod(LinearMethodBase):
             weight_shape=layer.weight.shape,
             input_dtype=self.input_dtype,
             out_dtype=self.out_dtype,
+            marlin_input_dtype=self.marlin_input_dtype,
             module_name=self.__class__.__name__,
         )
 
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8Kernels)
 
-    def process_weights_after_loading(self, layer: Module) -> None:
-        if self.use_marlin:
-            # Only Marlin kernels support `marlin_input_dtype`; guard to avoid
-            # AttributeError if backend selection changes.
-            if hasattr(self.fp8_linear, "marlin_input_dtype"):
-                self.fp8_linear.marlin_input_dtype = self.marlin_input_dtype
-            self.fp8_linear.process_weights_after_loading(layer)
-            return
+    def convert_to_canonical(self, layer: Module) -> Fp8LinearParams:
+        params = Fp8LinearParams.read_params_from_layer(layer)
 
-        input_scale = None
-        # TODO(rob): refactor block quant into separate class.
         if self.block_quant:
             assert not self.act_q_static
-
-        # If checkpoint not serialized fp8, quantize the weights.
-        else:
-            # If checkpoint is fp8 per-tensor, handle that there are N scales for N
-            # shards in a fused module
-            weight = layer.weight
-            weight_scale = layer.weight_scale
-
-            # If using w8a8, torch._scaled_mm needs per tensor, so
-            # requantize the logical shards as a single weight.
-            weight, weight_scale, input_scale = process_fp8_weight_tensor_strategy(
-                weight,
-                weight_scale,
-                layer.logical_widths,
-                getattr(layer, "input_scale", None),
+            weight, weight_scale_inv = process_fp8_weight_block_strategy(
+                params.weight, params.weight_scale_inv
             )
-            if self.act_q_static:
-                assert input_scale is not None
-                input_scale = input_scale.max()
-            weight = weight.t()
+            return params.evolve_and_verify(
+                weight=weight, weight_scale_inv=weight_scale_inv
+            )
 
-            # Update layer with new values.
-            replace_parameter(layer, "weight", weight.data)
-            replace_parameter(layer, "weight_scale", weight_scale.data)
+        weight, weight_scale, input_scale = process_fp8_weight_tensor_strategy(
+            params.weight,
+            params.weight_scale,
+            params.metadata.logical_widths,
+            params.input_scale,
+        )
+        return params.evolve_and_verify(
+            weight=weight.t(),
+            weight_scale=weight_scale,
+            input_scale=input_scale.max() if self.act_q_static else input_scale,
+        )
 
-        if input_scale is not None:
-            replace_parameter(layer, "input_scale", input_scale)
-        else:
-            layer.input_scale = None
-
-        self.fp8_linear.process_weights_after_loading(layer)
+    def process_weights_after_loading(self, layer: Module) -> None:
+        # TODO: lift the canonicalize -> kernel post-load -> update_layer_params
+        # sequence into a shared LinearMethodBase once every linear method
+        # has migrated to convert_to_canonical.
+        linear_params = self.convert_to_canonical(layer)
+        self.fp8_linear.process_weights_after_loading(linear_params)
+        linear_params.update_params_in_layer(layer)
 
     def apply(
         self,
@@ -513,7 +510,11 @@ class Fp8OnlineLinearMethod(Fp8LinearMethod):
             output_dim=0,
             weight_loader=weight_loader,
         )
-        layer.register_parameter("weight", weight)
+
+        Fp8LinearParams.register_params_in_layer(
+            layer,
+            weight=weight,
+        )
 
         initialize_online_processing(layer)
 
@@ -523,9 +524,17 @@ class Fp8OnlineLinearMethod(Fp8LinearMethod):
             weight_shape=layer.weight.shape,
             input_dtype=self.input_dtype,
             out_dtype=self.out_dtype,
+            marlin_input_dtype=self.marlin_input_dtype,
             module_name=self.__class__.__name__,
         )
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8Kernels)
+
+    def convert_to_canonical(self, layer: Module) -> Fp8LinearParams:
+        params = Fp8LinearParams.read_params_from_layer(layer)
+        qweight, weight_scale = ops.scaled_fp8_quant(params.weight, scale=None)
+        qweight = qweight.t()
+
+        return params.evolve_and_verify(weight=qweight, weight_scale=weight_scale)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
@@ -534,22 +543,9 @@ class Fp8OnlineLinearMethod(Fp8LinearMethod):
         # TODO(future): support block_quant in online quant path
         assert not self.block_quant
 
-        layer.input_scale = None
-        qweight, weight_scale = ops.scaled_fp8_quant(layer.weight, scale=None)
-
-        # Update layer with new values.
-        replace_parameter(layer, "weight", qweight.data)
-        replace_parameter(layer, "weight_scale", weight_scale.data)
-
-        if self.use_marlin:
-            # Only Marlin kernels support `marlin_input_dtype`; guard to avoid
-            # AttributeError if backend selection changes.
-            if hasattr(self.fp8_linear, "marlin_input_dtype"):
-                self.fp8_linear.marlin_input_dtype = self.marlin_input_dtype
-            self.fp8_linear.process_weights_after_loading(layer)
-        else:
-            weight = qweight.t()
-            replace_parameter(layer, "weight", weight.data)
+        linear_params = self.convert_to_canonical(layer)
+        self.fp8_linear.process_weights_after_loading(linear_params)
+        linear_params.update_params_in_layer(layer)
 
         # Prevent duplicate processing (e.g., during weight reload)
         layer._already_called_process_weights_after_loading = True

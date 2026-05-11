@@ -3,6 +3,7 @@
 
 import itertools
 from abc import abstractmethod
+from typing import Generic, TypeVar
 
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
@@ -28,6 +29,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.utils import (
     dispatch_unquantized_gemm,
 )
+from vllm.model_executor.linear_params import LinearParamsBase
 from vllm.model_executor.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -62,6 +64,8 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "ModelOptNvFp4LinearMethod",
     "HummingLinearMethod",
 ]
+
+_ParamsT = TypeVar("_ParamsT", bound=LinearParamsBase)
 
 
 def register_weight_loader_v2_supported_method(cls):
@@ -138,7 +142,7 @@ def adjust_scalar_to_fused_array(
     return param_data[shard_id], loaded_weight
 
 
-class LinearMethodBase(QuantizeMethodBase):
+class LinearMethodBase(QuantizeMethodBase, Generic[_ParamsT]):
     """Base class for different (maybe quantized) linear methods."""
 
     @abstractmethod
@@ -165,6 +169,9 @@ class LinearMethodBase(QuantizeMethodBase):
             output_size: Size of the output dim of the weight across all ranks.
             params_dtype: Datatype of the parameters.
         """
+        raise NotImplementedError
+
+    def convert_to_canonical(self, layer: torch.nn.Module) -> _ParamsT:
         raise NotImplementedError
 
     @abstractmethod

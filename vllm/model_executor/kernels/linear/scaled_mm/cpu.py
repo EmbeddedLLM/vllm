@@ -17,6 +17,7 @@ from vllm.platforms.interface import CpuArchEnum
 from ..base import Int8Params
 from .BlockScaledMMLinearKernel import (
     Fp8BlockScaledMMLinearKernel,
+    Fp8LinearParams,
     FP8ScaledMMLinearLayerConfig,
 )
 from .ScaledMMLinearKernel import (
@@ -275,35 +276,11 @@ class CPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             return False, "Only bfloat16/float32 output dtype supported."
         return True, None
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading(self, params: Fp8LinearParams) -> None:
         # Skip the base class process (FP8 padding / fnuz normalization)
         # which is GPU-oriented.  Instead, VNNI-prepack weights for AMX.
-        params = self._get_layer_params(layer)
-        packed_weight = torch.ops._C.convert_weight_packed(params.weight)
-        replace_parameter(
-            layer,
-            params.WEIGHT,
-            torch.nn.Parameter(packed_weight, requires_grad=False),
-        )
-
-        # Re-wrap scale as a plain Parameter so the kernel can read it
-        # without weight-loader metadata interfering.
-        scale_attr = (
-            params.WEIGHT_SCALE_INV
-            if params.weight_scale_inv is not None
-            else params.WEIGHT_SCALE
-        )
-        weight_scale = (
-            params.weight_scale_inv
-            if params.weight_scale_inv is not None
-            else params.weight_scale
-        )
-        assert weight_scale is not None
-        replace_parameter(
-            layer,
-            scale_attr,
-            torch.nn.Parameter(weight_scale.data, requires_grad=False),
-        )
+        packed_weight = torch.ops._C.convert_weight_packed(params.weight.data)
+        params.weight.data = packed_weight
 
     def apply_weights(
         self,

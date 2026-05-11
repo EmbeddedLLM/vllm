@@ -2,13 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
+from typing import Generic, TypeVar
 
 import torch
 
+from vllm.model_executor.linear_params import LinearParamsBase
+
 __all__ = ["CompressedTensorsScheme"]
 
+_ParamsT = TypeVar("_ParamsT", bound=LinearParamsBase)
 
-class CompressedTensorsScheme(ABC):
+
+class CompressedTensorsScheme(ABC, Generic[_ParamsT]):
     """
     Abstract class used to describe the weight creation and forward pass
     of different quantization schemes supported by CompressedTensors.
@@ -53,3 +58,14 @@ class CompressedTensorsScheme(ABC):
         needs to occur.
         """
         raise NotImplementedError()
+
+    def convert_to_canonical(self, layer: torch.nn.Module) -> _ParamsT:
+        """
+        Optional: convert raw checkpoint params on ``layer`` into the
+        scheme's canonical ``LinearParamsBase`` subclass. Schemes that
+        have migrated to the typed-params pipeline should override this
+        and call it from ``process_weights_after_loading``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} has not adopted convert_to_canonical"
+        )

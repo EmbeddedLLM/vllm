@@ -12,7 +12,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticChannelSym,
     kFp8StaticTensorSym,
 )
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.linear_params import Fp8LinearParams
 from vllm.platforms import current_platform
 
 
@@ -49,8 +49,8 @@ class XPUFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         assert self.is_supported()[0]
         self.config = config
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        replace_parameter(layer, "weight", layer.weight.data.t())
+    def process_weights_after_loading(self, params: Fp8LinearParams) -> None:
+        params.weight.data = params.weight.data.t()
 
     def apply_weights(
         self,

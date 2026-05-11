@@ -12,7 +12,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
 )
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.linear_params import Fp8LinearParams
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     fp8_gemm_nt,
@@ -81,30 +81,25 @@ class DeepGemmFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             return False, "The provided metadata is not supported."
         return True, None
 
-    def process_weights_after_loading(self, layer):
-        super().process_weights_after_loading(layer)
-        params = self._get_layer_params(layer)
-        assert layer.weight_block_size is not None
-
-        if self.is_deep_gemm_supported:
-            weight_scale_invs = params.weight_scale_inv
-            scale_attr = (
-                params.WEIGHT_SCALE_INV
-                if weight_scale_invs is not None
-                else params.WEIGHT_SCALE
-            )
-            dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
-                wq=params.weight,
-                ws=weight_scale_invs
-                if weight_scale_invs is not None
-                else params.weight_scale,
-                quant_block_shape=tuple(layer.weight_block_size),
-                use_e8m0=self.use_deep_gemm_e8m0,
-                is_bmm=getattr(layer, "is_bmm", False),
-                bmm_batch_size=getattr(layer, "bmm_batch_size", 0),
-            )
-            replace_parameter(layer, params.WEIGHT, dg_weight)
-            replace_parameter(layer, scale_attr, dg_weight_scale)
+    def process_weights_after_loading(self, params: Fp8LinearParams) -> None:
+        md = params.metadata
+        ws = (
+            params.weight_scale_inv
+            if params.weight_scale_inv is not None
+            else params.weight_scale
+        )
+        assert ws is not None
+        quant_block_shape = tuple(self.config.weight_quant_key.scale.group_shape)
+        dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
+            wq=params.weight.data,
+            ws=ws.data,
+            quant_block_shape=quant_block_shape,
+            use_e8m0=self.use_deep_gemm_e8m0,
+            is_bmm=md.is_bmm,
+            bmm_batch_size=md.bmm_batch_size,
+        )
+        params.weight.data = dg_weight
+        ws.data = dg_weight_scale
 
     def apply_block_scaled_mm(
         self,

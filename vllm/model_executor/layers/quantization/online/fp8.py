@@ -27,6 +27,9 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
 )
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    process_fp8_weight_block_strategy,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     create_fp8_quant_key,
@@ -39,6 +42,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_fp8_supported,
 )
+from vllm.model_executor.linear_params import Fp8LinearParams
 from vllm.model_executor.model_loader.reload.layerwise import (
     initialize_online_processing,
 )
@@ -52,7 +56,7 @@ from vllm.utils.deep_gemm import per_block_cast_to_fp8
 # ---------------------------------------------------------------------------
 
 
-class _Fp8OnlineLinearBase(LinearMethodBase):
+class _Fp8OnlineLinearBase(LinearMethodBase[Fp8LinearParams]):
     """Shared base for online FP8 linear methods. Loads fp16/bf16 checkpoint
     weights onto meta device and materializes them just-in-time."""
 
@@ -91,7 +95,8 @@ class _Fp8OnlineLinearBase(LinearMethodBase):
             output_dim=0,
             weight_loader=weight_loader,
         )
-        layer.register_parameter("weight", weight)
+
+        Fp8LinearParams.register_params_in_layer(layer, weight=weight)
 
         initialize_online_processing(layer)
 
@@ -139,16 +144,18 @@ class Fp8PerTensorOnlineLinearMethod(_Fp8OnlineLinearBase):
             module_name=self.__class__.__name__,
         )
 
+    def convert_to_canonical(self, layer: Module) -> Fp8LinearParams:
+        params = Fp8LinearParams.read_params_from_layer(layer)
+        qweight, weight_scale = ops.scaled_fp8_quant(params.weight, scale=None)
+        return params.evolve_and_verify(weight=qweight.t(), weight_scale=weight_scale)
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
-        layer.input_scale = None
-        qweight, weight_scale = ops.scaled_fp8_quant(layer.weight, scale=None)
-
-        # Update layer with new values.
-        replace_parameter(layer, "weight", qweight.t().data)
-        replace_parameter(layer, "weight_scale", weight_scale.data)
+        linear_params = self.convert_to_canonical(layer)
+        self.fp8_linear.process_weights_after_loading(linear_params)
+        linear_params.update_params_in_layer(layer)
 
         # Prevent duplicate processing (e.g., during weight reload)
         layer._already_called_process_weights_after_loading = True
@@ -227,21 +234,25 @@ class Fp8PerBlockOnlineLinearMethod(_Fp8OnlineLinearBase):
             module_name=self.__class__.__name__,
         )
 
+    def convert_to_canonical(self, layer: Module) -> Fp8LinearParams:
+        params = Fp8LinearParams.read_params_from_layer(layer)
+        qweight, weight_scale_inv = per_block_cast_to_fp8(
+            params.weight, block_size=self.weight_block_size, use_ue8m0=False
+        )
+        qweight, weight_scale_inv = process_fp8_weight_block_strategy(
+            qweight, weight_scale_inv
+        )
+        return params.evolve_and_verify(
+            weight=qweight, weight_scale_inv=weight_scale_inv
+        )
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
-        layer.input_scale = None
-        block_size = self.weight_block_size
-
-        qweight, weight_scale_inv = per_block_cast_to_fp8(
-            layer.weight, block_size=block_size, use_ue8m0=False
-        )
-
-        replace_parameter(layer, "weight", qweight.data)
-        replace_parameter(layer, "weight_scale_inv", weight_scale_inv.data)
-
-        self.fp8_linear.process_weights_after_loading(layer)
+        linear_params = self.convert_to_canonical(layer)
+        self.fp8_linear.process_weights_after_loading(linear_params)
+        linear_params.update_params_in_layer(layer)
 
         # Prevent duplicate processing (e.g., during weight reload)
         layer._already_called_process_weights_after_loading = True

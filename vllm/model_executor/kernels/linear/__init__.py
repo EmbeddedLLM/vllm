@@ -370,6 +370,7 @@ def init_fp8_linear_kernel(
     weight_shape: tuple[int, int],
     input_dtype: torch.dtype,
     out_dtype: torch.dtype,
+    marlin_input_dtype: torch.dtype | None = None,
     force_kernel: type[_KernelT] | None = None,
     module_name: str | None = None,
 ) -> FP8ScaledMMLinearKernel | Fp8BlockScaledMMLinearKernel:
@@ -379,6 +380,7 @@ def init_fp8_linear_kernel(
         weight_shape=weight_shape,
         input_dtype=input_dtype,
         out_dtype=out_dtype,
+        marlin_input_dtype=marlin_input_dtype,
     )
 
     possible_kernels = (
