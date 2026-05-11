@@ -14,10 +14,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     convert_to_channelwise,
 )
+from vllm.model_executor.linear_params import Fp8LinearParams
 from vllm.platforms import current_platform
 
 from ..base import (
-    FP8Params,
     Int8Params,
     MMLinearKernel,
     MMLinearLayerConfig,
@@ -39,10 +39,13 @@ class FP8ScaledMMLinearLayerConfig(MMLinearLayerConfig):
     weight_shape: tuple[int, int]
     input_dtype: torch.dtype
     out_dtype: torch.dtype
+    # Marlin-only: input dtype that drives FP8 exponent-bias-into-scales
+    # fusion. `None` outside the Marlin path.
+    marlin_input_dtype: torch.dtype | None = None
 
 
 class FP8ScaledMMLinearKernel(
-    MMLinearKernel[FP8ScaledMMLinearLayerConfig, FP8Params], ABC
+    MMLinearKernel[FP8ScaledMMLinearLayerConfig, Fp8LinearParams], ABC
 ):
     def __init__(
         self,
@@ -58,11 +61,11 @@ class FP8ScaledMMLinearKernel(
         )
         self.fp8_dtype = current_platform.fp8_dtype()
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        pass
+    def process_weights_after_loading(self, params: Fp8LinearParams) -> None:
+        return
 
-    def _get_layer_params(self, layer: torch.nn.Module, **kwargs) -> FP8Params:
-        return FP8Params.from_layer(layer)
+    def _get_layer_params(self, layer: torch.nn.Module, **kwargs) -> Fp8LinearParams:
+        return Fp8LinearParams.read_params_from_layer(layer)
 
     def apply_weights(
         self,

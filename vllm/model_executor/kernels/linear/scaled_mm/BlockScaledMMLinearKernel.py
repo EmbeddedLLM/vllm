@@ -2,45 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
-from typing_extensions import Self
 
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    process_fp8_weight_block_strategy,
-)
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.linear_params import Fp8LinearParams
 
 from ..base import (
-    FP8Params,
     MMLinearKernel,
 )
 from .ScaledMMLinearKernel import FP8ScaledMMLinearLayerConfig
 
 
-@dataclass
-class FP8BlockParams(FP8Params):
-    weight_scale_inv: torch.Tensor | None
-    weight_scale: torch.Tensor | None
-
-    WEIGHT_SCALE_INV: ClassVar[str] = "weight_scale_inv"
-
-    @classmethod
-    def from_layer(cls, layer: torch.nn.Module) -> Self:
-        return cls(
-            weight=getattr(layer, cls.WEIGHT),
-            weight_scale_inv=getattr(layer, cls.WEIGHT_SCALE_INV, None),
-            weight_scale=getattr(layer, cls.WEIGHT_SCALE, None),
-            input_scale=getattr(layer, cls.INPUT_SCALE, None),
-            input_scale_ub=getattr(layer, cls.INPUT_SCALE_UB, None),
-        )
-
-
 class Fp8BlockScaledMMLinearKernel(
-    MMLinearKernel[FP8ScaledMMLinearLayerConfig, FP8BlockParams], ABC
+    MMLinearKernel[FP8ScaledMMLinearLayerConfig, Fp8LinearParams], ABC
 ):
     # Set to False in subclasses that accept BF16 input directly (e.g. FlashInfer)
     # and therefore do not need the input quantization step in apply_weights.
@@ -69,30 +45,11 @@ class Fp8BlockScaledMMLinearKernel(
 
         return True, None
 
-    def _get_layer_params(self, layer: torch.nn.Module, **kwargs) -> FP8BlockParams:
-        return FP8BlockParams.from_layer(layer)
+    def _get_layer_params(self, layer: torch.nn.Module, **kwargs) -> Fp8LinearParams:
+        return Fp8LinearParams.read_params_from_layer(layer)
 
-    def process_weights_after_loading(self, layer: torch.nn.Module):
-        params = self._get_layer_params(layer)
-        # Fp8LinearMethod registered weight scale
-        # buffer as weight_scale_inv unlike compressed tensors.
-        weight_scale = (
-            params.weight_scale
-            if params.weight_scale_inv is None
-            else params.weight_scale_inv
-        )
-        scale_attr_name = (
-            params.WEIGHT_SCALE
-            if params.weight_scale_inv is None
-            else params.WEIGHT_SCALE_INV
-        )
-        new_weight, new_weight_scale = process_fp8_weight_block_strategy(
-            params.weight,
-            weight_scale,
-        )
-
-        replace_parameter(layer, params.WEIGHT, new_weight.data)
-        replace_parameter(layer, scale_attr_name, new_weight_scale.data)
+    def process_weights_after_loading(self, params: Fp8LinearParams) -> None:
+        return
 
     def apply_weights(
         self,

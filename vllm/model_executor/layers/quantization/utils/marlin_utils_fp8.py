@@ -14,6 +14,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_permute_scales,
     should_use_atomic_add_reduce,
 )
+from vllm.model_executor.linear_params import Fp8LinearParams
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
@@ -90,7 +91,7 @@ def apply_fp8_marlin_linear(
 
 
 def prepare_fp8_layer_for_marlin(
-    layer: torch.nn.Module,
+    params: Fp8LinearParams,
     size_k_first: bool = True,
     input_dtype: torch.dtype | None = None,
 ) -> None:
@@ -103,24 +104,27 @@ def prepare_fp8_layer_for_marlin(
     if input_dtype is not None and input_dtype.itemsize == 1:
         raise RuntimeError("Marlin W8A8 is not supported.")
 
-    part_size_n = layer.output_size_per_partition
-    part_size_k = layer.input_size_per_partition
-    weight_block_size = getattr(layer, "weight_block_size", None)
+    md = params.metadata
+    part_size_n = md.output_size_per_partition
+    part_size_k = md.input_size_per_partition
+    weight_block_size = md.weight_block_size
 
     if size_k_first:
-        assert layer.weight.shape == (part_size_k, part_size_n)
+        assert params.weight.data.shape == (part_size_k, part_size_n)
     else:
-        assert layer.weight.shape == (part_size_n, part_size_k)
+        assert params.weight.data.shape == (part_size_n, part_size_k)
 
-    device = layer.weight.device
+    device = params.weight.data.device
 
     # WORKSPACE
-    layer.workspace = marlin_make_workspace_new(device)
+    params.workspace = torch.nn.Parameter(
+        marlin_make_workspace_new(device), requires_grad=False
+    )
 
     # WEIGHT
     # Repack weights to marlin format
     perm = torch.empty(0, dtype=torch.int, device=device)
-    qweight = pack_fp8_to_int32(layer.weight, size_k_first)
+    qweight = pack_fp8_to_int32(params.weight.data, size_k_first)
     if not size_k_first:
         qweight = qweight.T.contiguous()
 
@@ -131,21 +135,22 @@ def prepare_fp8_layer_for_marlin(
         size_n=part_size_n,
         num_bits=8,
     )
-    replace_parameter(layer, "weight", marlin_qweight)
+    params.weight.data = marlin_qweight
 
     # WEIGHT SCALES
     # Permute scales
-    if "weight_scale" in dir(layer):
-        scales = layer.weight_scale.to(layer.orig_dtype)
-    elif "weight_scale_inv" in dir(layer):
-        scales = layer.weight_scale_inv.to(layer.orig_dtype)
+    if params.weight_scale is not None:
+        scales = params.weight_scale.to(md.orig_dtype)
+    else:
+        assert params.weight_scale_inv is not None
+        scales = params.weight_scale_inv.to(md.orig_dtype)
 
     group_size = -1 if weight_block_size is None else weight_block_size[1]
 
     # marlin kernel only support channel-wise and group-wise quantization
     # we need to convert the scales
     if weight_block_size is None:
-        logical_widths = getattr(layer, "logical_widths", [])
+        logical_widths = md.logical_widths
         if scales.nelement() == 1:
             # tensor-wise quantization -> channel-wise quantization
             # (1, 1) =>(repeat)=> (1, size_n)
@@ -187,15 +192,15 @@ def prepare_fp8_layer_for_marlin(
     )
     if input_dtype != torch.float8_e4m3fn:
         marlin_scales = fp8_fused_exponent_bias_into_scales(marlin_scales)
-    if hasattr(layer, "weight_scale"):
-        replace_parameter(layer, "weight_scale", marlin_scales)
-    elif hasattr(layer, "weight_scale_inv"):
-        replace_parameter(layer, "weight_scale_inv", marlin_scales)
+    if params.weight_scale is not None:
+        params.weight_scale.data = marlin_scales
+    else:
+        assert params.weight_scale_inv is not None
+        params.weight_scale_inv.data = marlin_scales
 
-    if hasattr(layer, "bias") and layer.bias is not None:
-        assert layer.bias.shape == (part_size_n,)
-        bias = marlin_permute_bias(layer.bias)
-        replace_parameter(layer, "bias", bias)
+    if params.bias is not None:
+        assert params.bias.shape == (part_size_n,)
+        params.bias.data = marlin_permute_bias(params.bias)
 
 
 def prepare_fp8_moe_layer_for_marlin(

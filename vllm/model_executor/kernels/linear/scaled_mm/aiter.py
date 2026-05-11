@@ -12,7 +12,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
 )
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.linear_params import Fp8LinearParams
 from vllm.platforms import current_platform
 
 from .BlockScaledMMLinearKernel import (
@@ -189,17 +189,10 @@ class AiterPreshuffledPerTokenFp8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
 
         return True, None
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        params = self._get_layer_params(layer)
-
-        replace_parameter(
-            layer,
-            params.WEIGHT,
-            torch.nn.Parameter(
-                rocm_aiter_ops.shuffle_weight(params.weight.t().contiguous()).data,
-                requires_grad=False,
-            ),
-        )
+    def process_weights_after_loading(self, params: Fp8LinearParams) -> None:
+        params.weight.data = rocm_aiter_ops.shuffle_weight(
+            params.weight.data.t().contiguous()
+        ).data
 
     def apply_scaled_mm(
         self,
@@ -255,14 +248,8 @@ class AiterPerTokenFp8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
             )
         return True, None
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        params = self._get_layer_params(layer)
-
-        replace_parameter(
-            layer,
-            params.WEIGHT,
-            torch.nn.Parameter(params.weight.t(), requires_grad=False),
-        )
+    def process_weights_after_loading(self, params: Fp8LinearParams) -> None:
+        params.weight.data = params.weight.data.t()
 
     def apply_scaled_mm(
         self,

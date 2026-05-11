@@ -11,7 +11,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
     is_fp8_marlin_supported,
     prepare_fp8_layer_for_marlin,
 )
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.linear_params import Fp8LinearParams
 from vllm.platforms import current_platform
 
 from .BlockScaledMMLinearKernel import (
@@ -60,34 +60,21 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
 
     def __init__(self, config: FP8ScaledMMLinearLayerConfig) -> None:
         super().__init__(config)
-        self.marlin_input_dtype = None
+        self.marlin_input_dtype = config.marlin_input_dtype
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        params = self._get_layer_params(layer)
-        w_q = params.weight
-        # Compressed tensors transposes the weight to (K, N)
-        # for channel and tensor quant strategies.
-        # So we can skip the transpose if the layout is
-        # already (K, N).
-        # TODO: Remove this check once the layouts have been
-        # canonicalized to a standard (N, K) dimension. See issue
-        # #33314 for more details.
-        if w_q.shape != (
-            layer.input_size_per_partition,
-            layer.output_size_per_partition,
+    def process_weights_after_loading(self, params: Fp8LinearParams) -> None:
+        md = params.metadata
+        if params.weight.data.shape != (
+            md.input_size_per_partition,
+            md.output_size_per_partition,
         ):
-            # transpose the weights to (K,N)
-            replace_parameter(
-                layer,
-                params.WEIGHT,
-                w_q.t(),
+            params.weight = torch.nn.Parameter(
+                params.weight.data.t().contiguous(), requires_grad=False
             )
 
-        layer.input_scale = None
         prepare_fp8_layer_for_marlin(
-            layer, size_k_first=True, input_dtype=self.marlin_input_dtype
+            params, size_k_first=True, input_dtype=self.marlin_input_dtype
         )
-        del layer.input_scale
 
     def apply_weights(
         self,
@@ -97,14 +84,14 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         **kwargs,
     ) -> torch.Tensor:
         params = self._get_layer_params(layer)
-
+        md = params.metadata
         return apply_fp8_marlin_linear(
             input=x,
             weight=params.weight,
             weight_scale=params.weight_scale,
-            workspace=layer.workspace,
-            size_n=layer.output_size_per_partition,
-            size_k=layer.input_size_per_partition,
+            workspace=params.workspace,
+            size_n=md.output_size_per_partition,
+            size_k=md.input_size_per_partition,
             input_dtype=self.marlin_input_dtype,
             bias=bias,
         )
@@ -162,16 +149,13 @@ class MarlinFP8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
 
     def __init__(self, config: FP8ScaledMMLinearLayerConfig) -> None:
         super().__init__(config)
-        self.marlin_input_dtype = None
+        self.marlin_input_dtype = config.marlin_input_dtype
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        super().process_weights_after_loading(layer)
-
-        layer.input_scale = None
+    def process_weights_after_loading(self, params: Fp8LinearParams) -> None:
+        params.input_scale = None
         prepare_fp8_layer_for_marlin(
-            layer, size_k_first=False, input_dtype=self.marlin_input_dtype
+            params, size_k_first=False, input_dtype=self.marlin_input_dtype
         )
-        del layer.input_scale
 
     def apply_weights(
         self,
@@ -181,7 +165,7 @@ class MarlinFP8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
         **kwargs,
     ) -> torch.Tensor:
         params = self._get_layer_params(layer)
-        weight = params.weight
+        md = params.metadata
         weight_scale = (
             params.weight_scale
             if params.weight_scale_inv is None
@@ -189,11 +173,11 @@ class MarlinFP8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
         )
         return apply_fp8_marlin_linear(
             input=x,
-            weight=weight,
+            weight=params.weight,
             weight_scale=weight_scale,
-            workspace=layer.workspace,
-            size_n=layer.output_size_per_partition,
-            size_k=layer.input_size_per_partition,
+            workspace=params.workspace,
+            size_n=md.output_size_per_partition,
+            size_k=md.input_size_per_partition,
             input_dtype=self.marlin_input_dtype,
             bias=bias,
         )

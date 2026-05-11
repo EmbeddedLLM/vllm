@@ -5,7 +5,6 @@ from typing import Any
 
 import torch
 from torch.nn import Module
-from torch.nn.parameter import Parameter
 
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
@@ -22,9 +21,6 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-    prepare_fp8_layer_for_marlin,
-)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
     kFp8DynamicTokenSym,
@@ -33,6 +29,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
 )
+from vllm.model_executor.linear_params import Fp8LinearParams
 from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
@@ -127,7 +124,6 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
             output_dim=0,
             weight_loader=weight_loader,
         )
-        layer.register_parameter("weight", weight)
 
         # WEIGHT SCALE
         weight_scale = ChannelQuantScaleParameter(
@@ -136,14 +132,19 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
             weight_loader=weight_loader,
         )
         weight_scale[:] = torch.finfo(torch.float32).min
-        layer.register_parameter("weight_scale", weight_scale)
 
         # INPUT SCALE UPPER BOUND
         input_scale_ub = torch.nn.Parameter(
             torch.tensor((self.quant_config.input_scale_ub), dtype=torch.float32),
             requires_grad=False,
         )
-        layer.input_scale_ub = input_scale_ub
+
+        Fp8LinearParams.register_params_in_layer(
+            layer,
+            weight=weight,
+            weight_scale=weight_scale,
+            input_scale_ub=input_scale_ub,
+        )
 
         self.fp8_linear = init_fp8_linear_kernel(
             activation_quant_key=kFp8DynamicTokenSym,
@@ -154,28 +155,27 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
             module_name=self.__class__.__name__,
         )
 
-    def process_weights_after_loading(self, layer: Module) -> None:
-        # required by torch.compile
-        layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
-        layer.weight = Parameter(layer.weight.data, requires_grad=False)
+    def convert_to_canonical(self, layer: Module) -> Fp8LinearParams:
+        params = Fp8LinearParams.read_params_from_layer(layer)
+        assert params.weight_scale is not None
 
-        weight = layer.weight
-
+        new_weight = params.weight.data
+        new_weight_scale = params.weight_scale.data
         if current_platform.is_fp8_fnuz():
-            weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
-                weight=weight, weight_scale=layer.weight_scale, input_scale=None
+            new_weight, new_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                weight=new_weight, weight_scale=new_weight_scale, input_scale=None
             )
-            if input_scale is not None:
-                layer.input_scale = Parameter(input_scale, requires_grad=False)
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
-        layer.weight = Parameter(weight.t(), requires_grad=False)
-        if self.quant_config.use_marlin:
-            prepare_fp8_layer_for_marlin(layer)
-            # Activations not quantized for marlin.
-            del layer.input_scale_ub
+        new_weight.data = new_weight.t()
+        return params.evolve_and_verify(
+            weight=new_weight,
+            weight_scale=new_weight_scale,
+        )
 
-        self.fp8_linear.process_weights_after_loading(layer)
+    def process_weights_after_loading(self, layer: Module) -> None:
+        linear_params = self.convert_to_canonical(layer)
+        self.fp8_linear.process_weights_after_loading(linear_params)
+        linear_params.update_params_in_layer(layer)
 
     def apply(
         self,

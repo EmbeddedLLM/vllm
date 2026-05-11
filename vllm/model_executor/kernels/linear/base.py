@@ -3,10 +3,9 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, ClassVar, Generic, TypeVar
+from typing import Any, ClassVar, Generic, TypeVar, overload
 
 import torch
-from typing_extensions import Self
 
 
 @dataclass
@@ -14,41 +13,12 @@ class MMLinearLayerConfig: ...
 
 
 @dataclass
-class Params:
-    """Base class for quantized layer parameters.
+class Params: ...
 
-    This class provides a typed interface for accessing quantized weights and scales
-    from layer modules. It serves as a parameter container that can be extracted from
-    layers and passed to kernel implementations.
 
-    Attributes:
-        weight: The quantized weight tensor
-        weight_scale: weight scaling factors
-        input_scale: Optional input scaling factors
-
-    Class Variables:
-        WEIGHT: Attribute name for weight tensor on the layer module
-        WEIGHT_SCALE: Attribute name for weight scale tensor on the layer module
-        INPUT_SCALE: Attribute name for input scale tensor on the layer module
-
-    Important:
-        The string values of WEIGHT, WEIGHT_SCALE, and INPUT_SCALE class variables
-        MUST match the attribute names used in the corresponding quantization method's
-        create_weights() implementation.
-        For example, if FP8LinearMethod.create_weights()
-        sets layer.weight and layer.weight_scale,
-        then WEIGHT="weight" and
-        WEIGHT_SCALE="weight_scale" must be used here.
-
-    Usage:
-        ```python
-        # Extract parameters from a quantized layer
-        params = Params.from_layer(layer)
-
-        # Access typed parameters
-        output = func(input, params.weight, params.weight_scale)
-        ```
-    """
+@dataclass
+class Int8Params(Params):
+    """Int8 layer parameters with typed fields"""
 
     weight: torch.Tensor
     weight_scale: torch.Tensor
@@ -58,38 +28,6 @@ class Params:
     WEIGHT: ClassVar[str] = "weight"
     WEIGHT_SCALE: ClassVar[str] = "weight_scale"
     INPUT_SCALE: ClassVar[str] = "input_scale"
-
-    @classmethod
-    def from_layer(cls, layer: torch.nn.Module) -> Self:
-        return cls(
-            weight=getattr(layer, cls.WEIGHT),
-            weight_scale=getattr(layer, cls.WEIGHT_SCALE),
-            input_scale=getattr(layer, cls.INPUT_SCALE, None),
-        )
-
-
-@dataclass
-class FP8Params(Params):
-    """FP8 layer parameters with typed fields"""
-
-    input_scale_ub: torch.Tensor | None
-
-    INPUT_SCALE_UB: ClassVar[str] = "input_scale_ub"
-
-    @classmethod
-    def from_layer(cls, layer: torch.nn.Module) -> "FP8Params":
-        """Extract parameters from layer"""
-        return cls(
-            weight=getattr(layer, cls.WEIGHT),
-            weight_scale=getattr(layer, cls.WEIGHT_SCALE),
-            input_scale=getattr(layer, cls.INPUT_SCALE, None),
-            input_scale_ub=getattr(layer, cls.INPUT_SCALE_UB, None),
-        )
-
-
-@dataclass
-class Int8Params(Params):
-    """Int8 layer parameters with typed fields"""
 
     input_zero_point: torch.Tensor | None
     azp_adj: torch.Tensor | None
@@ -109,7 +47,7 @@ class Int8Params(Params):
         )
 
 
-_ParamsT = TypeVar("_ParamsT", bound=Params)
+_ParamsT = TypeVar("_ParamsT")
 _ConfigT = TypeVar("_ConfigT", bound=MMLinearLayerConfig)
 
 
@@ -237,30 +175,24 @@ class MMLinearKernel(ABC, Generic[_ConfigT, _ParamsT]):
         """
         self.config = config
 
-    @abstractmethod
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Process and transform weights after loading from checkpoint.
+    @overload
+    def process_weights_after_loading(self, arg: _ParamsT) -> None: ...
+    @overload
+    def process_weights_after_loading(self, arg: torch.nn.Module) -> None: ...
 
-        This method is called once after weights are loaded but before inference.
-        Use it to preprocess weights into the format required by your kernel
-        (e.g., reordering, padding, format conversion).
+    def process_weights_after_loading(self, arg: _ParamsT | torch.nn.Module) -> None:
+        """Optional hook called once after weights are loaded.
 
-        Modifications should be done in-place using replace_parameter() to ensure
-        the layer's parameters are properly updated.
+        Two signatures are accepted during the migration to canonical
+        ``LinearParamsBase`` flow:
 
-        Args:
-            layer: The layer module containing the weights to process
-
-        Example:
-            ```python
-            def process_weights_after_loading(self, layer):
-                params = self._get_layer_params(layer)
-                # Reorder weights for better memory access
-                weight_reordered = reorder_weights(params.weight)
-                replace_parameter(layer, params.WEIGHT, weight_reordered)
-            ```
+        * ``(self, params: _ParamsT)`` — preferred. Mutate fields on
+          ``params`` in place; the LinearMethod writes them back to the
+          layer.
+        * ``(self, layer: torch.nn.Module)`` — legacy. Kernels (e.g. Int8)
+          may still take the layer directly.
         """
-        raise NotImplementedError
+        return
 
     # return a covariant type in the subclass
     @abstractmethod
