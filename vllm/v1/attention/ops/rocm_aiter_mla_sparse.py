@@ -1202,13 +1202,12 @@ def _sparse_attn_decode_ragged_kernel(
             x_fp8 = x_uint8.to(tl.float8e4b15, bitcast=True)
         else:
             x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-        encoded_scales = tl.load(
-            token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
-            mask=valid[:, None] & nope_mask[None, :],
-            other=127,
+        scales = _load_fp8_ds_mla_nope_scales(
+            token_scale_ptr,
+            valid,
+            nope_offsets,
         )
-        scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+        k_nope = x_fp8.to(tl.bfloat16) * scales
         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -1270,13 +1269,12 @@ def _sparse_attn_decode_ragged_kernel(
                 x_fp8 = x_uint8.to(tl.float8e4b15, bitcast=True)
             else:
                 x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            encoded_scales = tl.load(
-                token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
-                mask=valid[:, None] & nope_mask[None, :],
-                other=127,
+            scales = _load_fp8_ds_mla_nope_scales(
+                token_scale_ptr,
+                valid,
+                nope_offsets,
             )
-            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            k_nope = x_fp8.to(tl.bfloat16) * scales
             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -1411,6 +1409,62 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         num_warps=8,
     )
     return out
+
+
+@triton.jit
+def _load_fp8_ds_mla_nope_scales(
+    token_scale_ptr,
+    valid,
+    nope_offsets,
+):
+    scale0 = tl.exp2(
+        tl.load(token_scale_ptr + 0, mask=valid, other=127).to(tl.float32) - 127.0
+    )
+    scale1 = tl.exp2(
+        tl.load(token_scale_ptr + 1, mask=valid, other=127).to(tl.float32) - 127.0
+    )
+    scale2 = tl.exp2(
+        tl.load(token_scale_ptr + 2, mask=valid, other=127).to(tl.float32) - 127.0
+    )
+    scale3 = tl.exp2(
+        tl.load(token_scale_ptr + 3, mask=valid, other=127).to(tl.float32) - 127.0
+    )
+    scale4 = tl.exp2(
+        tl.load(token_scale_ptr + 4, mask=valid, other=127).to(tl.float32) - 127.0
+    )
+    scale5 = tl.exp2(
+        tl.load(token_scale_ptr + 5, mask=valid, other=127).to(tl.float32) - 127.0
+    )
+    scale6 = tl.exp2(
+        tl.load(token_scale_ptr + 6, mask=valid, other=127).to(tl.float32) - 127.0
+    )
+
+    scale = tl.where(
+        nope_offsets[None, :] < 64,
+        scale0[:, None],
+        tl.where(
+            nope_offsets[None, :] < 128,
+            scale1[:, None],
+            tl.where(
+                nope_offsets[None, :] < 192,
+                scale2[:, None],
+                tl.where(
+                    nope_offsets[None, :] < 256,
+                    scale3[:, None],
+                    tl.where(
+                        nope_offsets[None, :] < 320,
+                        scale4[:, None],
+                        tl.where(
+                            nope_offsets[None, :] < 384,
+                            scale5[:, None],
+                            scale6[:, None],
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    return scale.to(tl.bfloat16)
 
 
 def _rocm_sparse_attn_prefill_triton(
