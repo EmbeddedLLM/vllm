@@ -1038,14 +1038,13 @@ def _sparse_attn_prefill_ragged_kernel(
     head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     dim_offsets = tl.arange(0, BLOCK_D)
     head_mask = head_offsets < num_heads
-    dim_mask = dim_offsets < head_dim
 
     q = tl.load(
         q_ptr
         + query_idx * q_stride_t
         + head_offsets[:, None] * q_stride_h
         + dim_offsets[None, :] * q_stride_d,
-        mask=head_mask[:, None] & dim_mask[None, :],
+        mask=head_mask[:, None],
         other=0.0,
     )
 
@@ -1067,10 +1066,9 @@ def _sparse_attn_prefill_ragged_kernel(
 
         kv = tl.load(
             kv_ptr + slot[:, None] * kv_stride_n + dim_offsets[None, :] * kv_stride_d,
-            mask=valid[:, None] & dim_mask[None, :],
+            mask=valid[:, None],
             other=0.0,
         )
-        kv = tl.where(valid[:, None] & dim_mask[None, :], kv, 0.0)
 
         scores = tl.dot(q, tl.trans(kv)) * scale
         scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
@@ -1109,7 +1107,7 @@ def _sparse_attn_prefill_ragged_kernel(
         + head_offsets[:, None] * out_stride_h
         + dim_offsets[None, :] * out_stride_d,
         out,
-        mask=head_mask[:, None] & dim_mask[None, :],
+        mask=head_mask[:, None],
     )
 
 

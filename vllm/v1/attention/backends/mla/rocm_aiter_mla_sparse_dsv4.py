@@ -156,37 +156,73 @@ def compute_global_topk_ragged_indices_and_indptr(
 
 
 @triton.jit
-def _compute_combined_lens_kernel(
-    combined_lens_ptr,
-    query_start_loc_ptr,
-    seq_lens_ptr,
+def _sum_floor_div_range(
+    first,
+    count,
+    DIVISOR: tl.constexpr,
+):
+    count = tl.maximum(count, 0)
+    base = first // DIVISOR
+    rem = first - base * DIVISOR
+    span = rem + count
+    full = span // DIVISOR
+    tail = span - full * DIVISOR
+    return count * base + DIVISOR * full * (full - 1) // 2 + full * tail
+
+
+@triton.jit
+def _sum_topk_lens(
+    start_pos,
+    count,
+    TOP_K: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+):
+    first = start_pos + 1
+    uncapped = tl.minimum(
+        count,
+        tl.maximum(TOP_K * COMPRESS_RATIO - first, 0),
+    )
+    return (
+        _sum_floor_div_range(first, uncapped, COMPRESS_RATIO)
+        + (count - uncapped) * TOP_K
+    )
+
+
+@triton.jit
+def _sum_swa_lens(
+    start_pos,
+    count,
+    WINDOW_SIZE: tl.constexpr,
+):
+    first = start_pos + 1
+    ramp = tl.minimum(
+        count,
+        tl.maximum(WINDOW_SIZE - first + 1, 0),
+    )
+    return ramp * (2 * first + ramp - 1) // 2 + (count - ramp) * WINDOW_SIZE
+
+
+@triton.jit
+def _sum_combined_lens(
+    start_pos,
+    count,
     TOP_K: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     WINDOW_SIZE: tl.constexpr,
 ):
-    batch_idx = tl.program_id(0)
-    worker_id = tl.program_id(1)
-    num_workers = tl.num_programs(1)
-
-    base = tl.load(query_start_loc_ptr)
-    query_start = tl.load(query_start_loc_ptr + batch_idx) - base
-    query_end = tl.load(query_start_loc_ptr + batch_idx + 1) - base
-    query_len = query_end - query_start
-    seq_len = tl.load(seq_lens_ptr + batch_idx)
-    start_pos = seq_len - query_len
-
-    for token_idx in range(query_start + worker_id, query_end, num_workers):
-        token_idx_in_query = token_idx - query_start
-        pos = start_pos + token_idx_in_query
-        topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
-        swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
-        tl.store(combined_lens_ptr + token_idx, topk_len + swa_len)
+    return _sum_topk_lens(
+        start_pos,
+        count,
+        TOP_K,
+        COMPRESS_RATIO,
+    ) + _sum_swa_lens(start_pos, count, WINDOW_SIZE)
 
 
 @triton.jit
 def _combine_topk_swa_indices_ragged_kernel(
     combined_ragged_ptr,
     combined_indptr_ptr,
+    combined_lens_ptr,
     topk_indices_ptr,
     topk_indices_stride,
     query_start_loc_ptr,
@@ -199,6 +235,7 @@ def _combine_topk_swa_indices_ragged_kernel(
     COMPRESS_RATIO: tl.constexpr,
     WINDOW_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    NUM_REQS: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -213,6 +250,32 @@ def _combine_topk_swa_indices_ragged_kernel(
     gather_len = tl.load(gather_lens_ptr + batch_idx)
     start_pos = seq_len - query_len
     gather_start = seq_len - gather_len
+    request_base = tl.zeros((), dtype=tl.int32)
+
+    for prev_batch_idx in tl.static_range(0, NUM_REQS):
+        prev_query_start = tl.load(query_start_loc_ptr + prev_batch_idx) - base
+        prev_query_end = tl.load(query_start_loc_ptr + prev_batch_idx + 1) - base
+        prev_query_len = prev_query_end - prev_query_start
+        prev_seq_len = tl.load(seq_lens_ptr + prev_batch_idx)
+        prev_start_pos = prev_seq_len - prev_query_len
+        prev_total = _sum_combined_lens(
+            prev_start_pos,
+            prev_query_len,
+            TOP_K,
+            COMPRESS_RATIO,
+            WINDOW_SIZE,
+        )
+        request_base += tl.where(prev_batch_idx < batch_idx, prev_total, 0)
+
+    if block_idx == 0 and worker_id == 0:
+        request_total = _sum_combined_lens(
+            start_pos,
+            query_len,
+            TOP_K,
+            COMPRESS_RATIO,
+            WINDOW_SIZE,
+        )
+        tl.store(combined_indptr_ptr + query_end, request_base + request_total)
 
     for token_idx in range(query_start + worker_id, query_end, num_workers):
         token_idx_in_query = token_idx - query_start
@@ -220,10 +283,20 @@ def _combine_topk_swa_indices_ragged_kernel(
         topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
         swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
         combined_len = topk_len + swa_len
+        out_start = request_base + _sum_combined_lens(
+            start_pos,
+            token_idx_in_query,
+            TOP_K,
+            COMPRESS_RATIO,
+            WINDOW_SIZE,
+        )
+
+        if block_idx == 0:
+            tl.store(combined_indptr_ptr + token_idx, out_start)
+            tl.store(combined_lens_ptr + token_idx, combined_len)
 
         offset = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         if block_idx * BLOCK_SIZE < combined_len:
-            out_start = tl.load(combined_indptr_ptr + token_idx)
             topk_mask = (offset < topk_len) & (offset < topk_width)
             topk_vals = tl.load(
                 topk_indices_ptr + token_idx * topk_indices_stride + offset,
@@ -264,28 +337,25 @@ def combine_topk_swa_indices_ragged(
     )
 
     num_workers = 128
-    _compute_combined_lens_kernel[(num_reqs, num_workers)](
-        combined_lens,
-        query_start_loc,
-        seq_lens,
-        TOP_K=topk,
-        COMPRESS_RATIO=compress_ratio,
-        WINDOW_SIZE=window_size,
+    combined_indptr = torch.empty(
+        num_tokens + 1,
+        dtype=torch.int32,
+        device=topk_indices.device,
     )
-
-    combined_indptr = _build_indptr_from_lengths(combined_lens)
     combined_ragged = torch.empty(
         num_tokens * (topk + window_size),
         dtype=torch.int32,
         device=topk_indices.device,
     )
-    if combined_ragged.numel() > 0:
+    if num_tokens > 0:
         block = 128
+        num_blocks = max(1, triton.cdiv(topk + window_size, block))
         _combine_topk_swa_indices_ragged_kernel[
-            (num_reqs, num_workers, triton.cdiv(topk + window_size, block))
+            (num_reqs, num_workers, num_blocks)
         ](
             combined_ragged,
             combined_indptr,
+            combined_lens,
             topk_indices,
             topk_indices.stride(0),
             query_start_loc,
@@ -298,6 +368,7 @@ def combine_topk_swa_indices_ragged(
             COMPRESS_RATIO=compress_ratio,
             WINDOW_SIZE=window_size,
             BLOCK_SIZE=block,
+            NUM_REQS=num_reqs,
         )
     return combined_ragged, combined_indptr, combined_lens
 
