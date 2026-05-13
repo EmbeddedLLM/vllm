@@ -4,11 +4,13 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
@@ -40,7 +42,7 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -83,6 +85,15 @@ logger = init_logger(__name__)
 # workspace allocated at _forward_prefill (and the matching profile-time
 # reservation in attention_impl's dummy-run branch).
 PREFILL_CHUNK_SIZE = 4
+
+
+def _dsv4_wob_fp32_allreduce_enabled() -> bool:
+    return os.getenv("VLLM_DSV4_WOB_FP32_ALLREDUCE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 @dataclass
@@ -280,6 +291,29 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 k_cache_prefix=self.mla_attn.prefix,
             )
 
+    def _wo_b_local_apply(self, x: torch.Tensor) -> torch.Tensor:
+        bias = (
+            None
+            if self.wo_b.tp_rank > 0 or self.wo_b.skip_bias_add
+            else self.wo_b.bias
+        )
+        return self.wo_b.quant_method.apply(self.wo_b, x, bias)
+
+    def _wo_b_fp32_allreduce(self, x: torch.Tensor) -> torch.Tensor:
+        local = self._wo_b_local_apply(x)
+        if self.wo_b.reduce_results and self.wo_b.tp_size > 1:
+            reduced = local.float()
+            tp_group = get_tp_group()
+            if tp_group.world_size > 1:
+                dist.all_reduce(reduced, group=tp_group.device_group)
+            return reduced.to(local.dtype)
+        return local
+
+    def _wo_b(self, x: torch.Tensor) -> torch.Tensor:
+        if _dsv4_wob_fp32_allreduce_enabled() and current_platform.is_rocm():
+            return self._wo_b_fp32_allreduce(x)
+        return self.wo_b(x)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -315,7 +349,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self.o_lora_rank,
                 self.wo_a,
             )
-            return self.wo_b(z.flatten(1))
+            return self._wo_b(z.flatten(1))
 
         # O projection: inverse RoPE + FP8 quant + einsum + wo_b
         o_fp8, o_scale = fused_inv_rope_fp8_quant(
@@ -347,7 +381,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             list(self._einsum_recipe),
         )
 
-        return self.wo_b(z.flatten(1))
+        return self._wo_b(z.flatten(1))
 
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
         aux_streams = self.aux_stream_list

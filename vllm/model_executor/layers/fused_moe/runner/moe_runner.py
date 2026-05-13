@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import (
@@ -42,6 +45,31 @@ from vllm.utils.torch_utils import (
     LayerName,
     direct_register_custom_op,
 )
+
+
+def _dsv4_moe_fp32_allreduce_enabled() -> bool:
+    return os.getenv("VLLM_DSV4_MOE_FP32_ALLREDUCE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _maybe_fp32_tensor_model_parallel_all_reduce(
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    if (
+        _dsv4_moe_fp32_allreduce_enabled()
+        and current_platform.is_rocm()
+        and tensor.dtype in (torch.bfloat16, torch.float16)
+    ):
+        reduced = tensor.float()
+        tp_group = get_tp_group()
+        if tp_group.world_size > 1:
+            dist.all_reduce(reduced, group=tp_group.device_group)
+        return reduced.to(tensor.dtype)
+    return tensor_model_parallel_all_reduce(tensor)
 
 
 def get_layer_from_name(layer_name: str) -> torch.nn.Module:
@@ -388,7 +416,9 @@ class MoERunner(MoERunnerInterface):
             and not self.moe_config.is_sequence_parallel
             and self._fused_output_is_reduced
         ):
-            shared_output = tensor_model_parallel_all_reduce(shared_output)
+            shared_output = _maybe_fp32_tensor_model_parallel_all_reduce(
+                shared_output
+            )
         return shared_output
 
     def _maybe_reduce_final_output(
@@ -411,7 +441,7 @@ class MoERunner(MoERunnerInterface):
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not self._fused_output_is_reduced
         ):
-            states = tensor_model_parallel_all_reduce(states)
+            states = _maybe_fp32_tensor_model_parallel_all_reduce(states)
 
         return states[..., :trunc_size]
 
