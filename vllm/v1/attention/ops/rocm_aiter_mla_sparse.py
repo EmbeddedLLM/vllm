@@ -344,6 +344,190 @@ def paged_mqa_logits_module():
     return None
 
 
+@triton.jit
+def _fp8_paged_mqa_logits_fused_kernel(
+    q_ptr,  # [B, next_n, H, D] fp8
+    kv_fp8_ptr,  # [num_blocks, block_size * D] fp8, shuffled within a block
+    kv_scale_ptr,  # [num_blocks, block_size] float32
+    weights_ptr,  # [B * next_n, H] float32
+    context_lens_ptr,  # [B, context_n] int32
+    block_tables_ptr,  # [B, max_blocks_per_seq] int32
+    logits_ptr,  # [B * next_n, max_model_len] float32
+    max_model_len,
+    max_blocks_per_seq,
+    block_table_stride,
+    q_stride_b,
+    q_stride_n,
+    q_stride_h,
+    q_stride_d,
+    context_stride_b,
+    context_stride_t,
+    logits_stride_m,
+    kv_fp8_row_stride,
+    kv_scale_row_stride,
+    BLOCK_SIZE: tl.constexpr,
+    D_BLOCK: tl.constexpr,
+    D_ACTUAL: tl.constexpr,
+    H: tl.constexpr,
+    CONTEXT_N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_TILE_SIZE: tl.constexpr,
+    HEAD_TILE_SIZE: tl.constexpr,
+    SKIP_CONTEXT_LEN_LE: tl.constexpr,
+):
+    tile_rk = tl.program_id(0)
+    batch_idx = tl.program_id(1)
+    token_idx = tl.program_id(2)
+    query_idx = batch_idx * tl.num_programs(2) + token_idx
+
+    ctx_token_idx = tl.minimum(token_idx, CONTEXT_N - 1)
+    context_len = tl.load(
+        context_lens_ptr
+        + batch_idx * context_stride_b
+        + ctx_token_idx * context_stride_t
+    )
+    logi_start = tile_rk * BLOCK_N
+    if logi_start >= context_len:
+        return
+    if SKIP_CONTEXT_LEN_LE > 0 and context_len <= SKIP_CONTEXT_LEN_LE:
+        return
+
+    logi_offs = logi_start + tl.arange(0, BLOCK_N)
+    log_blk_rk = logi_offs // BLOCK_SIZE
+    within_blk = logi_offs - log_blk_rk * BLOCK_SIZE
+    blk_mask = log_blk_rk < max_blocks_per_seq
+    phys_blk = tl.load(
+        block_tables_ptr + batch_idx * block_table_stride + log_blk_rk,
+        mask=blk_mask,
+        other=0,
+    )
+    phys_blk_i64 = phys_blk.to(tl.int64)
+
+    kv_mask = logi_offs < context_len
+    d_offs = tl.arange(0, D_BLOCK)
+    d_mask = d_offs < D_ACTUAL
+    tile_block = within_blk // BLOCK_TILE_SIZE
+    tile_offset = within_blk - tile_block * BLOCK_TILE_SIZE
+    tiled_d = (d_offs // HEAD_TILE_SIZE) * HEAD_TILE_SIZE * BLOCK_TILE_SIZE
+    tiled_d += d_offs % HEAD_TILE_SIZE
+    kv_offsets = (
+        phys_blk_i64[:, None] * kv_fp8_row_stride
+        + tile_block[:, None] * BLOCK_TILE_SIZE * D_ACTUAL
+        + tile_offset[:, None] * HEAD_TILE_SIZE
+        + tiled_d[None, :]
+    )
+    k_blk = tl.load(
+        kv_fp8_ptr + kv_offsets,
+        mask=kv_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    k_scale = tl.load(
+        kv_scale_ptr + phys_blk_i64 * kv_scale_row_stride + within_blk,
+        mask=kv_mask,
+        other=0.0,
+    )
+
+    accum = tl.zeros((BLOCK_N,), tl.float32)
+    h_offsets_base = tl.arange(0, BLOCK_H)
+    for h_start in tl.static_range(0, H, BLOCK_H):
+        h_offsets = h_start + h_offsets_base
+        h_mask = h_offsets < H
+        q_blk = tl.load(
+            q_ptr
+            + batch_idx * q_stride_b
+            + token_idx * q_stride_n
+            + h_offsets[:, None] * q_stride_h
+            + d_offs[None, :] * q_stride_d,
+            mask=h_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        scores = tl.dot(q_blk, k_blk.T, input_precision="ieee", out_dtype=tl.float32)
+        scores = scores * k_scale[None, :]
+        weights = tl.load(
+            weights_ptr + query_idx * H + h_offsets,
+            mask=h_mask,
+            other=0.0,
+        )
+        scores = tl.maximum(scores, 0.0) * weights[:, None]
+        accum += tl.sum(scores, axis=0)
+
+    q_pos = context_len - 1
+    valid = kv_mask & (logi_offs <= q_pos)
+    accum = tl.where(valid, accum, float("-inf"))
+    tl.store(
+        logits_ptr + query_idx * logits_stride_m + logi_offs,
+        accum,
+        mask=logi_offs < max_model_len,
+    )
+
+
+def fp8_paged_mqa_logits_fused_triton(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+    skip_context_len_le: int = 0,
+) -> torch.Tensor:
+    """Fused paged MQA logits for the ROCm FP8 indexer cache."""
+    fp8_dtype = current_platform.fp8_dtype()
+    batch_size, next_n, heads, head_dim = q.shape
+    num_blocks = kv_cache.shape[0]
+    block_size = kv_cache.shape[1]
+    if context_lens.dim() == 1:
+        context_lens = context_lens.unsqueeze(-1)
+
+    kv_2d = kv_cache.reshape(num_blocks, block_size * (head_dim + 4))
+    kv_fp8 = kv_2d[:, : block_size * head_dim].view(fp8_dtype)
+    kv_scale = kv_2d[:, block_size * head_dim :].view(torch.float32)
+    logits = torch.full(
+        (batch_size * next_n, max_model_len),
+        float("-inf"),
+        device=q.device,
+        dtype=torch.float32,
+    )
+
+    block_n = 128 if block_size >= 128 else max(64, triton.next_power_of_2(block_size))
+    block_h = 4 if heads >= 4 else triton.next_power_of_2(heads)
+    grid = (triton.cdiv(max_model_len, block_n), batch_size, next_n)
+    _fp8_paged_mqa_logits_fused_kernel[grid](
+        q,
+        kv_fp8,
+        kv_scale,
+        weights,
+        context_lens,
+        block_tables,
+        logits,
+        max_model_len,
+        block_tables.shape[1],
+        block_tables.stride(0),
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        context_lens.stride(0),
+        context_lens.stride(1),
+        logits.stride(0),
+        kv_fp8.stride(0),
+        kv_scale.stride(0),
+        BLOCK_SIZE=block_size,
+        D_BLOCK=triton.next_power_of_2(head_dim),
+        D_ACTUAL=head_dim,
+        H=heads,
+        CONTEXT_N=context_lens.shape[1],
+        BLOCK_N=block_n,
+        BLOCK_H=block_h,
+        BLOCK_TILE_SIZE=16,
+        HEAD_TILE_SIZE=16,
+        SKIP_CONTEXT_LEN_LE=skip_context_len_le,
+        num_warps=4,
+        num_stages=2,
+    )
+    return logits
+
+
 def rocm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -352,6 +536,7 @@ def rocm_fp8_paged_mqa_logits(
     block_tables: torch.Tensor,
     schedule_metadata: torch.Tensor,
     max_model_len: int,
+    skip_context_len_le: int = 0,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
 
@@ -380,6 +565,22 @@ def rocm_fp8_paged_mqa_logits(
     # if rocm_aiter_ops.is_enabled():
     batch_size, next_n, heads, head_dim = q_fp8.shape
     num_blocks, block_size, _, _ = kv_cache_fp8.shape
+
+    if (
+        not _ON_GFX942
+        and head_dim % 16 == 0
+        and block_size % 16 == 0
+        and kv_cache_fp8.is_contiguous()
+    ):
+        return fp8_paged_mqa_logits_fused_triton(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+            skip_context_len_le=skip_context_len_le,
+        )
 
     if rocm_aiter_ops.is_enabled():
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
@@ -561,6 +762,94 @@ def _topk_indices_torch(logits: torch.Tensor, topk_tokens: int) -> torch.Tensor:
     return padded
 
 
+@triton.jit
+def _fill_dense_decode_topk_indices_kernel(
+    topk_indices_ptr,
+    topk_indices_stride,
+    seq_lens_ptr,
+    seq_lens_stride_b,
+    seq_lens_stride_t,
+    num_rows,
+    next_n: tl.constexpr,
+    context_n: tl.constexpr,
+    topk_tokens: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    ONLY_CONTEXT_LEN_LE_TOPK: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    topk_block = tl.program_id(1)
+    if row_idx >= num_rows:
+        return
+
+    batch_idx = row_idx // next_n
+    token_idx = row_idx - batch_idx * next_n
+    context_token_idx = tl.minimum(token_idx, context_n - 1)
+    context_len = tl.load(
+        seq_lens_ptr
+        + batch_idx * seq_lens_stride_b
+        + context_token_idx * seq_lens_stride_t
+    )
+    if ONLY_CONTEXT_LEN_LE_TOPK and context_len > topk_tokens:
+        return
+    offsets = topk_block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
+    values = tl.where(offsets < context_len, offsets, -1)
+    tl.store(
+        topk_indices_ptr + row_idx * topk_indices_stride + offsets,
+        values,
+        mask=offsets < topk_tokens,
+    )
+
+
+def fill_dense_decode_topk_indices(
+    topk_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    next_n: int,
+    only_context_len_le_topk: bool = False,
+) -> None:
+    """Fill top-k rows when every active compressed token is selected."""
+    if seq_lens.dim() == 1:
+        seq_lens = seq_lens.unsqueeze(-1)
+    num_rows, topk_tokens = topk_indices.shape
+    block_topk = min(1024, triton.next_power_of_2(topk_tokens))
+    _fill_dense_decode_topk_indices_kernel[
+        (num_rows, triton.cdiv(topk_tokens, block_topk))
+    ](
+        topk_indices,
+        topk_indices.stride(0),
+        seq_lens,
+        seq_lens.stride(0),
+        seq_lens.stride(1),
+        num_rows,
+        next_n,
+        seq_lens.shape[1],
+        topk_tokens,
+        BLOCK_TOPK=block_topk,
+        ONLY_CONTEXT_LEN_LE_TOPK=only_context_len_le_topk,
+    )
+
+
+def _decode_indexer_context_policy(
+    max_model_len: int,
+    active_seq_len: int,
+    topk_tokens: int,
+) -> tuple[str, int]:
+    """Choose the decode indexer path by active compressed context length.
+
+    The policy is exact for the whole model context range:
+    - active <= topk: every active compressed token is selected, so no score
+      matrix is needed.
+    - topk < active < model max: score the active prefix only; omitted columns
+      would be trailing -inf and cannot affect top-k.
+    - active == model max: score the full compressed model context.
+    """
+    active_width = max(1, min(max_model_len, active_seq_len))
+    if active_width <= topk_tokens:
+        return "dense_all_active", active_width
+    if active_width < max_model_len:
+        return "active_width_logits", active_width
+    return "full_context_logits", max_model_len
+
+
 def rocm_aiter_sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -735,18 +1024,38 @@ def rocm_aiter_sparse_attn_indexer_native(
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
 
-        logits = rocm_fp8_paged_mqa_logits(
-            padded_q_fp8_decode_tokens,
-            kv_cache,
-            weights[:num_padded_tokens],
-            decode_metadata.seq_lens,
-            decode_metadata.block_table,
-            decode_metadata.schedule_metadata,
-            max_model_len=max_model_len,
-        )
-
         topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
-        topk_indices.copy_(_topk_indices_torch(logits, topk_tokens)[:num_decode_tokens])
+        decode_policy, logits_width = _decode_indexer_context_policy(
+            max_model_len,
+            decode_metadata.max_seq_len,
+            topk_tokens,
+        )
+        if decode_policy == "dense_all_active":
+            fill_dense_decode_topk_indices(
+                topk_indices,
+                decode_metadata.seq_lens,
+                next_n,
+            )
+        else:
+            logits = rocm_fp8_paged_mqa_logits(
+                padded_q_fp8_decode_tokens,
+                kv_cache,
+                weights[:num_padded_tokens],
+                decode_metadata.seq_lens,
+                decode_metadata.block_table,
+                decode_metadata.schedule_metadata,
+                max_model_len=logits_width,
+                skip_context_len_le=topk_tokens,
+            )
+            topk_indices.copy_(
+                _topk_indices_torch(logits, topk_tokens)[:num_decode_tokens]
+            )
+            fill_dense_decode_topk_indices(
+                topk_indices,
+                decode_metadata.seq_lens,
+                next_n,
+                only_context_len_le_topk=True,
+            )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack

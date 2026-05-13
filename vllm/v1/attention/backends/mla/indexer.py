@@ -195,6 +195,7 @@ class DeepSeekV32IndexerDecodeMetadata:
     decode_lens: torch.Tensor
     requires_padding: bool
     schedule_metadata: torch.Tensor
+    max_seq_len: int
 
 
 @dataclass
@@ -610,6 +611,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
 
+            max_decode_seq_len = common_attn_metadata.max_seq_len
+            if self.compress_ratio > 1:
+                max_decode_seq_len //= self.compress_ratio
+            max_decode_seq_len = max(1, max_decode_seq_len)
+
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             if current_platform.is_cuda() and has_deep_gemm():
                 self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
@@ -624,6 +630,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
                 schedule_metadata=self.scheduler_metadata_buffer,
+                max_seq_len=max_decode_seq_len,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(
