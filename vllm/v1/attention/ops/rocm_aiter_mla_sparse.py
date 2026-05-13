@@ -490,7 +490,7 @@ def fp8_paged_mqa_logits_fused_triton(
     )
 
     block_n = 128 if block_size >= 128 else max(64, triton.next_power_of_2(block_size))
-    block_h = 4 if heads >= 4 else triton.next_power_of_2(heads)
+    block_h = min(16, triton.next_power_of_2(heads))
     grid = (triton.cdiv(max_model_len, block_n), batch_size, next_n)
     _fp8_paged_mqa_logits_fused_kernel[grid](
         q,
@@ -1688,7 +1688,7 @@ def _rocm_sparse_attn_prefill_ragged_triton(
 
     block_h = 16
     block_d = triton.next_power_of_2(head_dim)
-    block_k = 16 if head_dim >= 256 else 32
+    block_k = 32
     out = torch.empty_like(q, dtype=torch.bfloat16)
     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,
@@ -1876,7 +1876,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
         extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
 
     block_h = 16
-    block_k = 16 if head_dim >= 256 else 32
+    block_k = 32
     out = torch.empty_like(q, dtype=torch.bfloat16)
     _sparse_attn_decode_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,
