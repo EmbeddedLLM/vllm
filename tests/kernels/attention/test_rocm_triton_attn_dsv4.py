@@ -281,6 +281,67 @@ def test_sparse_attn_prefill_ragged_kernel() -> None:
 
 
 @torch.inference_mode()
+def test_fp8_mqa_logits_torch_accepts_column_scale() -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import fp8_mqa_logits_torch
+
+    device = torch.device("cuda")
+    torch.manual_seed(3)
+    fp8_dtype = current_platform.fp8_dtype()
+    q = (
+        torch.randn(4, 3, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    ).to(fp8_dtype)
+    k = (torch.randn(7, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125).to(
+        fp8_dtype
+    )
+    scale = torch.rand(7, 1, dtype=torch.float32, device=device) + 0.5
+    weights = torch.rand(4, 3, dtype=torch.float32, device=device)
+    cu_seqlen_ks = torch.tensor([0, 0, 2, 3], dtype=torch.int32, device=device)
+    cu_seqlen_ke = torch.tensor([7, 5, 7, 6], dtype=torch.int32, device=device)
+
+    actual = fp8_mqa_logits_torch(
+        q,
+        (k, scale),
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+    )
+    expected = fp8_mqa_logits_torch(
+        q,
+        (k, scale.squeeze(-1)),
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+@torch.inference_mode()
+def test_topk_indices_torch_prefill_converts_to_local_indices() -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _topk_indices_torch
+
+    device = torch.device("cuda")
+    logits = torch.full((3, 8), float("-inf"), dtype=torch.float32, device=device)
+    logits[0, :4] = torch.tensor([0.1, 0.7, 0.2, 0.5], device=device)
+    logits[1, 4:8] = torch.tensor([0.9, 0.3, 0.8, 0.4], device=device)
+    logits[2, 2:5] = torch.tensor([0.6, 0.4, 0.2], device=device)
+    row_starts = torch.tensor([0, 4, 2], dtype=torch.int32, device=device)
+
+    actual = _topk_indices_torch(logits, 4, row_starts=row_starts)
+    expected = torch.tensor(
+        [
+            [1, 3, 2, 0],
+            [0, 2, 3, 1],
+            [0, 1, 2, -1],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+@torch.inference_mode()
 def test_sparse_attn_decode_ragged_kernel() -> None:
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
         _rocm_sparse_attn_decode_ragged_triton,

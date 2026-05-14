@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from importlib.util import find_spec
 
 import torch
@@ -19,6 +20,10 @@ if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX942
 else:
     _ON_GFX942 = False
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
 
 
 @triton.jit
@@ -377,11 +382,13 @@ def rocm_fp8_paged_mqa_logits(
     from vllm._aiter_ops import rocm_aiter_ops
 
     aiter_paged_mqa_logits_module = None
-    # if rocm_aiter_ops.is_enabled():
     batch_size, next_n, heads, head_dim = q_fp8.shape
     num_blocks, block_size, _, _ = kv_cache_fp8.shape
 
-    if rocm_aiter_ops.is_enabled():
+    if (
+        rocm_aiter_ops.is_enabled()
+        and not _env_flag("VLLM_DSV4_INDEXER_PAGED_MQA_TORCH")
+    ):
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
 
     if aiter_paged_mqa_logits_module is not None:
@@ -464,6 +471,7 @@ def fp8_mqa_logits_torch(
     """
     k_fp8, scale = kv
     seq_len_kv = k_fp8.shape[0]
+    scale = scale.view(torch.float32).reshape(seq_len_kv)
     k = k_fp8.to(torch.bfloat16)
     q = q.to(torch.bfloat16)
 
@@ -475,7 +483,7 @@ def fp8_mqa_logits_torch(
     )
     mask = mask_lo & mask_hi
 
-    score = torch.einsum("mhd,nd->hmn", q, k).float() * scale
+    score = torch.einsum("mhd,nd->hmn", q, k).float() * scale.view(1, 1, -1)
     logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
     logits = logits.masked_fill(~mask, float("-inf"))
 
@@ -529,7 +537,7 @@ def rocm_fp8_mqa_logits(
     from vllm._aiter_ops import rocm_aiter_ops
 
     aiter_mqa_logits_module = None
-    if rocm_aiter_ops.is_enabled():
+    if rocm_aiter_ops.is_enabled() and not _env_flag("VLLM_DSV4_INDEXER_MQA_TORCH"):
         aiter_mqa_logits_module = mqa_logits_module()
 
     if aiter_mqa_logits_module is not None:
@@ -540,7 +548,11 @@ def rocm_fp8_mqa_logits(
         return fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
 
 
-def _topk_indices_torch(logits: torch.Tensor, topk_tokens: int) -> torch.Tensor:
+def _topk_indices_torch(
+    logits: torch.Tensor,
+    topk_tokens: int,
+    row_starts: torch.Tensor | None = None,
+) -> torch.Tensor:
     k = min(topk_tokens, logits.shape[-1])
     values, indices = torch.topk(logits, k=k, dim=-1)
     indices = indices.to(torch.int32)
@@ -550,15 +562,25 @@ def _topk_indices_torch(logits: torch.Tensor, topk_tokens: int) -> torch.Tensor:
         indices,
     )
     if k == topk_tokens:
-        return indices
-    padded = torch.full(
-        (logits.shape[0], topk_tokens),
-        -1,
-        dtype=torch.int32,
-        device=logits.device,
-    )
-    padded[:, :k] = indices
-    return padded
+        topk_indices = indices
+    else:
+        topk_indices = torch.full(
+            (logits.shape[0], topk_tokens),
+            -1,
+            dtype=torch.int32,
+            device=logits.device,
+        )
+        topk_indices[:, :k] = indices
+
+    if row_starts is not None:
+        row_starts = row_starts.to(dtype=torch.int32).reshape(-1, 1)
+        topk_indices = torch.where(
+            topk_indices < 0,
+            topk_indices,
+            topk_indices - row_starts,
+        )
+
+    return topk_indices
 
 
 def rocm_aiter_sparse_attn_indexer_fake(
@@ -708,7 +730,13 @@ def rocm_aiter_sparse_attn_indexer_native(
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
-            topk_indices.copy_(_topk_indices_torch(logits, topk_tokens))
+            topk_indices.copy_(
+                _topk_indices_torch(
+                    logits,
+                    topk_tokens,
+                    row_starts=chunk.cu_seqlen_ks,
+                )
+            )
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
@@ -745,8 +773,8 @@ def rocm_aiter_sparse_attn_indexer_native(
             max_model_len=max_model_len,
         )
 
-        topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
-        topk_indices.copy_(_topk_indices_torch(logits, topk_tokens)[:num_decode_tokens])
+        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+        topk_indices.copy_(_topk_indices_torch(logits, topk_tokens))
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
@@ -755,7 +783,7 @@ def rocm_aiter_sparse_attn_indexer_native(
                 topk_indices.reshape(batch_size, -1, topk_indices.shape[-1]),
                 decode_lens,
             )
-            topk_indices_buffer[:num_decode_tokens, : topk_indices.shape[-1]] = (
+            topk_indices_buffer[: topk_indices.shape[0], : topk_indices.shape[-1]] = (
                 topk_indices
             )
 
