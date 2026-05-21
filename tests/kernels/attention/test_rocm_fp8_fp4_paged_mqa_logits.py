@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import inspect
 import os
 import random
 
@@ -25,6 +26,31 @@ FP4_VALUES = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
     dtype=torch.float32,
 )
+
+
+def test_rocm_aiter_sparse_attn_indexer_native_signature_preserved() -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        rocm_aiter_sparse_attn_indexer_native,
+    )
+
+    signature = inspect.signature(rocm_aiter_sparse_attn_indexer_native)
+    assert list(signature.parameters) == [
+        "hidden_states",
+        "k_cache_prefix",
+        "kv_cache",
+        "q_quant",
+        "k",
+        "weights",
+        "quant_block_size",
+        "scale_fmt",
+        "topk_tokens",
+        "head_dim",
+        "max_model_len",
+        "total_seq_lens",
+        "topk_indices_buffer",
+        "skip_k_cache_insert",
+        "use_fp4_cache",
+    ]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -316,6 +342,222 @@ def test_rocm_fp4_mqa_logits_matches_reference() -> None:
 
 
 @torch.inference_mode()
+def test_rocm_fp4_mqa_logits_trivial_topk_skip_matches_full_topk() -> None:
+    from vllm.v1.attention.ops.rocm_fp8_fp4_paged_mqa_logits import (
+        rocm_fp4_mqa_logits,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(234)
+    seq_len = 9
+    seq_len_kv = 160
+    num_heads = 32
+    head_dim = 128
+    topk_tokens = 32
+    q = (
+        torch.randn(
+            (seq_len, num_heads, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.125
+    )
+    k = torch.randn((seq_len_kv, head_dim), device=device, dtype=torch.bfloat16) * 0.125
+    weights = torch.randn((seq_len, num_heads), device=device, dtype=torch.float32)
+    cu_seqlen_ks = torch.tensor(
+        [0, 3, 11, 29, 37, 43, 61, 72, 88],
+        device=device,
+        dtype=torch.int32,
+    )
+    row_lens = torch.tensor(
+        [0, 8, 31, 32, 33, 64, 72, 80, 72],
+        device=device,
+        dtype=torch.int32,
+    )
+    cu_seqlen_ke = cu_seqlen_ks + row_lens
+
+    q_packed, q_scales = _quantize_to_mxfp4(q)
+    k_packed, k_scales = _quantize_to_mxfp4(k)
+    q_in = (q_packed.view(torch.int8), q_scales.view(torch.int32).squeeze(-1))
+    k_in = (k_packed.view(torch.int8), k_scales.view(torch.int32).squeeze(-1))
+
+    full_logits = rocm_fp4_mqa_logits(
+        q_in,
+        k_in,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        clean_logits=False,
+    )
+    skipped_logits = rocm_fp4_mqa_logits(
+        q_in,
+        k_in,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        clean_logits=False,
+        trivial_topk_len=topk_tokens,
+    )
+
+    full_indices = torch.empty((seq_len, topk_tokens), dtype=torch.int32, device=device)
+    skipped_indices = torch.empty_like(full_indices)
+    torch.ops._C.top_k_per_row_prefill(
+        full_logits,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        full_indices,
+        full_logits.shape[0],
+        full_logits.stride(0),
+        full_logits.stride(1),
+        topk_tokens,
+    )
+    torch.ops._C.top_k_per_row_prefill(
+        skipped_logits,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        skipped_indices,
+        skipped_logits.shape[0],
+        skipped_logits.stride(0),
+        skipped_logits.stride(1),
+        topk_tokens,
+    )
+
+    starts_cpu = cu_seqlen_ks.cpu().tolist()
+    row_lens_cpu = row_lens.cpu().tolist()
+    for row, (start, row_len) in enumerate(zip(starts_cpu, row_lens_cpu)):
+        selected = min(topk_tokens, row_len)
+        assert torch.all(
+            (skipped_indices[row] == -1) | (skipped_indices[row] < row_len)
+        )
+        if row_len <= topk_tokens:
+            expected = torch.full(
+                (topk_tokens,),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            if row_len > 0:
+                expected[:row_len] = torch.arange(
+                    row_len, dtype=torch.int32, device=device
+                )
+            torch.testing.assert_close(skipped_indices[row], expected)
+            continue
+
+        full_positions = full_indices[row, :selected].clamp_min(0).to(torch.long)
+        skipped_positions = skipped_indices[row, :selected].clamp_min(0).to(torch.long)
+        full_values = full_logits[row, start + full_positions]
+        skipped_values = full_logits[row, start + skipped_positions]
+        torch.testing.assert_close(
+            torch.sort(skipped_values).values,
+            torch.sort(full_values).values,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+
+@torch.inference_mode()
+def test_rocm_fp4_mqa_logits_persistent_env_matches_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.attention.ops.rocm_fp8_fp4_paged_mqa_logits import (
+        rocm_fp4_mqa_logits,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(235)
+    seq_len = 10
+    seq_len_kv = 192
+    num_heads = 32
+    head_dim = 128
+    topk_tokens = 32
+    q = (
+        torch.randn(
+            (seq_len, num_heads, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.125
+    )
+    k = torch.randn((seq_len_kv, head_dim), device=device, dtype=torch.bfloat16) * 0.125
+    weights = torch.randn((seq_len, num_heads), device=device, dtype=torch.float32)
+    cu_seqlen_ks = torch.tensor(
+        [0, 3, 11, 29, 37, 43, 61, 72, 88, 96],
+        device=device,
+        dtype=torch.int32,
+    )
+    row_lens = torch.tensor(
+        [0, 8, 31, 32, 33, 64, 72, 80, 72, 96],
+        device=device,
+        dtype=torch.int32,
+    )
+    cu_seqlen_ke = cu_seqlen_ks + row_lens
+
+    q_packed, q_scales = _quantize_to_mxfp4(q)
+    k_packed, k_scales = _quantize_to_mxfp4(k)
+    q_in = (q_packed.view(torch.int8), q_scales.view(torch.int32).squeeze(-1))
+    k_in = (k_packed.view(torch.int8), k_scales.view(torch.int32).squeeze(-1))
+
+    monkeypatch.delenv(
+        "VLLM_ROCM_FP4_INDEXER_PREFILL_PERSISTENT_K_PROGS", raising=False
+    )
+    default_logits = rocm_fp4_mqa_logits(
+        q_in,
+        k_in,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        clean_logits=False,
+        trivial_topk_len=topk_tokens,
+    )
+    monkeypatch.setenv("VLLM_ROCM_FP4_INDEXER_PREFILL_PERSISTENT_K_PROGS", "4")
+    persistent_logits = rocm_fp4_mqa_logits(
+        q_in,
+        k_in,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        clean_logits=False,
+        trivial_topk_len=topk_tokens,
+    )
+
+    positions = torch.arange(seq_len_kv, device=device)[None, :]
+    starts = cu_seqlen_ks[:, None]
+    ends = cu_seqlen_ke[:, None]
+    computed_rows = row_lens[:, None] > topk_tokens
+    valid_mask = computed_rows & (positions >= starts) & (positions < ends)
+    torch.testing.assert_close(
+        persistent_logits.masked_fill(~valid_mask, 0),
+        default_logits.masked_fill(~valid_mask, 0),
+    )
+
+    default_indices = torch.empty(
+        (seq_len, topk_tokens), dtype=torch.int32, device=device
+    )
+    persistent_indices = torch.empty_like(default_indices)
+    torch.ops._C.top_k_per_row_prefill(
+        default_logits,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        default_indices,
+        default_logits.shape[0],
+        default_logits.stride(0),
+        default_logits.stride(1),
+        topk_tokens,
+    )
+    torch.ops._C.top_k_per_row_prefill(
+        persistent_logits,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        persistent_indices,
+        persistent_logits.shape[0],
+        persistent_logits.stride(0),
+        persistent_logits.stride(1),
+        topk_tokens,
+    )
+    torch.testing.assert_close(persistent_indices, default_indices)
+
+
+@torch.inference_mode()
 def test_cp_gather_indexer_mxfp4_cache_triton_matches_compressor_layout() -> None:
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
         cp_gather_indexer_mxfp4_cache_triton,
@@ -543,3 +785,1107 @@ def test_rocm_fp8_fp4_paged_mqa_logits_deepgemm_cases(case: PagedMQACase) -> Non
     diff = calc_diff(actual, expected)
     tolerance = 2e-2 if case.is_fp4 or case.logits_dtype is torch.bfloat16 else 1e-3
     assert diff < tolerance, f"{case.id()} diff={float(diff):.6f}"
+
+
+@pytest.mark.parametrize("seq_lens_2d", [False, True])
+@torch.inference_mode()
+def test_rocm_fp4_paged_mqa_logits_topk_chunked_matches_materialized(
+    seq_lens_2d: bool,
+) -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _fp4_decode_valid_lens_2d,
+        _rocm_fp4_paged_mqa_logits_topk_chunked,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(123)
+    batch_size = 3
+    next_n = 2
+    num_heads = 32
+    head_dim = 128
+    block_size = 32
+    max_model_len = 192
+    topk_tokens = 32
+
+    q = (
+        torch.randn(
+            (batch_size, next_n, num_heads, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.125
+    )
+    weights = torch.randn(
+        (batch_size * next_n, num_heads), device=device, dtype=torch.float32
+    )
+    context_1d = torch.tensor([70, 133, 181], device=device, dtype=torch.int32)
+    if seq_lens_2d:
+        context_lens = torch.tensor(
+            [[65, 70], [117, 133], [151, 181]],
+            device=device,
+            dtype=torch.int32,
+        )
+        max_ctx_per_seq = context_lens.max(dim=1).values
+    else:
+        context_lens = context_1d
+        max_ctx_per_seq = context_lens
+
+    num_blocks_per_query = torch.ceil(max_ctx_per_seq.float() / block_size).to(
+        torch.int32
+    )
+    total_blocks = int(num_blocks_per_query.sum().item()) + 4
+    kv_cache = (
+        torch.randn(
+            (total_blocks, block_size, 1, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.125
+    )
+    block_table = torch.empty(
+        (batch_size, int(num_blocks_per_query.max().item())),
+        device=device,
+        dtype=torch.int32,
+    )
+    block_pool = torch.randperm(total_blocks, device=device, dtype=torch.int32)
+    offset = 0
+    for i, num_blocks in enumerate(num_blocks_per_query.tolist()):
+        block_table[i, :num_blocks] = block_pool[offset : offset + num_blocks]
+        offset += num_blocks
+
+    q_packed, q_scales_u8 = _quantize_to_mxfp4(q)
+    q_in = (
+        q_packed.view(batch_size, next_n, num_heads, head_dim // 2).view(torch.int8),
+        q_scales_u8.view(torch.int32).squeeze(-1),
+    )
+    kv_in, _ = _kv_cache_cast_to_fp4(kv_cache)
+    schedule_metadata = get_paged_mqa_logits_metadata(
+        context_lens, block_size, get_num_sms()
+    )
+
+    logits = fp8_fp4_paged_mqa_logits(
+        q_in,
+        kv_in,
+        weights,
+        context_lens,
+        block_table,
+        schedule_metadata,
+        max_model_len,
+        clean_logits=False,
+    )
+    ref_indices = torch.empty(
+        (batch_size * next_n, topk_tokens), dtype=torch.int32, device=device
+    )
+    torch.ops._C.top_k_per_row_decode(
+        logits,
+        next_n,
+        context_lens,
+        ref_indices,
+        logits.shape[0],
+        logits.stride(0),
+        logits.stride(1),
+        topk_tokens,
+    )
+
+    actual_indices = torch.empty_like(ref_indices)
+    _rocm_fp4_paged_mqa_logits_topk_chunked(
+        q_in,
+        kv_in,
+        weights,
+        context_lens,
+        block_table,
+        schedule_metadata,
+        actual_indices,
+        max_model_len,
+        topk_tokens,
+    )
+
+    safe_ref = ref_indices.clamp_min(0).to(torch.long)
+    safe_actual = actual_indices.clamp_min(0).to(torch.long)
+    ref_values = torch.gather(logits, 1, safe_ref).masked_fill(
+        ref_indices < 0, float("-inf")
+    )
+    actual_values = torch.gather(logits, 1, safe_actual).masked_fill(
+        actual_indices < 0, float("-inf")
+    )
+    row_valid_lens = _fp4_decode_valid_lens_2d(
+        context_lens, next_n, max_model_len
+    ).reshape(-1)
+    for row in range(batch_size * next_n):
+        valid_len = int(row_valid_lens[row].item())
+        assert torch.all(
+            (actual_indices[row] == -1) | (actual_indices[row] < valid_len)
+        )
+        selected = min(topk_tokens, valid_len)
+        torch.testing.assert_close(
+            torch.sort(actual_values[row, :selected]).values,
+            torch.sort(ref_values[row, :selected]).values,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+
+@pytest.mark.parametrize("seq_lens_2d", [False, True])
+@torch.inference_mode()
+def test_rocm_fp4_paged_mqa_logits_streaming_topk_matches_materialized(
+    seq_lens_2d: bool,
+) -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _fp4_decode_valid_lens_2d,
+    )
+    from vllm.v1.attention.ops.rocm_fp8_fp4_paged_mqa_logits import (
+        rocm_fp4_paged_mqa_logits_topk,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(345)
+    batch_size = 3
+    next_n = 2
+    num_heads = 32
+    head_dim = 128
+    block_size = 32
+    max_model_len = 192
+    topk_tokens = 32
+
+    q = (
+        torch.randn(
+            (batch_size, next_n, num_heads, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.125
+    )
+    weights = torch.randn(
+        (batch_size * next_n, num_heads), device=device, dtype=torch.float32
+    )
+    if seq_lens_2d:
+        context_lens = torch.tensor(
+            [[17, 31], [65, 129], [151, 181]],
+            device=device,
+            dtype=torch.int32,
+        )
+        max_ctx_per_seq = context_lens.max(dim=1).values
+    else:
+        context_lens = torch.tensor([31, 129, 181], device=device, dtype=torch.int32)
+        max_ctx_per_seq = context_lens
+
+    num_blocks_per_query = torch.ceil(max_ctx_per_seq.float() / block_size).to(
+        torch.int32
+    )
+    total_blocks = int(num_blocks_per_query.sum().item()) + 4
+    kv_cache = (
+        torch.randn(
+            (total_blocks, block_size, 1, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.125
+    )
+    block_table = torch.empty(
+        (batch_size, int(num_blocks_per_query.max().item())),
+        device=device,
+        dtype=torch.int32,
+    )
+    block_pool = torch.randperm(total_blocks, device=device, dtype=torch.int32)
+    offset = 0
+    for i, num_blocks in enumerate(num_blocks_per_query.tolist()):
+        block_table[i, :num_blocks] = block_pool[offset : offset + num_blocks]
+        offset += num_blocks
+
+    q_packed, q_scales_u8 = _quantize_to_mxfp4(q)
+    q_in = (
+        q_packed.view(batch_size, next_n, num_heads, head_dim // 2).view(torch.int8),
+        q_scales_u8.view(torch.int32).squeeze(-1),
+    )
+    kv_in, _ = _kv_cache_cast_to_fp4(kv_cache)
+    schedule_metadata = get_paged_mqa_logits_metadata(
+        context_lens, block_size, get_num_sms()
+    )
+
+    logits = fp8_fp4_paged_mqa_logits(
+        q_in,
+        kv_in,
+        weights,
+        context_lens,
+        block_table,
+        schedule_metadata,
+        max_model_len,
+        clean_logits=False,
+    )
+    ref_indices = torch.empty(
+        (batch_size * next_n, topk_tokens), dtype=torch.int32, device=device
+    )
+    torch.ops._C.top_k_per_row_decode(
+        logits,
+        next_n,
+        context_lens,
+        ref_indices,
+        logits.shape[0],
+        logits.stride(0),
+        logits.stride(1),
+        topk_tokens,
+    )
+
+    actual_indices = torch.empty_like(ref_indices)
+    rocm_fp4_paged_mqa_logits_topk(
+        q_in,
+        kv_in,
+        weights,
+        context_lens,
+        block_table,
+        actual_indices,
+        max_context_len=max_model_len,
+        topk_tokens=topk_tokens,
+    )
+
+    safe_ref = ref_indices.clamp_min(0).to(torch.long)
+    safe_actual = actual_indices.clamp_min(0).to(torch.long)
+    ref_values = torch.gather(logits, 1, safe_ref).masked_fill(
+        ref_indices < 0, float("-inf")
+    )
+    actual_values = torch.gather(logits, 1, safe_actual).masked_fill(
+        actual_indices < 0, float("-inf")
+    )
+    row_valid_lens = _fp4_decode_valid_lens_2d(
+        context_lens, next_n, max_model_len
+    ).reshape(-1)
+    for row in range(batch_size * next_n):
+        valid_len = int(row_valid_lens[row].item())
+        assert torch.all(
+            (actual_indices[row] == -1) | (actual_indices[row] < valid_len)
+        )
+        selected = min(topk_tokens, valid_len)
+        if valid_len <= topk_tokens:
+            expected = torch.full(
+                (topk_tokens,),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            if valid_len > 0:
+                expected[:valid_len] = torch.arange(
+                    valid_len, dtype=torch.int32, device=device
+                )
+            torch.testing.assert_close(actual_indices[row], expected)
+            continue
+
+        torch.testing.assert_close(
+            torch.sort(actual_values[row, :selected]).values,
+            torch.sort(ref_values[row, :selected]).values,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+
+@pytest.mark.parametrize("seq_lens_2d", [False, True])
+@torch.inference_mode()
+def test_rocm_fp4_paged_mqa_logits_tile_topk_matches_materialized(
+    seq_lens_2d: bool,
+) -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _fp4_decode_valid_lens_2d,
+    )
+    from vllm.v1.attention.ops.rocm_fp8_fp4_paged_mqa_logits import (
+        rocm_fp4_paged_mqa_logits_tile_topk,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(456)
+    batch_size = 3
+    next_n = 2
+    num_heads = 32
+    head_dim = 128
+    block_size = 32
+    max_model_len = 192
+    topk_tokens = 32
+
+    q = (
+        torch.randn(
+            (batch_size, next_n, num_heads, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.125
+    )
+    weights = torch.randn(
+        (batch_size * next_n, num_heads), device=device, dtype=torch.float32
+    )
+    if seq_lens_2d:
+        context_lens = torch.tensor(
+            [[17, 31], [65, 129], [151, 181]],
+            device=device,
+            dtype=torch.int32,
+        )
+        max_ctx_per_seq = context_lens.max(dim=1).values
+    else:
+        context_lens = torch.tensor([31, 129, 181], device=device, dtype=torch.int32)
+        max_ctx_per_seq = context_lens
+
+    num_blocks_per_query = torch.ceil(max_ctx_per_seq.float() / block_size).to(
+        torch.int32
+    )
+    total_blocks = int(num_blocks_per_query.sum().item()) + 4
+    kv_cache = (
+        torch.randn(
+            (total_blocks, block_size, 1, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.125
+    )
+    block_table = torch.empty(
+        (batch_size, int(num_blocks_per_query.max().item())),
+        device=device,
+        dtype=torch.int32,
+    )
+    block_pool = torch.randperm(total_blocks, device=device, dtype=torch.int32)
+    offset = 0
+    for i, num_blocks in enumerate(num_blocks_per_query.tolist()):
+        block_table[i, :num_blocks] = block_pool[offset : offset + num_blocks]
+        offset += num_blocks
+
+    q_packed, q_scales_u8 = _quantize_to_mxfp4(q)
+    q_in = (
+        q_packed.view(batch_size, next_n, num_heads, head_dim // 2).view(torch.int8),
+        q_scales_u8.view(torch.int32).squeeze(-1),
+    )
+    kv_in, _ = _kv_cache_cast_to_fp4(kv_cache)
+    schedule_metadata = get_paged_mqa_logits_metadata(
+        context_lens, block_size, get_num_sms()
+    )
+
+    logits = fp8_fp4_paged_mqa_logits(
+        q_in,
+        kv_in,
+        weights,
+        context_lens,
+        block_table,
+        schedule_metadata,
+        max_model_len,
+        clean_logits=False,
+    )
+    ref_indices = torch.empty(
+        (batch_size * next_n, topk_tokens), dtype=torch.int32, device=device
+    )
+    torch.ops._C.top_k_per_row_decode(
+        logits,
+        next_n,
+        context_lens,
+        ref_indices,
+        logits.shape[0],
+        logits.stride(0),
+        logits.stride(1),
+        topk_tokens,
+    )
+
+    actual_indices = torch.empty_like(ref_indices)
+    rocm_fp4_paged_mqa_logits_tile_topk(
+        q_in,
+        kv_in,
+        weights,
+        context_lens,
+        block_table,
+        actual_indices,
+        max_context_len=max_model_len,
+        topk_tokens=topk_tokens,
+    )
+
+    safe_ref = ref_indices.clamp_min(0).to(torch.long)
+    safe_actual = actual_indices.clamp_min(0).to(torch.long)
+    ref_values = torch.gather(logits, 1, safe_ref).masked_fill(
+        ref_indices < 0, float("-inf")
+    )
+    actual_values = torch.gather(logits, 1, safe_actual).masked_fill(
+        actual_indices < 0, float("-inf")
+    )
+    row_valid_lens = _fp4_decode_valid_lens_2d(
+        context_lens, next_n, max_model_len
+    ).reshape(-1)
+    for row in range(batch_size * next_n):
+        valid_len = int(row_valid_lens[row].item())
+        assert torch.all(
+            (actual_indices[row] == -1) | (actual_indices[row] < valid_len)
+        )
+        selected = min(topk_tokens, valid_len)
+        if valid_len <= topk_tokens:
+            expected = torch.full(
+                (topk_tokens,),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            if valid_len > 0:
+                expected[:valid_len] = torch.arange(
+                    valid_len, dtype=torch.int32, device=device
+                )
+            torch.testing.assert_close(actual_indices[row], expected)
+            continue
+
+        torch.testing.assert_close(
+            torch.sort(actual_values[row, :selected]).values,
+            torch.sort(ref_values[row, :selected]).values,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+
+def test_rocm_fp4_paged_mqa_logits_streaming_topk_rejects_large_topk() -> None:
+    from vllm.v1.attention.ops.rocm_fp8_fp4_paged_mqa_logits import (
+        rocm_fp4_paged_mqa_logits_topk,
+    )
+
+    batch_size = 1
+    next_n = 1
+    num_heads = 32
+    head_dim = 128
+    block_size = 32
+    topk_tokens = 1024
+    q_values = torch.empty(
+        (batch_size, next_n, num_heads, head_dim // 2), dtype=torch.int8
+    )
+    q_scales = torch.empty((batch_size, next_n, num_heads), dtype=torch.int32)
+    kv_cache = torch.empty((1, block_size, 1, head_dim // 2 + 4), dtype=torch.uint8)
+    weights = torch.empty((batch_size * next_n, num_heads), dtype=torch.float32)
+    context_lens = torch.ones((batch_size, next_n), dtype=torch.int32)
+    block_tables = torch.zeros((batch_size, 1), dtype=torch.int32)
+    topk_indices = torch.empty((batch_size * next_n, topk_tokens), dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="validation-only"):
+        rocm_fp4_paged_mqa_logits_topk(
+            (q_values, q_scales),
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            topk_indices,
+            max_context_len=topk_tokens,
+            topk_tokens=topk_tokens,
+        )
+
+
+@torch.inference_mode()
+def test_rocm_fp4_decode_topk_logits_view_matches_full_width() -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _fp4_decode_topk_logits_view,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(321)
+    batch_size = 64
+    next_n = 1
+    max_decode_seq_len = 192
+    logits_width = 512
+    topk_tokens = 32
+    logits = torch.randn(
+        (batch_size * next_n, logits_width), device=device, dtype=torch.float32
+    )
+    seq_lens = torch.randint(
+        max_decode_seq_len - 32,
+        max_decode_seq_len + 1,
+        (batch_size, next_n),
+        device=device,
+        dtype=torch.int32,
+    )
+    seq_lens[:, -1] = max_decode_seq_len
+
+    full_indices = torch.empty(
+        (batch_size * next_n, topk_tokens), dtype=torch.int32, device=device
+    )
+    torch.ops._C.top_k_per_row_decode(
+        logits,
+        next_n,
+        seq_lens,
+        full_indices,
+        logits.shape[0],
+        logits.stride(0),
+        logits.stride(1),
+        topk_tokens,
+    )
+
+    topk_logits = _fp4_decode_topk_logits_view(
+        logits,
+        topk_tokens,
+        max_decode_seq_len,
+    )
+    view_indices = torch.empty_like(full_indices)
+    torch.ops._C.top_k_per_row_decode(
+        topk_logits,
+        next_n,
+        seq_lens,
+        view_indices,
+        topk_logits.shape[0],
+        topk_logits.stride(0),
+        topk_logits.stride(1),
+        topk_tokens,
+    )
+
+    safe_full = full_indices.clamp_min(0).long()
+    safe_view = view_indices.clamp_min(0).long()
+    full_values = torch.gather(logits, 1, safe_full).masked_fill(
+        full_indices < 0, float("-inf")
+    )
+    view_values = torch.gather(logits, 1, safe_view).masked_fill(
+        view_indices < 0, float("-inf")
+    )
+    row_valid_lens = seq_lens.reshape(-1)
+    for row in range(batch_size * next_n):
+        selected = min(topk_tokens, int(row_valid_lens[row].item()))
+        torch.testing.assert_close(
+            torch.sort(view_values[row, :selected]).values,
+            torch.sort(full_values[row, :selected]).values,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+
+def test_rocm_fp4_decode_logits_width_env_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _fp4_decode_logits_width,
+    )
+
+    monkeypatch.delenv("VLLM_ROCM_FP4_INDEXER_DECODE_WIDTH_CAP", raising=False)
+    assert (
+        _fp4_decode_logits_width(
+            active_paged_width=65536,
+            topk_tokens=1024,
+            max_decode_seq_len=8192,
+            max_model_len=1048576,
+        )
+        == 65536
+    )
+
+    monkeypatch.setenv("VLLM_ROCM_FP4_INDEXER_DECODE_WIDTH_CAP", "1")
+    assert (
+        _fp4_decode_logits_width(
+            active_paged_width=65536,
+            topk_tokens=1024,
+            max_decode_seq_len=8192,
+            max_model_len=1048576,
+        )
+        == 8192
+    )
+    assert (
+        _fp4_decode_logits_width(
+            active_paged_width=65536,
+            topk_tokens=2048,
+            max_decode_seq_len=1536,
+            max_model_len=1048576,
+        )
+        == 2048
+    )
+    monkeypatch.setenv("VLLM_ROCM_FP4_INDEXER_DECODE_WIDTH_CAP", "0")
+    assert (
+        _fp4_decode_logits_width(
+            active_paged_width=65536,
+            topk_tokens=1024,
+            max_decode_seq_len=8192,
+            max_model_len=1048576,
+        )
+        == 65536
+    )
+
+
+def test_rocm_fp4_fused_topk_env_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _should_use_fp4_fused_topk,
+        _should_use_fp4_tile_topk,
+    )
+
+    monkeypatch.delenv("VLLM_ROCM_FP4_INDEXER_FUSED_TOPK", raising=False)
+    monkeypatch.delenv("VLLM_ROCM_FP4_INDEXER_TILE_TOPK", raising=False)
+    assert not _should_use_fp4_fused_topk(
+        logits_width=65536, topk_tokens=1024, num_rows=64
+    )
+    assert not _should_use_fp4_fused_topk(
+        logits_width=65536, topk_tokens=1024, num_rows=96
+    )
+
+    monkeypatch.setenv("VLLM_ROCM_FP4_INDEXER_FUSED_TOPK", "0")
+    assert not _should_use_fp4_fused_topk(
+        logits_width=65536, topk_tokens=1024, num_rows=96
+    )
+    monkeypatch.setenv("VLLM_ROCM_FP4_INDEXER_FUSED_TOPK", "1")
+    assert _should_use_fp4_fused_topk(logits_width=8192, topk_tokens=2048, num_rows=16)
+    assert not _should_use_fp4_tile_topk(logits_width=8192, topk_tokens=1024)
+    monkeypatch.setenv("VLLM_ROCM_FP4_INDEXER_TILE_TOPK", "1")
+    assert _should_use_fp4_tile_topk(logits_width=8192, topk_tokens=1024)
+    assert not _should_use_fp4_tile_topk(logits_width=16384, topk_tokens=1024)
+
+
+@torch.inference_mode()
+def test_rocm_fp4_paged_mqa_logits_trivial_decode_topk_skip_matches_full_topk() -> None:
+    from vllm.v1.attention.ops.rocm_fp8_fp4_paged_mqa_logits import (
+        rocm_fp8_fp4_paged_mqa_logits,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(432)
+    batch_size = 4
+    next_n = 2
+    num_heads = 32
+    head_dim = 128
+    block_size = 32
+    max_model_len = 128
+    topk_tokens = 32
+
+    q = (
+        torch.randn(
+            (batch_size, next_n, num_heads, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.125
+    )
+    weights = torch.randn(
+        (batch_size * next_n, num_heads), device=device, dtype=torch.float32
+    )
+    context_lens = torch.tensor(
+        [[7, 32], [33, 64], [1, 48], [80, 96]],
+        device=device,
+        dtype=torch.int32,
+    )
+    num_blocks = cdiv(max_model_len, block_size)
+    kv_cache = (
+        torch.randn(
+            (num_blocks, block_size, 1, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.125
+    )
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).repeat(
+        batch_size, 1
+    )
+
+    q_packed, q_scales_u8 = _quantize_to_mxfp4(q)
+    q_in = (
+        q_packed.view(batch_size, next_n, num_heads, head_dim // 2).view(torch.int8),
+        q_scales_u8.view(torch.int32).squeeze(-1),
+    )
+    kv_in, _ = _kv_cache_cast_to_fp4(kv_cache)
+    schedule_metadata = get_paged_mqa_logits_metadata(
+        context_lens, block_size, get_num_sms()
+    )
+
+    full_logits = rocm_fp8_fp4_paged_mqa_logits(
+        q_in,
+        kv_in,
+        weights,
+        context_lens,
+        block_table,
+        schedule_metadata,
+        max_context_len=max_model_len,
+        clean_logits=False,
+    )
+    skipped_logits = rocm_fp8_fp4_paged_mqa_logits(
+        q_in,
+        kv_in,
+        weights,
+        context_lens,
+        block_table,
+        schedule_metadata,
+        max_context_len=max_model_len,
+        clean_logits=False,
+        trivial_topk_len=topk_tokens,
+    )
+
+    full_indices = torch.empty(
+        (batch_size * next_n, topk_tokens), dtype=torch.int32, device=device
+    )
+    skipped_indices = torch.empty_like(full_indices)
+    torch.ops._C.top_k_per_row_decode(
+        full_logits,
+        next_n,
+        context_lens,
+        full_indices,
+        full_logits.shape[0],
+        full_logits.stride(0),
+        full_logits.stride(1),
+        topk_tokens,
+    )
+    torch.ops._C.top_k_per_row_decode(
+        skipped_logits,
+        next_n,
+        context_lens,
+        skipped_indices,
+        skipped_logits.shape[0],
+        skipped_logits.stride(0),
+        skipped_logits.stride(1),
+        topk_tokens,
+    )
+
+    row_valid_lens = context_lens.reshape(-1).cpu().tolist()
+    for row, valid_len in enumerate(row_valid_lens):
+        selected = min(topk_tokens, valid_len)
+        assert torch.all(
+            (skipped_indices[row] == -1) | (skipped_indices[row] < valid_len)
+        )
+        if valid_len <= topk_tokens:
+            expected = torch.full(
+                (topk_tokens,),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            if valid_len > 0:
+                expected[:valid_len] = torch.arange(
+                    valid_len, dtype=torch.int32, device=device
+                )
+            torch.testing.assert_close(skipped_indices[row], expected)
+            continue
+
+        full_positions = full_indices[row, :selected].clamp_min(0).to(torch.long)
+        skipped_positions = skipped_indices[row, :selected].clamp_min(0).to(torch.long)
+        full_values = full_logits[row, full_positions]
+        skipped_values = full_logits[row, skipped_positions]
+        torch.testing.assert_close(
+            torch.sort(skipped_values).values,
+            torch.sort(full_values).values,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+
+@torch.inference_mode()
+def test_rocm_fp4_paged_mqa_logits_active_launch_width_matches_full_launch() -> None:
+    from vllm.v1.attention.ops.rocm_fp8_fp4_paged_mqa_logits import (
+        rocm_fp8_fp4_paged_mqa_logits,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(654)
+    batch_size = 4
+    next_n = 2
+    num_heads = 32
+    head_dim = 128
+    block_size = 32
+    max_model_len = 128
+    launch_context_len = 96
+    topk_tokens = 32
+
+    q = (
+        torch.randn(
+            (batch_size, next_n, num_heads, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.125
+    )
+    weights = torch.randn(
+        (batch_size * next_n, num_heads), device=device, dtype=torch.float32
+    )
+    context_lens = torch.tensor(
+        [[7, 32], [33, 64], [1, 48], [80, 96]],
+        device=device,
+        dtype=torch.int32,
+    )
+    num_blocks = cdiv(max_model_len, block_size)
+    kv_cache = (
+        torch.randn(
+            (num_blocks, block_size, 1, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.125
+    )
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).repeat(
+        batch_size, 1
+    )
+
+    q_packed, q_scales_u8 = _quantize_to_mxfp4(q)
+    q_in = (
+        q_packed.view(batch_size, next_n, num_heads, head_dim // 2).view(torch.int8),
+        q_scales_u8.view(torch.int32).squeeze(-1),
+    )
+    kv_in, _ = _kv_cache_cast_to_fp4(kv_cache)
+    schedule_metadata = get_paged_mqa_logits_metadata(
+        context_lens, block_size, get_num_sms()
+    )
+
+    full_logits = rocm_fp8_fp4_paged_mqa_logits(
+        q_in,
+        kv_in,
+        weights,
+        context_lens,
+        block_table,
+        schedule_metadata,
+        max_context_len=max_model_len,
+        clean_logits=False,
+    )
+    active_launch_logits = rocm_fp8_fp4_paged_mqa_logits(
+        q_in,
+        kv_in,
+        weights,
+        context_lens,
+        block_table,
+        schedule_metadata,
+        max_context_len=max_model_len,
+        clean_logits=False,
+        launch_context_len=launch_context_len,
+    )
+    active_prefix = active_launch_logits[:, :launch_context_len]
+    full_prefix = full_logits[:, :launch_context_len]
+    positions = torch.arange(launch_context_len, device=device)[None, :]
+    valid_mask = positions < context_lens.reshape(-1, 1)
+    torch.testing.assert_close(
+        active_prefix.masked_fill(~valid_mask, 0),
+        full_prefix.masked_fill(~valid_mask, 0),
+    )
+
+    full_indices = torch.empty(
+        (batch_size * next_n, topk_tokens), dtype=torch.int32, device=device
+    )
+    active_indices = torch.empty_like(full_indices)
+    full_topk_logits = full_logits[:, :launch_context_len]
+    active_topk_logits = active_launch_logits[:, :launch_context_len]
+    torch.ops._C.top_k_per_row_decode(
+        full_topk_logits,
+        next_n,
+        context_lens,
+        full_indices,
+        full_topk_logits.shape[0],
+        full_topk_logits.stride(0),
+        full_topk_logits.stride(1),
+        topk_tokens,
+    )
+    torch.ops._C.top_k_per_row_decode(
+        active_topk_logits,
+        next_n,
+        context_lens,
+        active_indices,
+        active_topk_logits.shape[0],
+        active_topk_logits.stride(0),
+        active_topk_logits.stride(1),
+        topk_tokens,
+    )
+    torch.testing.assert_close(active_indices, full_indices)
+
+
+@torch.inference_mode()
+def test_rocm_fp4_paged_mqa_logits_segment_env_matches_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.attention.ops.rocm_fp8_fp4_paged_mqa_logits import (
+        rocm_fp8_fp4_paged_mqa_logits,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(987)
+    batch_size = 3
+    next_n = 2
+    num_heads = 32
+    head_dim = 128
+    block_size = 32
+    max_model_len = 192
+    topk_tokens = 32
+
+    q = (
+        torch.randn(
+            (batch_size, next_n, num_heads, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.125
+    )
+    weights = torch.randn(
+        (batch_size * next_n, num_heads), device=device, dtype=torch.float32
+    )
+    context_lens = torch.tensor(
+        [[64, 96], [129, 160], [33, 192]],
+        device=device,
+        dtype=torch.int32,
+    )
+    num_blocks = cdiv(max_model_len, block_size)
+    kv_cache = (
+        torch.randn(
+            (num_blocks, block_size, 1, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.125
+    )
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).repeat(
+        batch_size, 1
+    )
+
+    q_packed, q_scales_u8 = _quantize_to_mxfp4(q)
+    q_in = (
+        q_packed.view(batch_size, next_n, num_heads, head_dim // 2).view(torch.int8),
+        q_scales_u8.view(torch.int32).squeeze(-1),
+    )
+    kv_in, _ = _kv_cache_cast_to_fp4(kv_cache)
+    schedule_metadata = get_paged_mqa_logits_metadata(
+        context_lens, block_size, get_num_sms()
+    )
+
+    default_logits = rocm_fp8_fp4_paged_mqa_logits(
+        q_in,
+        kv_in,
+        weights,
+        context_lens,
+        block_table,
+        schedule_metadata,
+        max_context_len=max_model_len,
+        clean_logits=False,
+        trivial_topk_len=topk_tokens,
+    )
+    monkeypatch.setenv("VLLM_ROCM_FP4_INDEXER_SEGMENT_GROUP_PROGS", "2")
+    segment_logits = rocm_fp8_fp4_paged_mqa_logits(
+        q_in,
+        kv_in,
+        weights,
+        context_lens,
+        block_table,
+        schedule_metadata,
+        max_context_len=max_model_len,
+        clean_logits=False,
+        trivial_topk_len=topk_tokens,
+    )
+
+    positions = torch.arange(max_model_len, device=device)[None, :]
+    valid_mask = positions < context_lens.reshape(-1, 1)
+    torch.testing.assert_close(
+        segment_logits.masked_fill(~valid_mask, 0),
+        default_logits.masked_fill(~valid_mask, 0),
+    )
+
+    default_indices = torch.empty(
+        (batch_size * next_n, topk_tokens), dtype=torch.int32, device=device
+    )
+    segment_indices = torch.empty_like(default_indices)
+    torch.ops._C.top_k_per_row_decode(
+        default_logits,
+        next_n,
+        context_lens,
+        default_indices,
+        default_logits.shape[0],
+        default_logits.stride(0),
+        default_logits.stride(1),
+        topk_tokens,
+    )
+    torch.ops._C.top_k_per_row_decode(
+        segment_logits,
+        next_n,
+        context_lens,
+        segment_indices,
+        segment_logits.shape[0],
+        segment_logits.stride(0),
+        segment_logits.stride(1),
+        topk_tokens,
+    )
+    torch.testing.assert_close(segment_indices, default_indices)
+
+
+@torch.inference_mode()
+def test_rocm_fp4_paged_mqa_logits_tile_chunks_env_matches_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.attention.ops.rocm_fp8_fp4_paged_mqa_logits import (
+        rocm_fp8_fp4_paged_mqa_logits,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(988)
+    batch_size = 3
+    next_n = 2
+    num_heads = 32
+    head_dim = 128
+    block_size = 32
+    max_model_len = 192
+    topk_tokens = 32
+
+    q = (
+        torch.randn(
+            (batch_size, next_n, num_heads, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.125
+    )
+    weights = torch.randn(
+        (batch_size * next_n, num_heads), device=device, dtype=torch.float32
+    )
+    context_lens = torch.tensor(
+        [[64, 96], [129, 160], [33, 192]],
+        device=device,
+        dtype=torch.int32,
+    )
+    num_blocks = cdiv(max_model_len, block_size)
+    kv_cache = (
+        torch.randn(
+            (num_blocks, block_size, 1, head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.125
+    )
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).repeat(
+        batch_size, 1
+    )
+
+    q_packed, q_scales_u8 = _quantize_to_mxfp4(q)
+    q_in = (
+        q_packed.view(batch_size, next_n, num_heads, head_dim // 2).view(torch.int8),
+        q_scales_u8.view(torch.int32).squeeze(-1),
+    )
+    kv_in, _ = _kv_cache_cast_to_fp4(kv_cache)
+    schedule_metadata = get_paged_mqa_logits_metadata(
+        context_lens, block_size, get_num_sms()
+    )
+
+    default_logits = rocm_fp8_fp4_paged_mqa_logits(
+        q_in,
+        kv_in,
+        weights,
+        context_lens,
+        block_table,
+        schedule_metadata,
+        max_context_len=max_model_len,
+        clean_logits=False,
+        trivial_topk_len=topk_tokens,
+    )
+    monkeypatch.setenv("VLLM_ROCM_FP4_INDEXER_TILE_CHUNKS", "2")
+    tiled_logits = rocm_fp8_fp4_paged_mqa_logits(
+        q_in,
+        kv_in,
+        weights,
+        context_lens,
+        block_table,
+        schedule_metadata,
+        max_context_len=max_model_len,
+        clean_logits=False,
+        trivial_topk_len=topk_tokens,
+    )
+
+    positions = torch.arange(max_model_len, device=device)[None, :]
+    valid_mask = positions < context_lens.reshape(-1, 1)
+    torch.testing.assert_close(
+        tiled_logits.masked_fill(~valid_mask, 0),
+        default_logits.masked_fill(~valid_mask, 0),
+    )
+
+    default_indices = torch.empty(
+        (batch_size * next_n, topk_tokens), dtype=torch.int32, device=device
+    )
+    tiled_indices = torch.empty_like(default_indices)
+    torch.ops._C.top_k_per_row_decode(
+        default_logits,
+        next_n,
+        context_lens,
+        default_indices,
+        default_logits.shape[0],
+        default_logits.stride(0),
+        default_logits.stride(1),
+        topk_tokens,
+    )
+    torch.ops._C.top_k_per_row_decode(
+        tiled_logits,
+        next_n,
+        context_lens,
+        tiled_indices,
+        tiled_logits.shape[0],
+        tiled_logits.stride(0),
+        tiled_logits.stride(1),
+        topk_tokens,
+    )
+    torch.testing.assert_close(tiled_indices, default_indices)

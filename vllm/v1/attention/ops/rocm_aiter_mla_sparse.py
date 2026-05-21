@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from importlib.util import find_spec
 
 import torch
@@ -12,12 +13,14 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
 from vllm.utils.torch_utils import LayerNameType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.attention.ops.rocm_fp8_fp4_paged_mqa_logits import (
     rocm_fp4_mqa_logits,
+    rocm_fp4_paged_mqa_logits_tile_topk,
+    rocm_fp4_paged_mqa_logits_topk,
+    rocm_fp8_fp4_paged_mqa_logits,
 )
 
 if current_platform.is_rocm():
@@ -27,6 +30,10 @@ else:
     _ON_GFX950 = False
 
 MXFP4_BLOCK_SIZE = 32
+_FP4_FUSED_TOPK_ENV = "VLLM_ROCM_FP4_INDEXER_FUSED_TOPK"
+_FP4_STREAMING_TOPK_ENV = "VLLM_ROCM_FP4_INDEXER_STREAMING_TOPK"
+_FP4_TILE_TOPK_ENV = "VLLM_ROCM_FP4_INDEXER_TILE_TOPK"
+_FP4_DECODE_WIDTH_CAP_ENV = "VLLM_ROCM_FP4_INDEXER_DECODE_WIDTH_CAP"
 
 
 @triton.jit
@@ -723,6 +730,223 @@ def _fill_decode_topk_indices(
     return indices
 
 
+def _fp4_decode_valid_lens_2d(
+    context_lens: torch.Tensor,
+    next_n: int,
+    max_model_len: int,
+) -> torch.Tensor:
+    if context_lens.dim() == 2:
+        if context_lens.dtype == torch.int32 and context_lens.is_contiguous():
+            return context_lens
+        valid_lens = context_lens
+    else:
+        offsets = torch.arange(next_n, device=context_lens.device, dtype=torch.int32)
+        valid_lens = context_lens[:, None] - next_n + offsets[None, :] + 1
+    return valid_lens.clamp(min=0, max=max_model_len).to(torch.int32).contiguous()
+
+
+def _should_use_fp4_fused_topk(
+    logits_width: int,
+    topk_tokens: int,
+    num_rows: int,
+) -> bool:
+    env_value = os.getenv(_FP4_FUSED_TOPK_ENV, "auto").strip().lower()
+    if env_value in ("0", "false", "off", "no"):
+        return False
+    if env_value in ("1", "true", "on", "yes", "force"):
+        return True
+
+    del logits_width, topk_tokens, num_rows
+    # The exact chunked path is useful for validation and peak-memory
+    # experiments, but current profiling shows it is slower than the
+    # materialized logits + vLLM top-k path. Do not enable it by default.
+    return False
+
+
+def _should_use_fp4_streaming_topk(topk_tokens: int) -> bool:
+    env_value = os.getenv(_FP4_STREAMING_TOPK_ENV, "0").strip().lower()
+    if env_value not in ("1", "true", "on", "yes", "force"):
+        return False
+    # Production top-k sizes currently compile too slowly for this single-CTA
+    # streaming selector. Keep it available for small-shape validation only.
+    return topk_tokens <= 256
+
+
+def _should_use_fp4_tile_topk(logits_width: int, topk_tokens: int) -> bool:
+    env_value = os.getenv(_FP4_TILE_TOPK_ENV, "0").strip().lower()
+    if env_value not in ("1", "true", "on", "yes", "force"):
+        return False
+    # Keep the experimental tile-fused selector within the compiled shapes that
+    # were profiled. Longer active widths should use the chunked helper.
+    return topk_tokens <= 1024 and logits_width <= topk_tokens * 8
+
+
+def _fp4_decode_topk_logits_view(
+    logits: torch.Tensor,
+    topk_tokens: int,
+    max_decode_seq_len: int,
+) -> torch.Tensor:
+    if logits.shape[0] < 64 or max_decode_seq_len <= 0:
+        return logits
+    topk_width = min(logits.shape[1], max(topk_tokens, max_decode_seq_len))
+    if topk_width >= logits.shape[1]:
+        return logits
+    return logits[:, :topk_width]
+
+
+def _fp4_decode_logits_width(
+    active_paged_width: int,
+    topk_tokens: int,
+    max_decode_seq_len: int,
+    max_model_len: int,
+) -> int:
+    width = min(max_model_len, max(topk_tokens, active_paged_width))
+    env_value = os.getenv(_FP4_DECODE_WIDTH_CAP_ENV, "0").strip().lower()
+    if env_value in ("1", "true", "on", "yes", "force"):
+        capped_active = min(active_paged_width, max_decode_seq_len)
+        return min(max_model_len, max(topk_tokens, capped_active))
+    return width
+
+
+def _rocm_fp4_paged_mqa_logits_topk_chunked(
+    q: tuple[torch.Tensor, torch.Tensor],
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    schedule_metadata: torch.Tensor,
+    topk_indices: torch.Tensor,
+    max_model_len: int,
+    topk_tokens: int,
+) -> torch.Tensor:
+    q_values, q_scales = q
+    batch_size, next_n = q_values.shape[:2]
+    num_rows = batch_size * next_n
+    block_size = int(kv_cache.shape[1])
+    min_chunk_tokens = topk_tokens * 2
+    chunk_blocks = max(1, triton.cdiv(min_chunk_tokens, block_size))
+    # Once the chunk is above the top-k insertion-sort cutoff, the local top-k
+    # uses the radix path and the merge candidate count stays bounded.
+    if topk_tokens >= 1024:
+        chunk_blocks = max(chunk_blocks, triton.cdiv(32768, block_size))
+    num_logical_blocks = min(
+        triton.cdiv(max_model_len, block_size), int(block_tables.shape[1])
+    )
+    row_valid_lens = _fp4_decode_valid_lens_2d(context_lens, next_n, max_model_len)
+
+    if num_logical_blocks <= chunk_blocks:
+        logits = rocm_fp8_fp4_paged_mqa_logits(
+            (q_values, q_scales),
+            kv_cache,
+            weights,
+            row_valid_lens,
+            block_tables[:, :num_logical_blocks],
+            schedule_metadata,
+            max_context_len=max_model_len,
+            clean_logits=False,
+            trivial_topk_len=topk_tokens,
+        )
+        torch.ops._C.top_k_per_row_decode(
+            logits,
+            next_n,
+            row_valid_lens,
+            topk_indices,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            topk_tokens,
+        )
+        return topk_indices
+
+    best_values = torch.full(
+        (num_rows, topk_tokens),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q_values.device,
+    )
+    best_indices = torch.full(
+        (num_rows, topk_tokens),
+        -1,
+        dtype=topk_indices.dtype,
+        device=q_values.device,
+    )
+    merge_width = topk_tokens * 2
+    merge_lens = torch.full(
+        (num_rows,),
+        merge_width,
+        dtype=torch.int32,
+        device=q_values.device,
+    )
+    merge_order = torch.empty_like(topk_indices)
+
+    for start_block in range(0, num_logical_blocks, chunk_blocks):
+        end_block = min(num_logical_blocks, start_block + chunk_blocks)
+        start_token = start_block * block_size
+        local_width = min(
+            max_model_len - start_token, (end_block - start_block) * block_size
+        )
+        if local_width <= 0:
+            break
+
+        local_valid_lens = (
+            (row_valid_lens - start_token).clamp(min=0, max=local_width).contiguous()
+        )
+        logits = rocm_fp8_fp4_paged_mqa_logits(
+            (q_values, q_scales),
+            kv_cache,
+            weights,
+            local_valid_lens,
+            block_tables[:, start_block:end_block],
+            schedule_metadata,
+            max_context_len=local_width,
+            clean_logits=False,
+        )
+        local_indices = torch.empty(
+            (num_rows, topk_tokens),
+            dtype=topk_indices.dtype,
+            device=q_values.device,
+        )
+        torch.ops._C.top_k_per_row_decode(
+            logits,
+            next_n,
+            local_valid_lens,
+            local_indices,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            topk_tokens,
+        )
+
+        safe_local_indices = local_indices.clamp_min(0).to(torch.long)
+        local_values = torch.gather(logits, 1, safe_local_indices)
+        valid_local = local_indices >= 0
+        local_values = local_values.masked_fill(~valid_local, float("-inf"))
+        local_global_indices = torch.where(
+            valid_local,
+            local_indices + start_token,
+            local_indices,
+        )
+
+        merge_values = torch.cat((best_values, local_values), dim=1)
+        merge_indices = torch.cat((best_indices, local_global_indices), dim=1)
+        torch.ops._C.top_k_per_row_decode(
+            merge_values,
+            1,
+            merge_lens,
+            merge_order,
+            num_rows,
+            merge_values.stride(0),
+            merge_values.stride(1),
+            topk_tokens,
+        )
+        merge_order_long = merge_order.to(torch.long)
+        best_values = torch.gather(merge_values, 1, merge_order_long)
+        best_indices = torch.gather(merge_indices, 1, merge_order_long)
+
+    topk_indices.copy_(best_indices)
+    return topk_indices
+
+
 def rocm_aiter_sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -957,6 +1181,7 @@ def rocm_aiter_sparse_attn_indexer_native(
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
                     clean_logits=False,
+                    trivial_topk_len=topk_tokens,
                 )
             else:
                 logits = rocm_fp8_mqa_logits(
@@ -1056,30 +1281,86 @@ def rocm_aiter_sparse_attn_indexer_native(
                 active_paged_width = (
                     decode_metadata.block_table.shape[1] * kv_cache_decode.shape[1]
                 )
-                logits_width = min(
-                    max_model_len,
-                    max(topk_tokens, active_paged_width),
-                )
-                logits = fp8_fp4_paged_mqa_logits(
-                    (padded_q_decode_tokens.view(torch.int8), padded_q_scale),
-                    kv_cache_decode,
-                    weights[:num_padded_tokens],
-                    decode_metadata.seq_lens,
-                    decode_metadata.block_table,
-                    decode_metadata.schedule_metadata,
-                    max_model_len=logits_width,
-                    clean_logits=False,
-                )
-                torch.ops._C.top_k_per_row_decode(
-                    logits,
-                    next_n,
-                    decode_metadata.seq_lens,
-                    topk_indices,
-                    logits.shape[0],
-                    logits.stride(0),
-                    logits.stride(1),
+                logits_width = _fp4_decode_logits_width(
+                    active_paged_width,
                     topk_tokens,
+                    decode_metadata.max_seq_len,
+                    max_model_len,
                 )
+                q_decode = (padded_q_decode_tokens.view(torch.int8), padded_q_scale)
+                if _should_use_fp4_fused_topk(
+                    logits_width,
+                    topk_tokens,
+                    num_padded_tokens,
+                ):
+                    fused_logits_width = min(
+                        logits_width,
+                        max(topk_tokens, decode_metadata.max_seq_len),
+                    )
+                    if _should_use_fp4_streaming_topk(topk_tokens):
+                        rocm_fp4_paged_mqa_logits_topk(
+                            q_decode,
+                            kv_cache_decode,
+                            weights[:num_padded_tokens],
+                            decode_metadata.seq_lens,
+                            decode_metadata.block_table,
+                            topk_indices,
+                            max_context_len=fused_logits_width,
+                            topk_tokens=topk_tokens,
+                        )
+                    elif _should_use_fp4_tile_topk(
+                        fused_logits_width,
+                        topk_tokens,
+                    ):
+                        rocm_fp4_paged_mqa_logits_tile_topk(
+                            q_decode,
+                            kv_cache_decode,
+                            weights[:num_padded_tokens],
+                            decode_metadata.seq_lens,
+                            decode_metadata.block_table,
+                            topk_indices,
+                            max_context_len=fused_logits_width,
+                            topk_tokens=topk_tokens,
+                        )
+                    else:
+                        _rocm_fp4_paged_mqa_logits_topk_chunked(
+                            q_decode,
+                            kv_cache_decode,
+                            weights[:num_padded_tokens],
+                            decode_metadata.seq_lens,
+                            decode_metadata.block_table,
+                            decode_metadata.schedule_metadata,
+                            topk_indices,
+                            max_model_len=fused_logits_width,
+                            topk_tokens=topk_tokens,
+                        )
+                else:
+                    logits = rocm_fp8_fp4_paged_mqa_logits(
+                        q_decode,
+                        kv_cache_decode,
+                        weights[:num_padded_tokens],
+                        decode_metadata.seq_lens,
+                        decode_metadata.block_table,
+                        decode_metadata.schedule_metadata,
+                        max_context_len=logits_width,
+                        clean_logits=False,
+                        trivial_topk_len=topk_tokens,
+                    )
+                    topk_logits = _fp4_decode_topk_logits_view(
+                        logits,
+                        topk_tokens,
+                        decode_metadata.max_seq_len,
+                    )
+                    torch.ops._C.top_k_per_row_decode(
+                        topk_logits,
+                        next_n,
+                        decode_metadata.seq_lens,
+                        topk_indices,
+                        topk_logits.shape[0],
+                        topk_logits.stride(0),
+                        topk_logits.stride(1),
+                        topk_tokens,
+                    )
         else:
             logits = rocm_fp8_paged_mqa_logits(
                 padded_q_decode_tokens,
