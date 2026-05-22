@@ -148,6 +148,8 @@ class PassConfig:
     """Fuse paired q/kv RMS norms in MLA attention."""
     fuse_rope_kvcache: bool = None  # type: ignore[assignment]
     """Fuse the QK rope + KV cache ops."""
+    fuse_quant_linear: bool = None  # type: ignore[assignment]
+    """Fuse group fp8 quant + blockscale GEMM into a single triton kernel."""
 
     rope_kvcache_fusion_max_token_num: int = 256
     """The threshold for ROCm AITER RoPE+KVCache fusion e.g. for small batch decode.
@@ -231,6 +233,7 @@ class PassConfig:
         "fuse_mla_dual_rms_norm",
         "fuse_rope_kvcache",
         "fuse_rope_kvcache_cat_mla",
+        "fuse_quant_linear",
         mode="wrap",
     )
     @classmethod

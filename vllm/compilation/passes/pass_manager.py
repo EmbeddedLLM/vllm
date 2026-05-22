@@ -22,6 +22,9 @@ if rocm_aiter_ops.is_enabled():
     from .fusion.allreduce_rms_fusion import (
         RocmAiterAllReduceFusionPass,
     )
+    from .fusion.quant_linear_fusion import (
+        AiterQuantLinearFusionPass,
+    )
     from .fusion.rocm_aiter_fusion import (
         MLADualRMSNormFusionPass,
         RocmAiterRMSNormQuantFusionPass,
@@ -168,6 +171,9 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                 self.passes += [ActivationQuantFusionPass(config)]
                 if rocm_aiter_ops.is_enabled():
                     self.passes += [RocmAiterSiluMulFp8GroupQuantFusionPass(config)]
+
+            if self.pass_config.fuse_quant_linear and rocm_aiter_ops.is_enabled():
+                self.passes += [AiterQuantLinearFusionPass(config)]
 
             if (
                 self.pass_config.fuse_mla_dual_rms_norm
