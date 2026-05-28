@@ -5,6 +5,9 @@ This guide covers optimization strategies and performance tuning for vLLM V1.
 !!! tip
     Running out of memory? Consult [this guide](./conserving_memory.md) on how to conserve memory.
 
+!!! tip "Hardware-Specific Tuning"
+    Using AMD GPUs? See the [AMD ROCm Optimization](./rocm_optimization.md) guide for ROCm-specific environment variables and AITER kernel flags.
+
 ## Optimization Levels
 
 vLLM provides 4 optimization levels (`-O0`, `-O1`, `-O2`, `-O3`) that allow users to trade off startup time for performance:

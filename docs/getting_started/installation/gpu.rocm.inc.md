@@ -412,4 +412,6 @@ To use the docker image as base for development, you can launch it in interactiv
 
 See [Feature x Hardware](../../features/README.md#feature-x-hardware) compatibility matrix for feature support information.
 
+For runtime performance tuning and AITER kernel flags, see [AMD ROCm Optimization](../../configuration/rocm_optimization.md).
+
 --8<-- [end:supported-features]
