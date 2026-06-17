@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from dataclasses import dataclass
 from typing import Any, ClassVar, cast
 
@@ -252,18 +251,6 @@ class DeepseekCompressor(nn.Module):
         self._static_forward_context = (
             vllm_config.compilation_config.static_forward_context
         )
-        self._use_atom_compressor_order = (
-            current_platform.is_rocm()
-            and os.environ.get("ATOM_USE_ATOM_COMPRESSOR_ORDER", "0") == "1"
-        )
-        self._state_save_stream: torch.cuda.Stream | None = None
-        if (
-            self._use_atom_compressor_order
-            and current_platform.is_rocm()
-            and torch.cuda.is_available()
-            and os.environ.get("ATOM_OVERLAP_COMPRESSOR_STATE_SAVE", "0") == "1"
-        ):
-            self._state_save_stream = torch.cuda.Stream()
 
         if self.head_dim == 512:
             assert not use_fp4_cache, (
@@ -309,7 +296,6 @@ class DeepseekCompressor(nn.Module):
             CompressorMetadata, attn_metadata[self.state_cache.prefix]
         )
         token_to_req_indices = state_metadata.token_to_req_indices
-        query_start_loc = state_metadata.query_start_loc
         slot_mapping = state_metadata.slot_mapping
         num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
@@ -325,28 +311,24 @@ class DeepseekCompressor(nn.Module):
             else {"launch_pdl": False}
         )
 
-        use_atom_compressor_order = (
-            self._use_atom_compressor_order and query_start_loc is not None
+        # Store the KV and score (with fused APE addition) in the state.
+        # NOTE: PDL is disabled — both this kernel and the compress kernels
+        # below depend on preceding kernel outputs (kv/score from the cublas
+        # GEMM; state_cache from this kernel) but neither emits/waits on PDL
+        # grid dependency primitives, so launch_pdl=True caused a
+        # read-after-write race and non-deterministic output.
+        save_partial_states(
+            kv=kv,
+            score=score,
+            ape=self.ape,
+            positions=positions,
+            state_cache=state_cache,
+            slot_mapping=slot_mapping,
+            block_size=block_size,
+            state_width=state_width,
+            compress_ratio=self.compress_ratio,
+            pdl_kwargs=pdl_kwargs,
         )
-        if not use_atom_compressor_order:
-            # Store the KV and score (with fused APE addition) in the state.
-            # NOTE: PDL is disabled — both this kernel and the compress kernels
-            # below depend on preceding kernel outputs (kv/score from the cublas
-            # GEMM; state_cache from this kernel) but neither emits/waits on PDL
-            # grid dependency primitives, so launch_pdl=True caused a
-            # read-after-write race and non-deterministic output.
-            save_partial_states(
-                kv=kv,
-                score=score,
-                ape=self.ape,
-                positions=positions,
-                state_cache=state_cache,
-                slot_mapping=slot_mapping,
-                block_size=block_size,
-                state_width=state_width,
-                compress_ratio=self.compress_ratio,
-                pdl_kwargs=pdl_kwargs,
-            )
 
         # Fused: compress → RMSNorm → RoPE → FP8 quant → KV cache write.
         # RoPE requirements (kernel applies forward GPT-J style rotation):
@@ -392,16 +374,6 @@ class DeepseekCompressor(nn.Module):
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
             extra_kwargs = {}
 
-        atom_order_kwargs: dict[str, Any] = {}
-        if compress_norm_rope_store_fn is compress_norm_rope_store_triton:
-            atom_order_kwargs = dict(
-                kv=kv,
-                score=score,
-                ape=self.ape,
-                query_start_loc=query_start_loc,
-                read_before_update=use_atom_compressor_order,
-            )
-
         compress_norm_rope_store_fn(
             state_cache=state_cache,
             num_actual=num_actual,
@@ -425,68 +397,5 @@ class DeepseekCompressor(nn.Module):
             quant_block=self._quant_block,
             token_stride=self._token_stride,
             scale_dim=self._scale_dim,
-            **atom_order_kwargs,
             **extra_kwargs,
         )
-        if use_atom_compressor_order:
-            self._save_partial_states_after_compress(
-                kv=kv,
-                score=score,
-                positions=positions,
-                state_cache=state_cache,
-                slot_mapping=slot_mapping,
-                block_size=block_size,
-                state_width=state_width,
-                pdl_kwargs=pdl_kwargs,
-            )
-
-    def _save_partial_states_after_compress(
-        self,
-        *,
-        kv: torch.Tensor,
-        score: torch.Tensor,
-        positions: torch.Tensor,
-        state_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        block_size: int,
-        state_width: int,
-        pdl_kwargs: dict,
-    ) -> None:
-        if self._state_save_stream is None:
-            save_partial_states(
-                kv=kv,
-                score=score,
-                ape=self.ape,
-                positions=positions,
-                state_cache=state_cache,
-                slot_mapping=slot_mapping,
-                block_size=block_size,
-                state_width=state_width,
-                compress_ratio=self.compress_ratio,
-                pdl_kwargs=pdl_kwargs,
-            )
-            return
-
-        current_stream = torch.cuda.current_stream()
-        self._state_save_stream.wait_stream(current_stream)
-        with torch.cuda.stream(self._state_save_stream):
-            save_partial_states(
-                kv=kv,
-                score=score,
-                ape=self.ape,
-                positions=positions,
-                state_cache=state_cache,
-                slot_mapping=slot_mapping,
-                block_size=block_size,
-                state_width=state_width,
-                compress_ratio=self.compress_ratio,
-                pdl_kwargs=pdl_kwargs,
-            )
-
-    def wait_for_state_save(self) -> None:
-        if self._state_save_stream is not None:
-            torch.cuda.current_stream().wait_stream(self._state_save_stream)
-
-    @property
-    def has_async_state_save(self) -> bool:
-        return self._state_save_stream is not None

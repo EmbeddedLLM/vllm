@@ -314,9 +314,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 prefix=f"{prefix}.compressor",
                 k_cache_prefix=self.prefix,
             )
-        self._has_async_state_save = (
-            self.compressor is not None and self.compressor.has_async_state_save
-        ) or (self.indexer is not None and self.indexer.compressor.has_async_state_save)
 
     def forward(
         self,
@@ -506,14 +503,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
         self.forward_mqa(q, kv, positions, out)
-        if self._has_async_state_save:
-            self._wait_for_compressor_state_saves()
-
-    def _wait_for_compressor_state_saves(self) -> None:
-        if self.compressor is not None:
-            self.compressor.wait_for_state_save()
-        if self.indexer is not None:
-            self.indexer.compressor.wait_for_state_save()
 
     def _fused_qnorm_rope_kv_insert(
         self,

@@ -7,11 +7,10 @@ pieces that have no analogue in V3/V32:
   * separate ``e_proj`` / ``h_proj`` with fp8 linear quantization (instead of
     the fused ``eh_proj``);
   * ``hc_head`` hypercompressed vocab projection applied in ``compute_logits``;
-  * ``DeepseekV4DecoderLayer`` with its own aux-stream management;
+  * ``DeepseekV4DecoderLayer`` with V4-specific attention/compressor plumbing;
   * V4-specific checkpoint weight-name remapping in ``load_weights``.
 """
 
-import os
 import typing
 from collections.abc import Callable, Iterable
 
@@ -66,7 +65,6 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         vllm_config: VllmConfig,
         topk_indices_buffer: torch.Tensor,
         prefix: str,
-        aux_stream_list: list[torch.cuda.Stream] | None = None,
     ) -> None:
         super().__init__()
 
@@ -121,7 +119,6 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
             vllm_config,
             prefix,
             topk_indices_buffer=topk_indices_buffer,
-            aux_stream_list=aux_stream_list,
         )
 
         self.hc_head_op = HCHeadOp()
@@ -184,17 +181,6 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
             device=self.device,
         )
 
-        # Three aux streams shared across all MTP layers, mirroring
-        # DeepseekV4Model. ROCm is opt-in while graph-capture safety is
-        # validated for this path.
-        enable_aux_streams = torch.cuda.is_available() and (
-            not current_platform.is_rocm()
-            or os.environ.get("ATOM_ENABLE_AUX_STREAMS", "0") == "1"
-        )
-        aux_stream_list = (
-            [torch.cuda.Stream() for _ in range(3)] if enable_aux_streams else None
-        )
-
         # to map the exact layer index from weights
         self.layers = torch.nn.ModuleDict(
             {
@@ -202,7 +188,6 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
                     vllm_config,
                     self.topk_indices_buffer,
                     f"{prefix}.layers.{idx}",
-                    aux_stream_list=aux_stream_list,
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,

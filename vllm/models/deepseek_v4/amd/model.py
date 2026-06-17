@@ -234,7 +234,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         vllm_config,
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
-        aux_stream_list: list[torch.cuda.Stream] | None = None,
     ):
         super().__init__()
 
@@ -250,7 +249,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             vllm_config,
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
-            aux_stream_list=aux_stream_list,
         )
         self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
 
@@ -454,19 +452,6 @@ class DeepseekV4Model(nn.Module):
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
 
-        # Three aux streams: one per non-default input GEMM in
-        # DeepseekV4Attention.attn_gemm_parallel_execute
-        # (compressor kv_score, indexer.weights_proj, indexer.compressor
-        # kv_score). fused_wqa_wkv stays on the default stream.
-        # ROCm aux streams are opt-in while we validate graph-capture safety.
-        enable_aux_streams = torch.cuda.is_available() and (
-            not current_platform.is_rocm()
-            or os.environ.get("ATOM_ENABLE_AUX_STREAMS", "0") == "1"
-        )
-        aux_stream_list = (
-            [torch.cuda.Stream() for _ in range(3)] if enable_aux_streams else None
-        )
-
         self.device = current_platform.device_type
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(
@@ -492,7 +477,6 @@ class DeepseekV4Model(nn.Module):
                 vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
-                aux_stream_list=aux_stream_list,
             ),
             prefix=f"{prefix}.layers",
         )
