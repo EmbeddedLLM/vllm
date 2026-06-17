@@ -2825,8 +2825,6 @@ class rocm_aiter_ops:
         hc_sinkhorn_eps: float,
         hc_post_mult_value: float,
         sinkhorn_repeat: int,
-        norm_weight: torch.Tensor | None = None,
-        norm_eps: float = 1e-6,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for mHC pre block.
@@ -2862,14 +2860,10 @@ class rocm_aiter_ops:
         hc_mult3 = hc_mult * 2 + hc_mult2
 
         hc_hidden_size = hc_mult * hidden_size
-        assert fn.shape[0] == hc_mult3 or (
-            fn.shape[0] == hc_mult and sinkhorn_repeat == 0
-        )
+        assert fn.shape[0] == hc_mult3
         assert fn.shape[1] == hc_hidden_size
-        assert hc_scale.shape == (3,) or (
-            hc_scale.shape == (1,) and sinkhorn_repeat == 0
-        )
-        assert hc_base.shape == (fn.shape[0],)
+        assert hc_scale.shape == (3,)
+        assert hc_base.shape == (hc_mult3,)
 
         outer_shape = residual.shape[:-2]
 
@@ -2913,8 +2907,6 @@ class rocm_aiter_ops:
                 hc_sinkhorn_eps,
                 hc_post_mult_value,
                 sinkhorn_repeat,
-                norm_weight,
-                norm_eps,
             )
         return (
             post_mix.view(*outer_shape, hc_mult, 1),
@@ -2948,14 +2940,30 @@ class rocm_aiter_ops:
         if num_tokens == 0:
             return
 
+        hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
+
+        full_fn = torch.zeros(
+            hc_mult3,
+            hc_mult * hidden_size,
+            dtype=fn.dtype,
+            device=fn.device,
+        )
+        full_fn[:hc_mult] = fn
+
+        full_base = torch.zeros(hc_mult3, dtype=hc_base.dtype, device=hc_base.device)
+        full_base[:hc_mult] = hc_base
+
+        full_scale = torch.zeros(3, dtype=hc_scale.dtype, device=hc_scale.device)
+        full_scale[0] = hc_scale[0]
+
         _, _, layer_input = rocm_aiter_ops.mhc_pre(
             hs_flat,
-            fn,
-            hc_scale,
-            hc_base,
+            full_fn,
+            full_scale,
+            full_base,
             rms_eps,
             hc_eps,
-            1e-6,
+            0.0,
             1.0,
             0,
         )

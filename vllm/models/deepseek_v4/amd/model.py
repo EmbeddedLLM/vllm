@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
 
-import aiter
 import regex as re
 import torch
 import torch.nn as nn
@@ -29,6 +27,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mhc import (
+    HAS_AITER_MHC,
     HCHeadOp,
     MHCFusedPostPreOp,
     MHCPostOp,
@@ -234,6 +233,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         vllm_config,
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
+        aux_stream_list: list[torch.cuda.Stream] | None = None,
     ):
         super().__init__()
 
@@ -249,6 +249,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             vllm_config,
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
+            aux_stream_list=aux_stream_list,
         )
         self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
 
@@ -306,18 +307,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.mhc_post = MHCPostOp()
         self.mhc_fused_post_pre = MHCFusedPostPreOp()
         self.has_tilelang = has_tilelang()
-        has_aiter_fused_hc = getattr(aiter, "mhc_fused_post_pre", None) is not None
-        use_aiter_triton_fused_hc = (
-            os.environ.get("ATOM_ENABLE_AITER_TRITON_MHC_FUSED_POST_PRE", "0") == "1"
-        )
-        use_tilelang_fused_hc = (
-            os.environ.get("ATOM_ENABLE_TILELANG_FUSED_HC", "0") == "1"
-        )
-        self.use_fused_hc = os.environ.get("ATOM_DISABLE_FUSED_HC", "0") != "1" and (
-            has_aiter_fused_hc
-            or use_aiter_triton_fused_hc
-            or (self.has_tilelang and use_tilelang_fused_hc)
-        )
 
     def hc_pre(
         self,
@@ -325,8 +314,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
-        norm_weight: torch.Tensor | None = None,
-        norm_eps: float | None = None,
     ):
         post_mix, res_mix, layer_input = self.mhc_pre(
             residual=x,
@@ -338,8 +325,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             hc_sinkhorn_eps=self.hc_eps,
             hc_post_mult_value=self.hc_post_alpha,
             sinkhorn_repeat=self.hc_sinkhorn_iters,
-            norm_weight=norm_weight,
-            norm_eps=self.rms_norm_eps if norm_eps is None else norm_eps,
         )
         return layer_input, post_mix, res_mix
 
@@ -352,49 +337,85 @@ class DeepseekV4DecoderLayer(nn.Module):
     ):
         return self.mhc_post(x, residual, post, comb)
 
-    def fuse_hc(
+    def _forward_fused_post_pre(
         self,
-        x_prev: torch.Tensor | None,
-        residual: torch.Tensor,
-        hc_fn: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
-        norm_weight: torch.Tensor,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        norm_eps = self.rms_norm_eps
-        if x_prev is not None:
-            assert post_mix is not None
-            assert res_mix is not None
-            if self.use_fused_hc:
-                residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
-                    x_prev,
-                    residual,
-                    post_mix,
-                    res_mix,
-                    hc_fn,
-                    hc_scale,
-                    hc_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    self.hc_post_alpha,
-                    self.hc_sinkhorn_iters,
-                    norm_weight=norm_weight,
-                    norm_eps=norm_eps,
-                )
-                return x, residual, post_mix, res_mix
-            residual = self.hc_post(x_prev, residual, post_mix, res_mix)
-        x, post_mix, res_mix = self.hc_pre(
+        if residual is None:
+            # Run standalone hc_pre on first layer
+            residual = x
+            x, post_mix, res_mix = self.hc_pre(
+                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            )
+        else:
+            residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
+                x,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+            )
+
+        x = self.attn_norm(x)
+        x = self.attn(positions, x, None)
+
+        residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
+            x,
             residual,
-            hc_fn,
-            hc_scale,
-            hc_base,
-            norm_weight,
-            norm_eps,
+            post_mix,
+            res_mix,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
         )
+        x = self.ffn_norm(x)
+        x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
+
+    def _forward_unfused_post_pre(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        post_mix: torch.Tensor | None = None,
+        res_mix: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
+    ]:
+        residual = x
+        x, post, comb = self.hc_pre(
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        )
+        x = self.attn_norm(x)
+        x = self.attn(positions, x, None)
+        x = self.hc_post(x, residual, post, comb)
+
+        residual = x
+        x, post, comb = self.hc_pre(
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        )
+        x = self.ffn_norm(x)
+        x = self.ffn(x, input_ids)
+        x = self.hc_post(x, residual, post, comb)
+        return x, None, None, None
 
     def forward(
         self,
@@ -407,36 +428,19 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> tuple[
         torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
     ]:
-        if residual is None:
-            residual = x
-            x_prev = None
-        else:
-            x_prev = x
-
-        x, residual, post_mix, res_mix = self.fuse_hc(
-            x_prev,
-            residual,
-            self.hc_attn_fn,
-            self.hc_attn_scale,
-            self.hc_attn_base,
-            self.attn_norm.weight,
-            post_mix,
-            res_mix,
+        # Select the mHC path:
+        # - aiter unfused pre/post (preferred ROCm path when aiter is available),
+        #   or the torch/triton fallback when tilelang is unavailable ->
+        #   _forward_unfused_post_pre
+        # - tilelang fused post+pre (CUDA, or ROCm without aiter) ->
+        #   _forward_fused_post_pre
+        if not self.has_tilelang or HAS_AITER_MHC:
+            return self._forward_unfused_post_pre(
+                x, positions, input_ids, post_mix, res_mix, residual
+            )
+        return self._forward_fused_post_pre(
+            x, positions, input_ids, post_mix, res_mix, residual
         )
-        x = self.attn(positions, x, None)
-
-        x, residual, post_mix, res_mix = self.fuse_hc(
-            x,
-            residual,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            self.ffn_norm.weight,
-            post_mix,
-            res_mix,
-        )
-        x = self.ffn(x, input_ids)
-        return x, residual, post_mix, res_mix
 
 
 class DeepseekV4Model(nn.Module):
@@ -451,6 +455,17 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
+
+        # Three aux streams: one per non-default input GEMM in
+        # DeepseekV4Attention.attn_gemm_parallel_execute
+        # (compressor kv_score, indexer.weights_proj, indexer.compressor
+        # kv_score). fused_wqa_wkv stays on the default stream.
+        # Disable them on ROCm because of hang issues.
+        aux_stream_list = (
+            None
+            if current_platform.is_rocm()
+            else [torch.cuda.Stream() for _ in range(3)]
+        )
 
         self.device = current_platform.device_type
         # Reserved topk indices buffer for all Indexer layers to reuse.
@@ -477,6 +492,7 @@ class DeepseekV4Model(nn.Module):
                 vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
+                aux_stream_list=aux_stream_list,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -506,6 +522,7 @@ class DeepseekV4Model(nn.Module):
             requires_grad=False,
         )
         self.hc_head_op = HCHeadOp()
+        self.has_tilelang = has_tilelang()
         # Pre-hc_head residual stream buffer for the MTP draft. Stable
         # address (outside the cudagraph pool) so the copy_ in forward()
         # refreshes it correctly across captured shapes.
@@ -563,9 +580,7 @@ class DeepseekV4Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
 
         residual, post_mix, res_mix = None, None, None
-        last_layer: DeepseekV4DecoderLayer | None = None
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            last_layer = layer
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -574,12 +589,11 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
-        if last_layer is not None and residual is not None:
-            assert post_mix is not None
-            assert res_mix is not None
-            hidden_states = last_layer.hc_post(
-                hidden_states, residual, post_mix, res_mix
-            )
+        # The fused post+pre path (tilelang) defers the final hc_post and
+        # returns the residual streams; the unfused path (aiter / torch on
+        # ROCm) applies hc_post inline and returns None, so skip it here.
+        if layer is not None and residual is not None:
+            hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})

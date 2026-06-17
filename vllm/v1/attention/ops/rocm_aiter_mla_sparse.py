@@ -31,11 +31,6 @@ except Exception:
     _aiter_top_k_per_row_prefill = None
 
 _USE_AITER_TOPK = os.environ.get("ATOM_DISABLE_AITER_TOPK", "0") != "1"
-_FORCE_ATOM_DECODE_SPLITS = int(os.environ.get("ATOM_DECODE_NUM_SPLITS", "0") or 0)
-_USE_DECODE_FUSED_SINGLE = (
-    os.environ.get("ATOM_ENABLE_DECODE_FUSED_SINGLE", "0") == "1"
-    and os.environ.get("ATOM_DISABLE_DECODE_FUSED_SINGLE", "0") != "1"
-)
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950
@@ -2065,8 +2060,6 @@ def _decode_num_splits(
     in one wave, so s8 is strictly better). Snapping needs the average segment
     lengths, which the caller derives sync-free from the ragged index sizes.
     """
-    if _FORCE_ATOM_DECODE_SPLITS > 0:
-        return _FORCE_ATOM_DECODE_SPLITS
 
     base = max(1, num_queries * heads_blocks)
     # Target ~1 workgroup per CU: enough to fill the device while keeping the
@@ -2224,40 +2217,6 @@ def _rocm_sparse_attn_decode_ragged_triton(
     num_splits = _decode_num_splits(
         num_queries, heads_blocks, avg_main_len, avg_extra_len, block_k
     )
-    if _USE_DECODE_FUSED_SINGLE and num_splits == 1:
-        _sparse_attn_decode_ragged_kernel[(num_queries, heads_blocks)](
-            q,
-            main_cache,
-            main_indices,
-            main_indptr,
-            extra_cache,
-            extra_indices,
-            extra_indptr,
-            attn_sink,
-            out,
-            q.stride(0),
-            q.stride(1),
-            out.stride(0),
-            out.stride(1),
-            main_cache.stride(0),
-            extra_cache.stride(0),
-            main_cache.shape[0] * main_cache.shape[1],
-            extra_cache.shape[0] * extra_cache.shape[1],
-            main_cache.shape[1],
-            extra_cache.shape[1],
-            scale,
-            num_heads,
-            HAS_ATTN_SINK=has_attn_sink,
-            HAS_EXTRA=has_extra,
-            NOPE_DIM=nope_head_dim,
-            NOPE_BLOCK=nope_block,
-            ROPE_DIM=rope_head_dim,
-            IS_FNUZ=is_fnuz,
-            BLOCK_H=block_h,
-            BLOCK_K=block_k,
-            num_warps=4,
-        )
-        return out
 
     part_m = torch.empty(
         (num_queries, num_splits, num_heads), dtype=torch.float32, device=q.device
