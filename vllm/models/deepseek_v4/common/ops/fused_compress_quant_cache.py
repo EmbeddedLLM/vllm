@@ -51,6 +51,11 @@ def compress_norm_rope_store_triton(
     quant_block: int,
     token_stride: int,
     scale_dim: int,
+    kv: torch.Tensor | None = None,
+    score: torch.Tensor | None = None,
+    ape: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    read_before_update: bool = False,
 ) -> None:
     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
 
@@ -67,11 +72,34 @@ def compress_norm_rope_store_triton(
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
         num_warps = 1
 
+    if read_before_update:
+        assert kv is not None
+        assert score is not None
+        assert ape is not None
+        assert query_start_loc is not None
+        current_kv = kv
+        current_score = score
+        current_ape = ape
+        current_query_start_loc = query_start_loc
+    else:
+        current_kv = state_cache
+        current_score = state_cache
+        current_ape = rms_norm_weight
+        current_query_start_loc = token_to_req_indices
+
     kernel[(num_actual,)](
         # state cache
         state_cache,
         state_cache.stride(0),
         state_cache.stride(1),
+        # current fwd input, used by ATOM-order read-before-update mode
+        current_kv,
+        current_kv.stride(0),
+        current_score,
+        current_score.stride(0),
+        current_ape,
+        current_ape.stride(0),
+        current_query_start_loc,
         # metadata
         token_to_req_indices,
         positions,
@@ -101,6 +129,7 @@ def compress_norm_rope_store_triton(
         TOKEN_STRIDE=token_stride,
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
+        READ_BEFORE_UPDATE=read_before_update,
         num_warps=num_warps,
         **pdl_kwargs,
     )
@@ -115,6 +144,14 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     state_cache_ptr,
     state_cache_stride0,
     state_cache_stride1,
+    # ── current fwd input, used by ATOM-order read-before-update mode ──
+    current_kv_ptr,
+    current_kv_stride,
+    current_score_ptr,
+    current_score_stride,
+    current_ape_ptr,
+    current_ape_stride,
+    query_start_loc_ptr,
     # ── metadata ──
     token_to_req_indices_ptr,
     positions_ptr,
@@ -144,6 +181,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     TOKEN_STRIDE: tl.constexpr,  # 576 for DeepseekV4
     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
     KV_BLOCK_STRIDE: tl.constexpr,
+    READ_BEFORE_UPDATE: tl.constexpr,
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
 
@@ -170,11 +208,19 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     tokens = tl.arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
     pos = start + tokens
     mask_pos = pos >= 0
+    if READ_BEFORE_UPDATE:
+        query_start = tl.load(query_start_loc_ptr + req_idx)
+        first_position = tl.load(positions_ptr + query_start)
+        is_input = pos >= first_position
+    else:
+        is_input = pos < 0
+    state_mask_pos = mask_pos & ~is_input
+    input_mask_pos = mask_pos & is_input
 
     block_indices = pos // block_size
     block_numbers = tl.load(
         block_table_ptr + req_idx * block_table_stride + block_indices,
-        mask=mask_pos,
+        mask=state_mask_pos,
         other=0,
     )
     block_offsets = pos % block_size
@@ -192,21 +238,50 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
         + head_offset
     )
 
-    combined_mask = mask_pos[:, None] & mask[None, :]
+    state_combined_mask = state_mask_pos[:, None] & mask[None, :]
+    input_combined_mask = input_mask_pos[:, None] & mask[None, :]
 
     # ── Softmax + weighted sum ───────────────────────────────────────
     score = tl.load(
         row_base[:, None] + STATE_WIDTH + block[None, :],
-        mask=combined_mask,
+        mask=state_combined_mask,
         other=float("-inf"),
     )
-    score = tl.softmax(score, dim=0)
-
     kv = tl.load(
         row_base[:, None] + block[None, :],
-        mask=combined_mask,
+        mask=state_combined_mask,
         other=0.0,
     )
+    if READ_BEFORE_UPDATE:
+        in_row = token_idx - (position - pos)
+        input_score = tl.load(
+            current_score_ptr
+            + in_row[:, None] * current_score_stride
+            + head_offset[:, None]
+            + block[None, :],
+            mask=input_combined_mask,
+            other=0.0,
+        )
+        ape_row = pos % COMPRESS_RATIO
+        input_ape = tl.load(
+            current_ape_ptr
+            + ape_row[:, None] * current_ape_stride
+            + head_offset[:, None]
+            + block[None, :],
+            mask=input_combined_mask,
+            other=0.0,
+        )
+        input_kv = tl.load(
+            current_kv_ptr
+            + in_row[:, None] * current_kv_stride
+            + head_offset[:, None]
+            + block[None, :],
+            mask=input_combined_mask,
+            other=0.0,
+        )
+        score = tl.where(input_combined_mask, input_score + input_ape, score)
+        kv = tl.where(input_combined_mask, input_kv, kv)
+    score = tl.softmax(score, dim=0)
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 
@@ -305,6 +380,14 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     state_cache_ptr,
     state_cache_stride0,
     state_cache_stride1,
+    # ── current fwd input, used by ATOM-order read-before-update mode ──
+    current_kv_ptr,
+    current_kv_stride,
+    current_score_ptr,
+    current_score_stride,
+    current_ape_ptr,
+    current_ape_stride,
+    query_start_loc_ptr,
     # ── metadata ──
     token_to_req_indices_ptr,
     positions_ptr,
@@ -334,6 +417,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
+    READ_BEFORE_UPDATE: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -364,11 +448,19 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     tokens = tl.arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
     pos = start + tokens
     mask_pos = pos >= 0
+    if READ_BEFORE_UPDATE:
+        query_start = tl.load(query_start_loc_ptr + req_idx)
+        first_position = tl.load(positions_ptr + query_start)
+        is_input = pos >= first_position
+    else:
+        is_input = pos < 0
+    state_mask_pos = mask_pos & ~is_input
+    input_mask_pos = mask_pos & is_input
 
     block_indices = pos // block_size
     block_numbers = tl.load(
         block_table_ptr + req_idx * block_table_stride + block_indices,
-        mask=mask_pos,
+        mask=state_mask_pos,
         other=0,
     )
     block_offsets = pos % block_size
@@ -385,20 +477,49 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
         + head_offset
     )
 
-    combined_mask = mask_pos[:, None] & mask[None, :]
+    state_combined_mask = state_mask_pos[:, None] & mask[None, :]
+    input_combined_mask = input_mask_pos[:, None] & mask[None, :]
 
     score = tl.load(
         row_base[:, None] + STATE_WIDTH + block[None, :],
-        mask=combined_mask,
+        mask=state_combined_mask,
         other=float("-inf"),
     )
-    score = tl.softmax(score, dim=0)
-
     kv = tl.load(
         row_base[:, None] + block[None, :],
-        mask=combined_mask,
+        mask=state_combined_mask,
         other=0.0,
     )
+    if READ_BEFORE_UPDATE:
+        in_row = token_idx - (position - pos)
+        input_score = tl.load(
+            current_score_ptr
+            + in_row[:, None] * current_score_stride
+            + head_offset[:, None]
+            + block[None, :],
+            mask=input_combined_mask,
+            other=0.0,
+        )
+        ape_row = pos % COMPRESS_RATIO
+        input_ape = tl.load(
+            current_ape_ptr
+            + ape_row[:, None] * current_ape_stride
+            + head_offset[:, None]
+            + block[None, :],
+            mask=input_combined_mask,
+            other=0.0,
+        )
+        input_kv = tl.load(
+            current_kv_ptr
+            + in_row[:, None] * current_kv_stride
+            + head_offset[:, None]
+            + block[None, :],
+            mask=input_combined_mask,
+            other=0.0,
+        )
+        score = tl.where(input_combined_mask, input_score + input_ape, score)
+        kv = tl.where(input_combined_mask, input_kv, kv)
+    score = tl.softmax(score, dim=0)
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 
@@ -482,6 +603,14 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     state_cache_ptr,
     state_cache_stride0,
     state_cache_stride1,
+    # ── current fwd input, used by ATOM-order read-before-update mode ──
+    current_kv_ptr,
+    current_kv_stride,
+    current_score_ptr,
+    current_score_stride,
+    current_ape_ptr,
+    current_ape_stride,
+    query_start_loc_ptr,
     # ── metadata ──
     token_to_req_indices_ptr,
     positions_ptr,
@@ -511,6 +640,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     TOKEN_STRIDE: tl.constexpr,  # HEAD_SIZE // 2 = 64 packed bytes/token
     SCALE_DIM: tl.constexpr,  # HEAD_SIZE // QUANT_BLOCK = 4 ue8m0 bytes/token
     KV_BLOCK_STRIDE: tl.constexpr,
+    READ_BEFORE_UPDATE: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → MXFP4 quant → store.
 
@@ -543,11 +673,19 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     tokens = tl.arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
     pos = start + tokens
     mask_pos = pos >= 0
+    if READ_BEFORE_UPDATE:
+        query_start = tl.load(query_start_loc_ptr + req_idx)
+        first_position = tl.load(positions_ptr + query_start)
+        is_input = pos >= first_position
+    else:
+        is_input = pos < 0
+    state_mask_pos = mask_pos & ~is_input
+    input_mask_pos = mask_pos & is_input
 
     block_indices = pos // block_size
     block_numbers = tl.load(
         block_table_ptr + req_idx * block_table_stride + block_indices,
-        mask=mask_pos,
+        mask=state_mask_pos,
         other=0,
     )
     block_offsets = pos % block_size
@@ -564,20 +702,49 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
         + head_offset
     )
 
-    combined_mask = mask_pos[:, None] & mask[None, :]
+    state_combined_mask = state_mask_pos[:, None] & mask[None, :]
+    input_combined_mask = input_mask_pos[:, None] & mask[None, :]
 
     score = tl.load(
         row_base[:, None] + STATE_WIDTH + block[None, :],
-        mask=combined_mask,
+        mask=state_combined_mask,
         other=float("-inf"),
     )
-    score = tl.softmax(score, dim=0)
-
     kv = tl.load(
         row_base[:, None] + block[None, :],
-        mask=combined_mask,
+        mask=state_combined_mask,
         other=0.0,
     )
+    if READ_BEFORE_UPDATE:
+        in_row = token_idx - (position - pos)
+        input_score = tl.load(
+            current_score_ptr
+            + in_row[:, None] * current_score_stride
+            + head_offset[:, None]
+            + block[None, :],
+            mask=input_combined_mask,
+            other=0.0,
+        )
+        ape_row = pos % COMPRESS_RATIO
+        input_ape = tl.load(
+            current_ape_ptr
+            + ape_row[:, None] * current_ape_stride
+            + head_offset[:, None]
+            + block[None, :],
+            mask=input_combined_mask,
+            other=0.0,
+        )
+        input_kv = tl.load(
+            current_kv_ptr
+            + in_row[:, None] * current_kv_stride
+            + head_offset[:, None]
+            + block[None, :],
+            mask=input_combined_mask,
+            other=0.0,
+        )
+        score = tl.where(input_combined_mask, input_score + input_ape, score)
+        kv = tl.where(input_combined_mask, input_kv, kv)
+    score = tl.softmax(score, dim=0)
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 

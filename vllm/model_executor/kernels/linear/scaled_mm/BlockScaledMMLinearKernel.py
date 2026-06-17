@@ -8,10 +8,15 @@ from typing import ClassVar
 import torch
 from typing_extensions import Self
 
+from vllm.model_executor.layers.fusion.quant_activation import (
+    QuantizedActivation,
+    as_quantized_activation,
+)
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     process_fp8_weight_block_strategy,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.model_executor.utils import replace_parameter
 
 from ..base import (
@@ -58,6 +63,11 @@ class Fp8BlockScaledMMLinearKernel(
         )
         self.use_triton = False
 
+    def input_quant_key(self) -> QuantKey | None:
+        if self.apply_input_quant:
+            return self.config.activation_quant_key
+        return None
+
     @classmethod
     def can_implement(cls, config: FP8ScaledMMLinearLayerConfig):
         act_quant_key = config.activation_quant_key
@@ -97,7 +107,7 @@ class Fp8BlockScaledMMLinearKernel(
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | QuantizedActivation,
         bias: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -112,11 +122,20 @@ class Fp8BlockScaledMMLinearKernel(
         input_scale = params.input_scale
         scale_up = params.input_scale_ub
 
-        # View input as 2D matrix for fp8 methods
-        input_2d = x.view(-1, x.shape[-1])
-        output_shape = [*x.shape[:-1], weight.shape[0]]
+        qa = as_quantized_activation(x, self.input_quant_key())
+        if qa is not None:
+            input_2d = qa.data.view(-1, qa.data.shape[-1])
+            input_scale = qa.scale
+            output_shape = [*qa.orig_shape[:-1], weight.shape[0]]
+        else:
+            assert isinstance(x, torch.Tensor)
+            # View input as 2D matrix for fp8 methods.
+            input_2d = x.view(-1, x.shape[-1])
+            output_shape = [*x.shape[:-1], weight.shape[0]]
 
-        if self.apply_input_quant:
+        if qa is not None:
+            q_input = input_2d
+        elif self.apply_input_quant:
             q_input, input_scale = self.quant_fp8(
                 input_2d, input_scale, scale_up, use_triton=self.use_triton
             )

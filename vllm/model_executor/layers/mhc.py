@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
+import torch.nn.functional as F
 
 # this import will also register the custom ops
 # import vllm.model_executor.kernels.mhc  # noqa: F401
@@ -9,6 +12,28 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.utils.import_utils import has_tilelang
 
 HAS_TILELANG = has_tilelang()
+USE_AITER_MHC = os.environ.get("ATOM_DISABLE_AITER_MHC", "0") != "1"
+USE_AITER_MHC_PRE = (
+    USE_AITER_MHC
+    and os.environ.get("ATOM_ENABLE_AITER_MHC_PRE", "0") == "1"
+    and os.environ.get("ATOM_DISABLE_AITER_MHC_PRE", "0") != "1"
+)
+USE_AITER_MHC_POST = (
+    USE_AITER_MHC and os.environ.get("ATOM_DISABLE_AITER_MHC_POST", "0") != "1"
+)
+USE_AITER_MHC_FUSED_POST_PRE = (
+    USE_AITER_MHC
+    and os.environ.get("ATOM_DISABLE_AITER_MHC_FUSED_POST_PRE", "0") != "1"
+)
+USE_AITER_TRITON_MHC_FUSED_POST_PRE = (
+    USE_AITER_MHC_FUSED_POST_PRE
+    and os.environ.get("ATOM_ENABLE_AITER_TRITON_MHC_FUSED_POST_PRE", "0") == "1"
+)
+USE_AITER_HC_HEAD = (
+    USE_AITER_MHC
+    and os.environ.get("ATOM_ENABLE_AITER_HC_HEAD", "0") == "1"
+    and os.environ.get("ATOM_DISABLE_AITER_HC_HEAD", "0") != "1"
+)
 
 
 # --8<-- [start:mhc_pre]
@@ -71,24 +96,22 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # TODO: Reenable aiter after we are at the aiter
-        # version that has this bugfix
-        # https://github.com/ROCm/aiter/commit/b639cb63bcac4672dce33a731fad042a65cb3649
-        # It has accuracy problem at large number of tokens.
-        # hidden_size = residual.shape[-1]
-        # if hidden_size % 256 == 0:
-        #     return torch.ops.vllm.mhc_pre_aiter(
-        #         residual,
-        #         fn,
-        #         hc_scale,
-        #         hc_base,
-        #         rms_eps,
-        #         hc_pre_eps,
-        #         hc_sinkhorn_eps,
-        #         hc_post_mult_value,
-        #         sinkhorn_repeat,
-        #     )
-        # else:
+        hidden_size = residual.shape[-1]
+        if USE_AITER_MHC_PRE and hidden_size % 256 == 0:
+            return torch.ops.vllm.mhc_pre_aiter(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                norm_weight,
+                norm_eps,
+            )
         if HAS_TILELANG:
             return torch.ops.vllm.mhc_pre_tilelang(
                 residual,
@@ -135,7 +158,7 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return mhc_kernels.mhc_pre_torch(
+        post_mix, comb_mix, layer_input = mhc_kernels.mhc_pre_torch(
             residual,
             fn,
             hc_scale,
@@ -146,6 +169,14 @@ class MHCPreOp(CustomOp):
             hc_post_mult_value,
             sinkhorn_repeat,
         )
+        if norm_weight is not None:
+            layer_input = F.rms_norm(
+                layer_input.float(),
+                (layer_input.shape[-1],),
+                norm_weight.float(),
+                norm_eps,
+            ).to(layer_input.dtype)
+        return post_mix, comb_mix, layer_input
 
     def forward_xpu(
         self,
@@ -211,19 +242,14 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
-        # TODO: Reenable aiter after we are at the aiter
-        # version that has this bugfix
-        # https://github.com/ROCm/aiter/commit/b639cb63bcac4672dce33a731fad042a65cb3649
-        # It has accuracy problem at large number of tokens.
-        # hidden_size = residual.shape[-1]
-        # if hidden_size % 256 == 0:
-        #     return torch.ops.vllm.mhc_post_aiter(
-        #         x,
-        #         residual,
-        #         post_layer_mix,
-        #         comb_res_mix,
-        #     )
-        # else:
+        hidden_size = residual.shape[-1]
+        if USE_AITER_MHC_POST and hidden_size % 256 == 0:
+            return torch.ops.vllm.mhc_post_aiter(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+            )
         if HAS_TILELANG:
             return torch.ops.vllm.mhc_post_tilelang(
                 x, residual, post_layer_mix, comb_res_mix
@@ -310,7 +336,27 @@ class HCHeadOp(CustomOp):
         outer_shape = hidden_states.shape[:-2]
         hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
 
-        if HAS_TILELANG:
+        if USE_AITER_HC_HEAD and hidden_size % 256 == 0:
+            from vllm._aiter_ops import rocm_aiter_ops
+
+            out = torch.empty(
+                hs_flat.shape[0],
+                hidden_size,
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
+            rocm_aiter_ops.hc_head(
+                hs_flat,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                out,
+                hidden_size,
+                rms_norm_eps,
+                hc_eps,
+                hc_mult,
+            )
+        elif HAS_TILELANG:
             out = torch.ops.vllm.hc_head_fused_kernel_tilelang(
                 hs_flat,
                 hc_fn,
@@ -409,6 +455,77 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_size = residual.shape[-1]
+        if USE_AITER_MHC_FUSED_POST_PRE and hidden_size % 256 == 0:
+            try:
+                import aiter
+
+                mhc_fused_post_pre = getattr(aiter, "mhc_fused_post_pre", None)
+            except Exception:
+                mhc_fused_post_pre = None
+            if mhc_fused_post_pre is not None:
+                post_mix_cur, comb_mix_cur, layer_input_cur, residual_cur = (
+                    mhc_fused_post_pre(
+                        x,
+                        residual,
+                        post_layer_mix,
+                        comb_res_mix,
+                        fn,
+                        hc_scale,
+                        hc_base,
+                        rms_eps,
+                        hc_pre_eps,
+                        hc_sinkhorn_eps,
+                        hc_post_mult_value,
+                        sinkhorn_repeat,
+                        norm_weight,
+                        norm_eps,
+                    )
+                )
+                return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+            if USE_AITER_TRITON_MHC_FUSED_POST_PRE:
+                residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = (
+                    torch.ops.vllm.mhc_fused_post_pre_aiter(
+                        x,
+                        residual,
+                        post_layer_mix,
+                        comb_res_mix,
+                        fn,
+                        hc_scale,
+                        hc_base,
+                        rms_eps,
+                        hc_pre_eps,
+                        hc_sinkhorn_eps,
+                        hc_post_mult_value,
+                        sinkhorn_repeat,
+                        n_splits,
+                        norm_weight,
+                        norm_eps,
+                    )
+                )
+                return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+        if USE_AITER_MHC_POST and USE_AITER_MHC_PRE and hidden_size % 256 == 0:
+            residual_cur = torch.ops.vllm.mhc_post_aiter(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+            )
+            post_mix_cur, comb_mix_cur, layer_input_cur = torch.ops.vllm.mhc_pre_aiter(
+                residual_cur,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                norm_weight,
+                norm_eps,
+            )
+            return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
         return torch.ops.vllm.mhc_fused_post_pre_tilelang(
             x,
             residual,
@@ -447,6 +564,77 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_size = residual.shape[-1]
+        if USE_AITER_MHC_FUSED_POST_PRE and hidden_size % 256 == 0:
+            try:
+                import aiter
+
+                mhc_fused_post_pre = getattr(aiter, "mhc_fused_post_pre", None)
+            except Exception:
+                mhc_fused_post_pre = None
+            if mhc_fused_post_pre is not None:
+                post_mix_cur, comb_mix_cur, layer_input_cur, residual_cur = (
+                    mhc_fused_post_pre(
+                        x,
+                        residual,
+                        post_layer_mix,
+                        comb_res_mix,
+                        fn,
+                        hc_scale,
+                        hc_base,
+                        rms_eps,
+                        hc_pre_eps,
+                        hc_sinkhorn_eps,
+                        hc_post_mult_value,
+                        sinkhorn_repeat,
+                        norm_weight,
+                        norm_eps,
+                    )
+                )
+                return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+            if USE_AITER_TRITON_MHC_FUSED_POST_PRE:
+                residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = (
+                    torch.ops.vllm.mhc_fused_post_pre_aiter(
+                        x,
+                        residual,
+                        post_layer_mix,
+                        comb_res_mix,
+                        fn,
+                        hc_scale,
+                        hc_base,
+                        rms_eps,
+                        hc_pre_eps,
+                        hc_sinkhorn_eps,
+                        hc_post_mult_value,
+                        sinkhorn_repeat,
+                        n_splits,
+                        norm_weight,
+                        norm_eps,
+                    )
+                )
+                return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+        if USE_AITER_MHC_POST and USE_AITER_MHC_PRE and hidden_size % 256 == 0:
+            residual_cur = torch.ops.vllm.mhc_post_aiter(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+            )
+            post_mix_cur, comb_mix_cur, layer_input_cur = torch.ops.vllm.mhc_pre_aiter(
+                residual_cur,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                norm_weight,
+                norm_eps,
+            )
+            return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
         return torch.ops.vllm.mhc_fused_post_pre_tilelang(
             x,
             residual,
@@ -500,6 +688,13 @@ class MHCFusedPostPreOp(CustomOp):
             hc_post_mult_value,
             sinkhorn_repeat,
         )
+        if norm_weight is not None:
+            layer_input_cur = F.rms_norm(
+                layer_input_cur.float(),
+                (layer_input_cur.shape[-1],),
+                norm_weight.float(),
+                norm_eps,
+            ).to(layer_input_cur.dtype)
         return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
 
     def forward_xpu(

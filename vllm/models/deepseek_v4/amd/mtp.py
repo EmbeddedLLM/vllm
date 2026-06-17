@@ -11,6 +11,7 @@ pieces that have no analogue in V3/V32:
   * V4-specific checkpoint weight-name remapping in ``load_weights``.
 """
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 
@@ -184,11 +185,14 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         )
 
         # Three aux streams shared across all MTP layers, mirroring
-        # DeepseekV4Model. ROCm runs the same work serially for now.
+        # DeepseekV4Model. ROCm is opt-in while graph-capture safety is
+        # validated for this path.
+        enable_aux_streams = torch.cuda.is_available() and (
+            not current_platform.is_rocm()
+            or os.environ.get("ATOM_ENABLE_AUX_STREAMS", "0") == "1"
+        )
         aux_stream_list = (
-            None
-            if current_platform.is_rocm()
-            else [torch.cuda.Stream() for _ in range(3)]
+            [torch.cuda.Stream() for _ in range(3)] if enable_aux_streams else None
         )
 
         # to map the exact layer index from weights

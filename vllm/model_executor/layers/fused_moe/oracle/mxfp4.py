@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from enum import Enum
 from typing import TYPE_CHECKING, Literal, Union
 
@@ -1359,32 +1360,61 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         if w2_bias is not None:
             w2_bias = w2_bias.data.to(torch.float32)
 
-        e, n, k = w13_weight.shape
+        use_gu_interleave = os.environ.get("ATOM_MOE_GU_ITLV", "0") == "1"
 
-        # No de-interleave: standard _load_w13 already produces
-        # [gate_all, up_all] layout.  Use aiter-native shuffle functions
-        # (matching aiter/ops/flydsl/test_flydsl_moe_a4w4.py pattern).
+        from aiter.ops.shuffle import shuffle_scale as _shuf_s
         from aiter.ops.shuffle import shuffle_weight as _shuf_w
         from aiter.utility.fp4_utils import e8m0_shuffle as _e8m0_shuf
 
-        # w13 (gate+up, stage1): shuffle_weight with layout (16,16)
-        w13_weight = torch.nn.Parameter(
-            _shuf_w(w13_weight.data.view(torch.float4_e2m1fn_x2), (16, 16)),
-            requires_grad=False,
-        )
-        shuffled_w13_scale = _e8m0_shuf(
-            w13_weight_scale.view(-1, w13_weight_scale.shape[-1])
-        )
+        if use_gu_interleave:
+            # Optional ATOM-style gate/up interleave path. Keep it behind an
+            # env gate because the default vLLM AITER backend expects the
+            # standard preshuffled layout.
+            w13_weight = torch.nn.Parameter(
+                _shuf_w(
+                    w13_weight.data.view(torch.float4_e2m1fn_x2),
+                    is_guinterleave=True,
+                    gate_up=True,
+                ),
+                requires_grad=False,
+            )
+            shuffled_w13_scale = _shuf_s(
+                w13_weight_scale.reshape(-1, w13_weight_scale.shape[-1]),
+                num_experts,
+                True,
+                True,
+            )
 
-        # w2 (down-proj, stage2): same shuffle as w13 for a4w4 fp4x2
-        # (tuning script uses shuffle_weight((16,16)) + e8m0_shuffle for both)
-        w2_weight = torch.nn.Parameter(
-            _shuf_w(w2_weight.data.view(torch.float4_e2m1fn_x2), (16, 16)),
-            requires_grad=False,
-        )
-        shuffled_w2_scale = _e8m0_shuf(
-            w2_weight_scale.view(-1, w2_weight_scale.shape[-1])
-        )
+            w2_weight = torch.nn.Parameter(
+                _shuf_w(
+                    w2_weight.data.view(torch.float4_e2m1fn_x2),
+                    is_guinterleave=True,
+                    gate_up=False,
+                ),
+                requires_grad=False,
+            )
+            shuffled_w2_scale = _shuf_s(
+                w2_weight_scale.reshape(-1, w2_weight_scale.shape[-1]),
+                num_experts,
+                True,
+                False,
+            )
+        else:
+            w13_weight = torch.nn.Parameter(
+                _shuf_w(w13_weight.data.view(torch.float4_e2m1fn_x2), (16, 16)),
+                requires_grad=False,
+            )
+            shuffled_w13_scale = _e8m0_shuf(
+                w13_weight_scale.view(-1, w13_weight_scale.shape[-1])
+            )
+
+            w2_weight = torch.nn.Parameter(
+                _shuf_w(w2_weight.data.view(torch.float4_e2m1fn_x2), (16, 16)),
+                requires_grad=False,
+            )
+            shuffled_w2_scale = _e8m0_shuf(
+                w2_weight_scale.view(-1, w2_weight_scale.shape[-1])
+            )
 
         return (
             w13_weight,

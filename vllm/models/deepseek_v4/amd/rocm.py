@@ -1,14 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import dataclass
 from typing import cast
 
 import torch
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
+from vllm.models.deepseek_v4.amd.v4_kernels import qk_norm_rope_maybe_quant
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
-from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
+from vllm.models.deepseek_v4.common.ops import (
+    dequantize_and_gather_k_cache,
+    quantize_and_insert_k_cache,
+)
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
     DeepseekV4FlashMLAMetadata,
@@ -29,6 +36,9 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_sparse_attn_prefill,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
+
+USE_ATOM_QK_ROPE = os.environ.get("ATOM_DISABLE_QK_ROPE", "0") != "1"
+USE_ATOM_FUSED_Q_NORM_QUANT = os.environ.get("ATOM_USE_FUSED_Q_NORM_QUANT", "1") != "0"
 
 
 def _build_indptr_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
@@ -586,6 +596,82 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return num_heads
 
+    def _q_norm_maybe_quant(
+        self,
+        qr: torch.Tensor,
+    ) -> torch.Tensor | QuantizedActivation:
+        if not USE_ATOM_FUSED_Q_NORM_QUANT:
+            return self.q_norm(qr)
+
+        quant_key = getattr(self.wq_b, "input_quant_key", None)
+        if quant_key is None:
+            return self.q_norm(qr)
+
+        if self.indexer is not None:
+            indexer_quant_key = getattr(self.indexer.wq_b, "input_quant_key", None)
+            if indexer_quant_key != quant_key:
+                return self.q_norm(qr)
+
+        scale_desc = quant_key.scale
+        group_shape = scale_desc.group_shape
+        if (
+            scale_desc.static
+            or scale_desc.dtype is not torch.float32
+            or not group_shape.is_per_group()
+            or group_shape.col <= 0
+            or qr.shape[-1] % group_shape.col != 0
+        ):
+            return self.q_norm(qr)
+
+        qr_quant, qr_scale = rocm_aiter_ops.get_rmsnorm_group_fused_quant_op()(
+            qr,
+            self.q_norm.weight.data,
+            self.eps,
+            group_shape.col,
+        )
+        return QuantizedActivation(
+            data=qr_quant,
+            scale=qr_scale,
+            orig_dtype=qr.dtype,
+            orig_shape=qr.shape,
+            quant_key=quant_key,
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        llama_4_scaling: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not USE_ATOM_QK_ROPE:
+            return super().forward(positions, hidden_states, llama_4_scaling)
+
+        num_tokens = hidden_states.shape[0]
+        o_padded = torch.empty(
+            (num_tokens, self.padded_heads, self.head_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+            self.attn_gemm_parallel_execute(hidden_states)
+        )
+        qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+        qr = self._q_norm_maybe_quant(qr)
+
+        self.attention_impl(
+            hidden_states,
+            qr,
+            kv,
+            kv_score,
+            indexer_kv_score,
+            indexer_weights,
+            positions,
+            o_padded,
+        )
+        o = o_padded[:, : self.n_local_heads, :]
+        return self._o_proj(o, positions)
+
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # ROCm BF16 reference wo_a path (inverse RoPE + einsum) + wo_b.
         z = rocm_inv_rope_einsum(
@@ -598,6 +684,97 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             self.wo_a,
         )
         return self.wo_b(z.flatten(1))
+
+    def _atom_rotary_cos_sin(
+        self, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        half_rope = self.rope_head_dim // 2
+        cache_key = (
+            cos_sin_cache.data_ptr(),
+            cos_sin_cache.device,
+            cos_sin_cache.dtype,
+            tuple(cos_sin_cache.shape),
+            half_rope,
+            dtype,
+        )
+        cached = getattr(self.rotary_emb, "_atom_split_cos_sin_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1], cached[2]
+
+        cos_cache = cos_sin_cache[..., :half_rope].to(dtype=dtype).contiguous()
+        sin_cache = (
+            cos_sin_cache[..., half_rope : 2 * half_rope].to(dtype=dtype).contiguous()
+        )
+        self.rotary_emb._atom_split_cos_sin_cache = (
+            cache_key,
+            cos_cache,
+            sin_cache,
+        )
+        return cos_cache, sin_cache
+
+    def _fused_qnorm_rope_kv_insert(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        attn_metadata: object,
+    ) -> torch.Tensor:
+        if not USE_ATOM_QK_ROPE:
+            return DeepseekV4Attention._fused_qnorm_rope_kv_insert(
+                self,
+                q,
+                kv,
+                positions,
+                attn_metadata,  # type: ignore[arg-type]
+            )
+
+        if not isinstance(attn_metadata, dict):
+            if self.n_local_heads < self.padded_heads:
+                out = q.new_zeros(q.shape[0], self.padded_heads, self.head_dim)
+                out[:, : self.n_local_heads, :].copy_(q)
+                return out
+            return q
+
+        swa_metadata = cast(
+            DeepseekSparseSWAMetadata | None,
+            attn_metadata.get(self.swa_cache_layer.prefix),
+        )
+        assert swa_metadata is not None
+        assert positions.dtype == torch.int64
+
+        cos_cache, sin_cache = self._atom_rotary_cos_sin(kv.dtype)
+
+        q_flat = q.reshape(q.shape[0], self.n_local_heads * self.head_dim)
+        q_out, kv_out, _, _ = qk_norm_rope_maybe_quant(
+            q_flat,
+            kv,
+            self.kv_norm.weight.data,
+            cos_cache,
+            sin_cache,
+            positions,
+            self.n_local_heads,
+            self.head_dim,
+            self.rope_head_dim,
+            self.eps,
+            quant_q=False,
+            quant_k=False,
+        )
+
+        swa_kv_cache = self.swa_cache_layer.kv_cache
+        if swa_kv_cache.dtype == torch.uint8:
+            quantize_and_insert_k_cache(
+                kv_out,
+                swa_kv_cache.view(swa_kv_cache.shape[0], -1),
+                swa_metadata.slot_mapping,
+                swa_metadata.block_size,
+            )
+        else:
+            raise NotImplementedError(
+                "ROCm DeepSeek V4 ATOM q/k path currently expects fp8_ds_mla "
+                "uint8 SWA cache."
+            )
+        return q_out
 
     def forward_mqa(
         self,
