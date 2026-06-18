@@ -306,3 +306,212 @@ RESULT_PREFIX=ds-v4-pro-nomtp-current-default-noeager CONCURRENCIES=32 \
 ```
 
 Do not change `lmeval.sh` when validating accuracy.
+
+## 2026-06-17 Latest Tilelang-MHC Baseline And Fused Activation
+
+### Latest Tilelang-MHC / No-Breakable Baseline
+
+Result: accuracy passed; performance was not the overall best saved C32 run.
+
+Current launch state at measurement time:
+
+- `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
+- no `--enforce-eager`
+- `MAX_NUM_SEQS=256` for `lmeval.sh`
+- fresh restart with `MAX_NUM_SEQS=32` for `benchmarkvllm.sh`
+
+Accuracy:
+
+- GSM8K flexible: `0.9537528431`
+- GSM8K strict: `0.9545109932`
+
+C32 random 1024/1024 benchmark:
+
+- output throughput: `921.10 tok/s`
+- total throughput: `1845.80 tok/s`
+- mean TPOT: `33.76 ms`
+- result file: `bench-sparsemla/latest-aitermhc-nobreakable-C32.json`
+
+This is slower than the best saved run,
+`bench-sparsemla/revert-compressor-aux-nomtp-C32.json`, which measured
+`926.06 output tok/s`, `1855.74 total tok/s`, and `33.50 ms` mean TPOT.
+
+### `aiter.ops.triton.fusions.fused_clamp_act_mul`
+
+Result: kept as a gated experimental improvement over the latest baseline.
+
+Integration:
+
+- `DeepseekV4MLP` can call
+  `aiter.ops.triton.fusions.fused_clamp_act_mul.fused_clamp_act_mul`.
+- It is gated by `ATOM_USE_AITER_FUSED_CLAMP_ACT_MUL=1`.
+- The launch script currently enables that gate by default for testing.
+- Fallback remains the previous top-level `aiter.silu_and_mul` path.
+
+Small BF16 tensor checks against `aiter.silu_and_mul` showed exact matches for
+some shapes and maximum absolute differences of about `0.001-0.002` for other
+shapes, so full task accuracy was required.
+
+Accuracy:
+
+- GSM8K flexible: `0.9537528431`
+- GSM8K strict: `0.9545109932`
+
+C32 random 1024/1024 benchmark:
+
+- output throughput: `922.73 tok/s`
+- total throughput: `1849.07 tok/s`
+- mean TPOT: `33.71 ms`
+- result file: `bench-sparsemla/fused-clamp-actmul-C32.json`
+
+Compared with the latest tilelang-MHC baseline, this is a small improvement:
+`+1.63 output tok/s` and `-0.05 ms` mean TPOT. It is still below the overall
+best saved C32 result, so treat this as a tentative local improvement rather
+than a solved performance gap.
+
+### `aiter.cp_gather_indexer_k_quant_cache`
+
+Result: rejected for performance and removed.
+
+Experiment:
+
+- Added a gfx950 opt-in path for top-level
+  `aiter.cp_gather_indexer_k_quant_cache`.
+- The current Triton cache writer uses the preshuffled layout, so the aiter
+  gather call needed `preshuffle=True`; without that, a smoke test showed
+  matching scales but incorrect gathered K values.
+
+Accuracy with fused activation plus aiter cp-gather:
+
+- GSM8K flexible: `0.9514783927`
+- GSM8K strict: `0.9522365428`
+
+C32 random 1024/1024 benchmark:
+
+- output throughput: `922.16 tok/s`
+- total throughput: `1847.92 tok/s`
+- mean TPOT: `33.67 ms`
+- result file: `bench-sparsemla/aiter-cpgather-C32.json`
+
+This passed accuracy but was slower than the fused-activation-only result
+(`922.73 output tok/s`, `1849.07 total tok/s`). The integration was removed
+because the rule is to keep only changes that improve performance while
+preserving accuracy.
+
+### `aiter.rope_rotate_activation` + `aiter.get_hip_quant`
+
+Result: rejected for performance and removed.
+
+Experiment:
+
+- Added an opt-in `DeepseekV4Indexer` path for the FP8 indexer-cache case.
+- The path followed the ATOM indexer sequence:
+  `wq_b -> rope_rotate_activation -> get_hip_quant(QuantType.per_1x128) ->
+  weights * q_scale * softmax/head scale`.
+- vLLM's existing path uses `fused_indexer_q_rope_quant`, which fuses RoPE,
+  quantization, and weight-scale folding in one Triton kernel.
+- `rope_rotate_activation` requires split `cos` and `sin` tensors with the
+  same dtype as Q, while vLLM stores a combined `cos_sin_cache`; the experiment
+  used a cached split/cast to avoid per-forward conversion.
+
+Smoke result:
+
+- Dtypes matched the current FP8 path: `torch.float8_e4m3fn` Q and `float32`
+  folded weights.
+- Folded weights were numerically close to the vLLM path, but Q values differed
+  because `rope_rotate_activation` includes ATOM's activation rotation rather
+  than being a bitwise replacement for vLLM's fused RoPE-only indexer kernel.
+
+Accuracy:
+
+- GSM8K flexible: `0.9514783927`
+- GSM8K strict: `0.9522365428`
+- result file:
+  `results_deepseekprographmtp_aitermhc_nobreakablecudagraph/deepseek-ai__DeepSeek-V4-Pro/results_2026-06-17T19-12-07.602309.json`
+
+C32 random 1024/1024 benchmark:
+
+- output throughput: `888.72 tok/s`
+- total throughput: `1780.92 tok/s`
+- mean TPOT: `34.97 ms`
+- result file: `bench-sparsemla/aiter-indexer-ropequant-C32.json`
+
+This passed accuracy but was much slower than the kept fused-activation-only
+result (`922.73 output tok/s`, `1849.07 total tok/s`, `33.71 ms` mean TPOT).
+The likely reason is that the ATOM-style sequence adds separate kernels and
+loses vLLM's fused indexer Q RoPE/quant/weight-fold kernel. The integration was
+removed.
+
+### `ATOM/atom/model_ops/v4_kernels/fused_compress.py`
+
+Status: not integrated in the current kept code.
+
+Inspection summary:
+
+- ATOM's `fused_compress_attn` is not a simple replacement for vLLM's
+  `compress_norm_rope_store_triton`.
+- ATOM depends on `CompressPlan` metadata:
+  `[ragged_id, batch_id, position, window_len]` rows, with fixed-capacity
+  plan buffers for graph replay.
+- ATOM also expects separate per-sequence compressor state slots:
+  `kv_state`, `score_state`, and `state_slot_mapping`.
+- vLLM's current compressor path is wired to vLLM scheduler/cache metadata:
+  `slot_mapping`, `block_table`, a paged combined state cache, and the vLLM
+  KV-cache abstraction.
+- The ordering also differs. ATOM's fused compressor must run before the state
+  update because it reads previous-forward compressor state. The current
+  reverted vLLM path writes partial states first and then compresses through the
+  paged state cache.
+
+Implication:
+
+- A direct copy would require adding an ATOM-style compression-plan builder and
+  per-sequence ring-state abstraction inside vLLM, then adapting cache scatter
+  to vLLM's KV-cache/indexer cache layout.
+- Importing `atom.model_ops.v4_kernels.fused_compress` directly would violate
+  the no-ATOM-package-dependency requirement.
+- Reintroducing the previous compressor-order experiment is not appropriate as
+  a shortcut; that code was explicitly reverted, and the current passing
+  accuracy baseline uses the vLLM ordering.
+
+Follow-up experiment:
+
+- Added a vLLM-native FP8 indexer-only path behind
+  `ATOM_USE_INDEXER_PLAN_COMPRESS=1`.
+- The path kept vLLM's scheduler, paged state cache, and KV-cache metadata, but
+  changed the order to read previous rows from the paged state cache and current
+  rows directly from the current forward input before `save_partial_states`.
+- This approximated ATOM's read-before-update compressor ordering without
+  importing ATOM or adding ATOM's ring-state cache/`CompressPlan` abstraction.
+
+Accuracy:
+
+- GSM8K flexible: `0.9537528431`
+- GSM8K strict: `0.9545109932`
+- result file:
+  `results_deepseekprographmtp_aitermhc_nobreakablecudagraph/deepseek-ai__DeepSeek-V4-Pro/results_2026-06-17T19-38-17.056777.json`
+
+C32 random 1024/1024 benchmark:
+
+- output throughput: `918.41 tok/s`
+- total throughput: `1840.41 tok/s`
+- mean TPOT: `33.83 ms`
+- result file: `bench-sparsemla/indexer-plan-compress-C32.json`
+
+Decision: rejected and removed. It preserved accuracy, but it was slower than
+the kept fused-activation run (`922.73 output tok/s`, `1849.07 total tok/s`,
+`33.71 ms` mean TPOT) and slower than the latest tilelang-MHC baseline
+(`921.10 output tok/s`). The likely reason is that avoiding one state-cache
+read in the compress kernel did not offset the extra direct current-input
+loads and the additional metadata work in vLLM's paged layout.
+
+Next analysis ideas:
+
+- Build a vLLM-native `CompressPlan` from `CommonAttentionMetadata` using
+  `query_start_loc`, per-request lengths, and `block_table`.
+- Decide whether the ATOM ring-state layout can coexist with vLLM's paged state
+  cache without duplicating memory.
+- If a ring-state cache is added, test only the CSA/indexer compressor first
+  because it has the most direct FP8 cache scatter analogue.
+- Benchmark the compressor kernel in isolation before a full lmeval cycle;
+  full benchmark should still be gated by GSM8K accuracy.

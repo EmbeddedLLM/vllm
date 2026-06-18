@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -8,6 +9,11 @@ import regex as re
 import torch
 import torch.nn as nn
 from aiter import silu_and_mul as aiter_silu_and_mul
+
+try:
+    from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
+except Exception:
+    fused_clamp_act_mul = None
 
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -95,15 +101,22 @@ class DeepseekV4MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else 0.0
+        self.use_fused_clamp_act_mul = (
+            os.environ.get("ATOM_USE_AITER_FUSED_CLAMP_ACT_MUL", "0") == "1"
+            and fused_clamp_act_mul is not None
+        )
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        x = torch.empty(
-            (gate_up.shape[0], gate_up.shape[-1] // 2),
-            dtype=gate_up.dtype,
-            device=gate_up.device,
-        )
-        aiter_silu_and_mul(x, gate_up, self.swiglu_limit)
+        if self.use_fused_clamp_act_mul:
+            x = fused_clamp_act_mul(gate_up, swiglu_limit=self.swiglu_limit)
+        else:
+            x = torch.empty(
+                (gate_up.shape[0], gate_up.shape[-1] // 2),
+                dtype=gate_up.dtype,
+                device=gate_up.device,
+            )
+            aiter_silu_and_mul(x, gate_up, self.swiglu_limit)
         x, _ = self.down_proj(x)
         return x
 
