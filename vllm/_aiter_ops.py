@@ -1078,24 +1078,28 @@ def _rocm_aiter_rmsnorm_with_add_fp8_group_quant_impl(
     variance_epsilon: float,
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+    from aiter import add_rmsnorm_quant
 
-    (x_quant, x_quant_scales), _, _, res = fused_rms_fp8_group_quant(
-        x,
-        weight,
-        variance_epsilon,
-        None,
-        None,
-        None,
-        group_size=group_size,
-        dtype_quant=FP8_DTYPE,
-        res1=residual,
+    M, N = x.shape
+    x_quant = torch.empty_like(x, dtype=FP8_DTYPE, device=x.device)
+    x_quant_scales = torch.empty(
+        (M, (N + group_size - 1) // group_size),
+        dtype=torch.float32,
+        device=x.device,
     )
-    return (
+    res = torch.empty_like(residual, device=residual.device)
+    add_rmsnorm_quant(
         x_quant,
+        x,
+        residual,
         res,
         x_quant_scales,
+        weight,
+        variance_epsilon,
+        group_size,
+        False,
     )
+    return x_quant, res, x_quant_scales
 
 
 def _rocm_aiter_rmsnorm_with_add_fp8_group_quant_fake(
@@ -1120,18 +1124,23 @@ def _rocm_aiter_rmsnorm_fp8_group_quant_impl(
     variance_epsilon: float,
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+    from aiter import rmsnorm_quant
 
-    (x_quant, x_quant_scales), _, _, res = fused_rms_fp8_group_quant(
+    M, N = x.shape
+    x_quant = torch.empty_like(x, dtype=FP8_DTYPE, device=x.device)
+    x_quant_scales = torch.empty(
+        (M, (N + group_size - 1) // group_size),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    rmsnorm_quant(
+        x_quant,
         x,
+        x_quant_scales,
         weight,
         variance_epsilon,
-        None,
-        None,
-        None,
-        group_size=group_size,
-        dtype_quant=FP8_DTYPE,
-        res1=None,
+        group_size,
+        False,
     )
     return (x_quant, x_quant_scales)
 

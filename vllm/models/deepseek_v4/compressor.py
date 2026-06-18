@@ -81,6 +81,7 @@ class CompressorMetadata:
     block_size: int
 
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
+    query_start_loc: torch.Tensor | None = None  # [num_reqs + 1]
 
 
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
@@ -115,6 +116,7 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             slot_mapping=common_attn_metadata.slot_mapping,
             block_size=self.block_size,
             token_to_req_indices=token_to_req_indices,
+            query_start_loc=common_attn_metadata.query_start_loc,
         )
 
 

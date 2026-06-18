@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -7,6 +8,12 @@ from itertools import islice
 import regex as re
 import torch
 import torch.nn as nn
+from aiter import silu_and_mul as aiter_silu_and_mul
+
+try:
+    from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
+except Exception:
+    fused_clamp_act_mul = None
 
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -14,7 +21,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     GateLinear,
@@ -27,6 +33,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mhc import (
+    HAS_AITER_MHC,
     HCHeadOp,
     MHCFusedPostPreOp,
     MHCPostOp,
@@ -93,14 +100,23 @@ class DeepseekV4MLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        if swiglu_limit is not None:
-            self.act_fn = SiluAndMulWithClamp(swiglu_limit)
-        else:
-            self.act_fn = SiluAndMul()
+        self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else 0.0
+        self.use_fused_clamp_act_mul = (
+            os.environ.get("ATOM_USE_AITER_FUSED_CLAMP_ACT_MUL", "0") == "1"
+            and fused_clamp_act_mul is not None
+        )
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self.use_fused_clamp_act_mul:
+            x = fused_clamp_act_mul(gate_up, swiglu_limit=self.swiglu_limit)
+        else:
+            x = torch.empty(
+                (gate_up.shape[0], gate_up.shape[-1] // 2),
+                dtype=gate_up.dtype,
+                device=gate_up.device,
+            )
+            aiter_silu_and_mul(x, gate_up, self.swiglu_limit)
         x, _ = self.down_proj(x)
         return x
 
@@ -425,7 +441,13 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> tuple[
         torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
     ]:
-        if not self.has_tilelang:
+        # Select the mHC path:
+        # - aiter unfused pre/post (preferred ROCm path when aiter is available),
+        #   or the torch/triton fallback when tilelang is unavailable ->
+        #   _forward_unfused_post_pre
+        # - tilelang fused post+pre (CUDA, or ROCm without aiter) ->
+        #   _forward_fused_post_pre
+        if not self.has_tilelang or HAS_AITER_MHC:
             return self._forward_unfused_post_pre(
                 x, positions, input_ids, post_mix, res_mix, residual
             )
@@ -580,7 +602,10 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
-        if layer is not None and self.has_tilelang:
+        # The fused post+pre path (tilelang) defers the final hc_post and
+        # returns the residual streams; the unfused path (aiter / torch on
+        # ROCm) applies hc_post inline and returns None, so skip it here.
+        if layer is not None and residual is not None:
             hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
 
         if not get_pp_group().is_last_rank:
