@@ -15,6 +15,49 @@ try:
 except Exception:
     fused_clamp_act_mul = None
 
+_ATOM_USE_AITER_FUSED_CLAMP_ACT_MUL = (
+    os.environ.get("ATOM_USE_AITER_FUSED_CLAMP_ACT_MUL", "0") == "1"
+)
+_ROCM_DSV4_ATOM_STATE_ENABLED = (
+    os.environ.get("VLLM_ROCM_DSV4_ATOM_STATE", "0") == "1"
+)
+_ROCM_DSV4_USE_AITER_MHC = (
+    os.environ.get("VLLM_ROCM_DSV4_USE_AITER_MHC", "0") == "1"
+)
+_ROCM_DSV4_USE_AITER_MHC_FUSE_NORM = (
+    os.environ.get("VLLM_ROCM_DSV4_USE_AITER_MHC_FUSE_NORM", "0") == "1"
+)
+_ROCM_DSV4_USE_AITER_MHC_PRE = (
+    os.environ.get(
+        "VLLM_ROCM_DSV4_USE_AITER_MHC_PRE",
+        str(int(_ROCM_DSV4_USE_AITER_MHC)),
+    )
+    == "1"
+)
+_ROCM_DSV4_USE_AITER_MHC_PRE_ATTN = (
+    os.environ.get(
+        "VLLM_ROCM_DSV4_USE_AITER_MHC_PRE_ATTN",
+        str(int(_ROCM_DSV4_USE_AITER_MHC_PRE)),
+    )
+    == "1"
+)
+_ROCM_DSV4_USE_AITER_MHC_PRE_FFN = (
+    os.environ.get(
+        "VLLM_ROCM_DSV4_USE_AITER_MHC_PRE_FFN",
+        str(int(_ROCM_DSV4_USE_AITER_MHC_PRE)),
+    )
+    == "1"
+)
+_ROCM_DSV4_AITER_MHC_PRE_ATTN_MAX_LAYER = int(
+    os.environ.get("VLLM_ROCM_DSV4_AITER_MHC_PRE_ATTN_MAX_LAYER", "-1")
+)
+_ROCM_DSV4_AITER_MHC_PRE_FFN_MAX_LAYER = int(
+    os.environ.get("VLLM_ROCM_DSV4_AITER_MHC_PRE_FFN_MAX_LAYER", "-1")
+)
+_ROCM_DSV4_AITER_MHC_FUSE_NORM_MAX_TOKENS = int(
+    os.environ.get("VLLM_ROCM_DSV4_AITER_MHC_FUSE_NORM_MAX_TOKENS", "64")
+)
+
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
@@ -102,8 +145,7 @@ class DeepseekV4MLP(nn.Module):
             )
         self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else 0.0
         self.use_fused_clamp_act_mul = (
-            os.environ.get("ATOM_USE_AITER_FUSED_CLAMP_ACT_MUL", "0") == "1"
-            and fused_clamp_act_mul is not None
+            _ATOM_USE_AITER_FUSED_CLAMP_ACT_MUL and fused_clamp_act_mul is not None
         )
 
     def forward(self, x):
@@ -255,6 +297,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         import vllm.model_executor.layers.mhc  # noqa: F401
 
         config = vllm_config.model_config.hf_config
+        self.layer_id = extract_layer_index(prefix)
         self.hidden_size = config.hidden_size
 
         self.rms_norm_eps = config.rms_norm_eps
@@ -266,8 +309,23 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
 
-        self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
-        self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
+        mhc_norm_dtype = (
+            torch.bfloat16
+            if (
+                _ROCM_DSV4_USE_AITER_MHC_FUSE_NORM
+                and (
+                    _ROCM_DSV4_USE_AITER_MHC_PRE_ATTN
+                    or _ROCM_DSV4_USE_AITER_MHC_PRE_FFN
+                )
+            )
+            else None
+        )
+        self.attn_norm = RMSNorm(
+            self.hidden_size, self.rms_norm_eps, dtype=mhc_norm_dtype
+        )
+        self.ffn_norm = RMSNorm(
+            self.hidden_size, self.rms_norm_eps, dtype=mhc_norm_dtype
+        )
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
@@ -327,8 +385,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+        use_aiter_pre: bool = False,
     ):
-        post_mix, res_mix, layer_input = self.mhc_pre(
+        mhc_pre = (
+            torch.ops.vllm.mhc_pre_aiter
+            if use_aiter_pre
+            else self.mhc_pre
+        )
+        post_mix, res_mix, layer_input = mhc_pre(
             residual=x,
             fn=hc_fn,
             hc_scale=hc_scale,
@@ -338,6 +404,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             hc_sinkhorn_eps=self.hc_eps,
             hc_post_mult_value=self.hc_post_alpha,
             sinkhorn_repeat=self.hc_sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
         )
         return layer_input, post_mix, res_mix
 
@@ -414,6 +482,50 @@ class DeepseekV4DecoderLayer(nn.Module):
         torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
     ]:
         residual = x
+        num_hc_tokens = x.numel() // (self.hc_mult * self.hidden_size)
+        use_fused_mhc_norm = (
+            HAS_AITER_MHC
+            and _ROCM_DSV4_USE_AITER_MHC_FUSE_NORM
+            and (
+                _ROCM_DSV4_AITER_MHC_FUSE_NORM_MAX_TOKENS < 0
+                or num_hc_tokens <= _ROCM_DSV4_AITER_MHC_FUSE_NORM_MAX_TOKENS
+            )
+        )
+        if use_fused_mhc_norm:
+            use_aiter_attn_pre = _ROCM_DSV4_USE_AITER_MHC_PRE_ATTN and (
+                _ROCM_DSV4_AITER_MHC_PRE_ATTN_MAX_LAYER < 0
+                or self.layer_id < _ROCM_DSV4_AITER_MHC_PRE_ATTN_MAX_LAYER
+            )
+            use_aiter_ffn_pre = _ROCM_DSV4_USE_AITER_MHC_PRE_FFN and (
+                _ROCM_DSV4_AITER_MHC_PRE_FFN_MAX_LAYER < 0
+                or self.layer_id < _ROCM_DSV4_AITER_MHC_PRE_FFN_MAX_LAYER
+            )
+            x, post, comb = self.hc_pre(
+                x,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.attn_norm.weight,
+                self.rms_norm_eps,
+                use_aiter_pre=use_aiter_attn_pre,
+            )
+            x = self.attn(positions, x, None)
+            x = self.hc_post(x, residual, post, comb)
+
+            residual = x
+            x, post, comb = self.hc_pre(
+                x,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.ffn_norm.weight,
+                self.rms_norm_eps,
+                use_aiter_pre=use_aiter_ffn_pre,
+            )
+            x = self.ffn(x, input_ids)
+            x = self.hc_post(x, residual, post, comb)
+            return x, None, None, None
+
         x, post, comb = self.hc_pre(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
@@ -805,6 +917,19 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
         )
+
+    @staticmethod
+    def get_model_state_cls():
+        if current_platform.is_rocm() and _ROCM_DSV4_ATOM_STATE_ENABLED:
+            from vllm.models.deepseek_v4.amd.model_state import (
+                DeepseekV4RocmAtomModelState,
+            )
+
+            return DeepseekV4RocmAtomModelState
+
+        from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+
+        return DefaultModelState
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
+    DeepseekV4AtomMLAAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheSpec,
@@ -1387,6 +1388,11 @@ def register_all_kvcache_specs(vllm_config):
     )
     KVCacheSpecRegistry.register(
         MLAAttentionSpec, FullAttentionManager, uniform_type_base_spec=FullAttentionSpec
+    )
+    KVCacheSpecRegistry.register(
+        DeepseekV4AtomMLAAttentionSpec,
+        FullAttentionManager,
+        uniform_type_base_spec=FullAttentionSpec,
     )
     # NOTE(Mengqing): HiddenStateCacheSpec won't take part in
     # grouping, thus the uniform_type_base_spec is just a

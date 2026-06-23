@@ -21,6 +21,7 @@ from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    DeepseekV4AtomMLAAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
@@ -759,6 +760,15 @@ def max_memory_usage_bytes(
     return sum(spec.max_memory_usage_bytes(vllm_config) for spec in kv_cache_specs)
 
 
+def _representative_scheduler_spec(group_spec: UniformTypeKVCacheSpecs) -> KVCacheSpec:
+    """Collapse per-layer specs without dropping fixed-prefix metadata."""
+    specs = tuple(group_spec.kv_cache_specs.values())
+    for spec in specs:
+        if spec.fixed_prefix_size_bytes > 0:
+            return spec
+    return specs[0]
+
+
 def estimate_max_model_len(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -888,6 +898,13 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
         # Encoder-only models do not have KV cache, kv_cache_type can be
         # regarded as uniform.
         return True
+    has_fixed_prefix = any(
+        spec.fixed_prefix_size_bytes > 0 for spec in kv_cache_spec.values()
+    )
+    if has_fixed_prefix and not all(
+        spec.fixed_prefix_size_bytes > 0 for spec in kv_cache_spec.values()
+    ):
+        return False
     try:
         kv_cache_spec_values = list(kv_cache_spec.values())
         _ = kv_cache_spec_values[0].merge(kv_cache_spec_values)
@@ -896,12 +913,61 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
     return True
 
 
+def _iter_group_layer_specs(group: KVCacheGroupSpec) -> Iterator[KVCacheSpec]:
+    group_spec = group.kv_cache_spec
+    if isinstance(group_spec, UniformTypeKVCacheSpecs):
+        for layer_name in group.layer_names:
+            yield group_spec.kv_cache_specs[layer_name]
+    else:
+        yield group_spec
+
+
+def _contains_deepseek_v4_atom_spec(kv_cache_config: KVCacheConfig) -> bool:
+    return any(
+        isinstance(spec, DeepseekV4AtomMLAAttentionSpec)
+        for group in kv_cache_config.kv_cache_groups
+        for spec in _iter_group_layer_specs(group)
+    )
+
+
+def _scalable_blocks_per_request(
+    vllm_config: VllmConfig, spec: KVCacheSpec
+) -> int:
+    max_memory_bytes = (
+        spec.max_memory_usage_bytes(vllm_config) - spec.fixed_prefix_size_bytes
+    )
+    assert max_memory_bytes >= 0
+    return cdiv(max_memory_bytes, spec.page_size_bytes)
+
+
+def _get_atom_max_concurrency_for_kv_cache_config(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> float:
+    max_blocks_per_request = 0
+    for group in kv_cache_config.kv_cache_groups:
+        if not group.layer_names:
+            continue
+        group_blocks = max(
+            _scalable_blocks_per_request(vllm_config, spec)
+            for spec in _iter_group_layer_specs(group)
+        )
+        max_blocks_per_request = max(max_blocks_per_request, group_blocks)
+    if max_blocks_per_request <= 0:
+        return 0.0
+    return kv_cache_config.num_blocks / max_blocks_per_request
+
+
 def get_max_concurrency_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> float:
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
+    if _contains_deepseek_v4_atom_spec(kv_cache_config):
+        return _get_atom_max_concurrency_for_kv_cache_config(
+            vllm_config, kv_cache_config
+        )
+
     num_layer_per_group = max(
         len(group.layer_names) for group in kv_cache_config.kv_cache_groups
     )
@@ -937,10 +1003,18 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
+        atom_layout = _deepseek_v4_atom_layout_bytes(kv_cache_groups)
+        if atom_layout is not None:
+            _, bytes_per_block = atom_layout
+            return bytes_per_block
         return kv_cache_groups[0].kv_cache_spec.page_size_bytes
     if all(
         isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs) for g in kv_cache_groups
     ):
+        atom_layout = _deepseek_v4_atom_layout_bytes(kv_cache_groups)
+        if atom_layout is not None:
+            _, bytes_per_block = atom_layout
+            return bytes_per_block
         # buckets = {page_size: [[layer_names], [layer_names], ...]}
         buckets = _bucket_layers_by_page_size(kv_cache_groups)
         return sum(ps * len(slots) for ps, slots in buckets.items())
@@ -1218,6 +1292,55 @@ def _bucket_layers_by_page_size(
     return buckets
 
 
+def _split_deepseek_v4_atom_layers(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> tuple[
+    list[KVCacheGroupSpec],
+    list[tuple[str, DeepseekV4AtomMLAAttentionSpec]],
+]:
+    atom_layers: list[tuple[str, DeepseekV4AtomMLAAttentionSpec]] = []
+    regular_groups: list[KVCacheGroupSpec] = []
+    for group in kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        regular_layer_names: list[str] = []
+        for layer_name in group.layer_names:
+            if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                layer_spec = group_spec.kv_cache_specs[layer_name]
+            else:
+                layer_spec = group_spec
+            if (
+                isinstance(layer_spec, DeepseekV4AtomMLAAttentionSpec)
+                and layer_spec.atom_swa_prefix_bytes > 0
+            ):
+                atom_layers.append((layer_name, layer_spec))
+            else:
+                regular_layer_names.append(layer_name)
+        if regular_layer_names:
+            regular_groups.append(
+                KVCacheGroupSpec(
+                    layer_names=regular_layer_names,
+                    kv_cache_spec=group.kv_cache_spec,
+                    is_eagle_group=group.is_eagle_group,
+                )
+            )
+    return regular_groups, atom_layers
+
+
+def _deepseek_v4_atom_layout_bytes(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> tuple[int, int] | None:
+    """Return ``(fixed_prefix_bytes, bytes_per_block)`` for ATOM KV layout."""
+    regular_groups, atom_layers = _split_deepseek_v4_atom_layers(kv_cache_groups)
+    if not atom_layers:
+        return None
+
+    buckets = _bucket_layers_by_page_size(regular_groups)
+    bytes_per_block = sum(ps * len(slots) for ps, slots in buckets.items())
+    bytes_per_block += sum(spec.page_size_bytes for _, spec in atom_layers)
+    fixed_prefix_bytes = sum(spec.atom_swa_prefix_bytes for _, spec in atom_layers)
+    return fixed_prefix_bytes, bytes_per_block
+
+
 def _get_kv_cache_config_deepseek_v4(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1229,17 +1352,39 @@ def _get_kv_cache_config_deepseek_v4(
     groups at the same slot share a tensor (they have independent block
     tables so block-id namespaces never collide).
     """
-    # buckets = {page_size: [[layer_names], [layer_names], ...]}
-    buckets = _bucket_layers_by_page_size(kv_cache_groups)
-    total_num_bytes_per_block = sum(ps * len(slots) for ps, slots in buckets.items())
+    regular_groups, atom_layers = _split_deepseek_v4_atom_layers(kv_cache_groups)
 
-    num_blocks = available_memory // total_num_bytes_per_block
+    # buckets = {page_size: [[layer_names], [layer_names], ...]}
+    buckets = _bucket_layers_by_page_size(regular_groups)
+    total_num_bytes_per_block = sum(ps * len(slots) for ps, slots in buckets.items())
+    total_num_bytes_per_block += sum(spec.page_size_bytes for _, spec in atom_layers)
+    total_prefix_bytes = sum(spec.atom_swa_prefix_bytes for _, spec in atom_layers)
+
+    if total_num_bytes_per_block <= 0:
+        raise ValueError("DeepseekV4 KV cache config has no allocatable layers.")
+
+    available_for_blocks = available_memory - total_prefix_bytes
+    if available_for_blocks <= 0:
+        raise ValueError(
+            "Insufficient KV cache memory for DeepSeek-V4 ATOM SWA prefixes: "
+            f"available={available_memory}, prefixes={total_prefix_bytes}."
+        )
+
+    num_blocks = available_for_blocks // total_num_bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
     kv_cache_tensors: list[KVCacheTensor] = []
     for ps, slots in buckets.items():
         for slot in slots:
             kv_cache_tensors.append(KVCacheTensor(size=ps * num_blocks, shared_by=slot))
+    for layer_name, spec in atom_layers:
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=spec.atom_swa_prefix_bytes + spec.page_size_bytes * num_blocks,
+                shared_by=[layer_name],
+                fixed_prefix_size=spec.atom_swa_prefix_bytes,
+            )
+        )
 
     return num_blocks, kv_cache_tensors
 
@@ -1270,7 +1415,15 @@ def get_kv_cache_config_from_groups(
         )
 
     # Determine how model runners should initialize the KV cache tensors.
-    if len(kv_cache_groups) == 1 and isinstance(
+    if _deepseek_v4_atom_layout_bytes(kv_cache_groups) is not None:
+        # DeepseekV4 ATOM unified KV needs per-layer fixed SWA prefixes in
+        # front of the paged compressed tails. This is independent of whether
+        # the core grouping path represented the layer set as a
+        # UniformTypeKVCacheSpecs group or as a single concrete ATOM spec.
+        num_blocks, kv_cache_tensors = _get_kv_cache_config_deepseek_v4(
+            vllm_config, kv_cache_groups, available_memory
+        )
+    elif len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         # Special case: all layers have the same type of KV cache but with
@@ -1517,6 +1670,34 @@ def _get_kv_cache_groups_uniform_groups(
         isinstance(spec, MLAAttentionSpec)
         for spec in full_mla_spec.kv_cache_specs.values()
     )
+    swa_mla_specs = grouped_specs[1:]
+    assert all(
+        isinstance(spec, SlidingWindowMLASpec)
+        for group in swa_mla_specs
+        for spec in group.kv_cache_specs.values()
+    )
+
+    # DeepSeekV4 groups SWA/state pages by padding them to one of the full-MLA
+    # tuple page sizes. ROCm ATOM mixed KV can make the full-MLA page set no
+    # longer dominate every SWA/state page size, so pad the largest full-MLA
+    # page upward first and keep the same tuple layout.
+    if swa_mla_specs:
+        full_page_sizes = full_mla_spec.get_page_sizes()
+        max_full_page_size = max(full_page_sizes)
+        max_swa_page_size = max(
+            page_size
+            for group in swa_mla_specs
+            for page_size in group.get_page_sizes()
+        )
+        if max_swa_page_size > max_full_page_size:
+            for layer_spec in full_mla_spec.kv_cache_specs.values():
+                if layer_spec.page_size_bytes == max_full_page_size:
+                    object.__setattr__(
+                        layer_spec,
+                        "page_size_padded",
+                        max_swa_page_size,
+                    )
+                    break
     full_mla_group = KVCacheGroupSpec(
         layer_names=list(full_mla_spec.kv_cache_specs.keys()),
         kv_cache_spec=full_mla_spec,
@@ -1540,13 +1721,6 @@ def _get_kv_cache_groups_uniform_groups(
     num_layer_tuples_per_group = [
         round_up(x, num_layer_tuples) for x in num_layer_tuples_per_group
     ]
-
-    swa_mla_specs = grouped_specs[1:]
-    assert all(
-        isinstance(spec, SlidingWindowMLASpec)
-        for group in swa_mla_specs
-        for spec in group.kv_cache_specs.values()
-    )
 
     # Split each SWA UniformKV group into smaller groups to align their #(layer tuples)
     # Possibly padding layer tuples for this.
@@ -1709,11 +1883,7 @@ def generate_scheduler_kv_cache_config(
     cfg = copy.deepcopy(kv_cache_configs[0])
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
-            # All layers in the UniformTypeKVCacheSpecs have the same type,
-            # so use an arbitrary one to initialize the scheduler.
-            group.kv_cache_spec = next(
-                iter(group.kv_cache_spec.kv_cache_specs.values())
-            )
+            group.kv_cache_spec = _representative_scheduler_spec(group.kv_cache_spec)
     return cfg
 
 
@@ -1743,6 +1913,27 @@ def _max_memory_usage_bytes_from_groups(
     """
     if not kv_cache_groups:
         return 0
+
+    atom_layout = _deepseek_v4_atom_layout_bytes(kv_cache_groups)
+    if atom_layout is not None:
+        fixed_prefix_bytes, bytes_per_block = atom_layout
+        max_pages = 0
+        for group in kv_cache_groups:
+            group_spec = group.kv_cache_spec
+            for layer_name in group.layer_names:
+                if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                    spec = group_spec.kv_cache_specs[layer_name]
+                else:
+                    spec = group_spec
+                max_bytes = spec.max_memory_usage_bytes(vllm_config)
+                max_pages = max(
+                    max_pages,
+                    cdiv(
+                        max_bytes - spec.fixed_prefix_size_bytes,
+                        spec.page_size_bytes,
+                    ),
+                )
+        return fixed_prefix_bytes + max_pages * bytes_per_block
 
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
@@ -2013,12 +2204,17 @@ def get_kv_cache_configs(
                 adjusted_memory.append(avail_mem)
                 continue
             bytes_per_block = _pool_bytes_per_block(groups)
+            fixed_prefix_bytes = 0
+            atom_layout = _deepseek_v4_atom_layout_bytes(groups)
+            if atom_layout is not None:
+                fixed_prefix_bytes = atom_layout[0]
+            scalable_memory = max(0, avail_mem - fixed_prefix_bytes)
             logger.info(
                 "Overriding num_gpu_blocks=%d with num_gpu_blocks_override=%d",
-                avail_mem // bytes_per_block,
+                scalable_memory // bytes_per_block,
                 override,
             )
-            adjusted_memory.append(override * bytes_per_block)
+            adjusted_memory.append(fixed_prefix_bytes + override * bytes_per_block)
         available_memory = adjusted_memory
 
     if vllm_config.model_config.original_max_model_len == -1:
@@ -2062,8 +2258,14 @@ def get_kv_cache_configs(
 
         # Shrink tensor size proportionally
         for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+            fixed_prefix_size = getattr(tensor, "fixed_prefix_size", 0)
+            scalable_size = tensor.size - fixed_prefix_size
+            assert scalable_size >= 0
+            assert scalable_size % num_blocks_old == 0
+            tensor.size = (
+                fixed_prefix_size
+                + scalable_size // num_blocks_old * min_num_blocks
+            )
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             max_model_len = vllm_config.model_config.max_model_len

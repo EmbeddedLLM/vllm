@@ -184,22 +184,35 @@ def _reshape_kv_cache(
         if group.kv_cache_group_id >= len(kernel_block_sizes):
             continue
 
-        kv_cache_spec = group.kv_cache_spec
-        if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-            # use storage_block_size as the kernel block size for groups
-            # that apply a compression on block size (eg. DeepSeek V4).
-            kernel_block_size = kv_cache_spec.storage_block_size
-        else:
-            kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
+        group_kv_cache_spec = group.kv_cache_spec
 
         for layer_name in group.layer_names:
             if layer_name in shared_kv_cache_layers:
                 # Shared layer — tensor will be aliased to its target later.
                 continue
 
+            if isinstance(group_kv_cache_spec, UniformTypeKVCacheSpecs):
+                kv_cache_spec = group_kv_cache_spec.kv_cache_specs[layer_name]
+            else:
+                kv_cache_spec = group_kv_cache_spec
+
+            if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
+                # use storage_block_size as the kernel block size for groups
+                # that apply a compression on block size (eg. DeepSeek V4).
+                kernel_block_size = kv_cache_spec.storage_block_size
+            else:
+                kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
+
             kv_raw_tensor = kv_cache_raw_tensors[layer_name]
-            assert kv_raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-            num_blocks = kv_raw_tensor.numel() // kv_cache_spec.page_size_bytes
+            prefix_bytes = kv_cache_spec.fixed_prefix_size_bytes
+            assert prefix_bytes >= 0
+            assert kv_raw_tensor.numel() >= prefix_bytes
+            assert (kv_raw_tensor.numel() - prefix_bytes) % (
+                kv_cache_spec.page_size_bytes
+            ) == 0
+            num_blocks = (
+                kv_raw_tensor.numel() - prefix_bytes
+            ) // kv_cache_spec.page_size_bytes
 
             if isinstance(kv_cache_spec, AttentionSpec):
                 has_attn = True
@@ -210,12 +223,15 @@ def _reshape_kv_cache(
                     kv_cache_spec.storage_block_size // kernel_block_size
                 )
                 kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+                layer_cache_dtype = getattr(
+                    kv_cache_spec, "cache_dtype_str", None
+                ) or cache_dtype
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
                     kernel_block_size,
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
-                    cache_dtype_str=cache_dtype,
+                    cache_dtype_str=layer_cache_dtype,
                 )
 
                 # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
@@ -232,11 +248,11 @@ def _reshape_kv_cache(
                 ]
 
                 dtype = kv_cache_spec.dtype
-                kv_tensor = kv_raw_tensor.view(dtype)
-                if kv_cache_spec.page_size_padded is not None:
-                    # Use strided view to handle page_size_bytes that
-                    # include padding. This follows the same pattern as
-                    # MambaSpec handling in gpu_model_runner.py.
+                kv_tensor = kv_raw_tensor[prefix_bytes:].view(dtype)
+                if kv_cache_spec.requires_strided_kv_cache_view:
+                    # Use strided view to handle page_size_bytes that include
+                    # padding or a spec-defined fixed tail. This follows the
+                    # same pattern as MambaSpec handling in gpu_model_runner.py.
                     # NOTE: This assumes kv_cache_shape[0] == num_blocks
                     # (i.e. the first physical dimension is the block
                     # index), which holds for all current backends
@@ -245,6 +261,11 @@ def _reshape_kv_cache(
                     page_stride = kv_cache_spec.page_size_bytes // dtype_size
                     strides = list(torch.empty(kv_cache_shape).stride())
                     strides[inv_order[0]] = page_stride
+                    inner_block_stride_bytes = kv_cache_spec.inner_block_stride_bytes
+                    if inner_block_stride_bytes is not None:
+                        strides[inv_order[1]] = (
+                            inner_block_stride_bytes // dtype_size
+                        )
                     kv_cache = torch.as_strided(
                         kv_tensor,
                         size=kv_cache_shape,
@@ -252,7 +273,19 @@ def _reshape_kv_cache(
                     )
                 else:
                     # No padding — safe to use a contiguous view.
-                    kv_cache = kv_tensor.view(kv_cache_shape)
+                    try:
+                        kv_cache = kv_tensor.view(kv_cache_shape)
+                    except RuntimeError as e:
+                        raise RuntimeError(
+                            "Failed to reshape KV cache for layer "
+                            f"{layer_name}: shape={kv_cache_shape}, "
+                            f"kv_tensor_numel={kv_tensor.numel()}, "
+                            f"spec={kv_cache_spec!r}, "
+                            f"prefix_bytes={prefix_bytes}, "
+                            f"raw_numel={kv_raw_tensor.numel()}, "
+                            f"cache_dtype={cache_dtype}, "
+                            f"layer_cache_dtype={layer_cache_dtype}"
+                        ) from e
                 kv_caches[layer_name] = kv_cache.permute(*inv_order)
 
             elif isinstance(kv_cache_spec, MambaSpec):

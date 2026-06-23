@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 
 import torch
@@ -30,6 +31,11 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
+_ATOM_ROCM_DSV4_ENABLED = current_platform.is_rocm() and (
+    os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION", "0") == "1"
+    or os.environ.get("VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR", "0") == "1"
+    or os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV", "0") == "1"
+)
 
 
 @triton.jit
@@ -162,6 +168,8 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        if _ATOM_ROCM_DSV4_ENABLED:
+            return [128, 256]
         return [256]
 
 

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from typing import ClassVar, cast
 
@@ -31,6 +32,45 @@ from vllm.v1.kv_cache_interface import (
 _LAYER_TYPE_SWAONLY = "swaonly"
 _LAYER_TYPE_C4A = "c4a"
 _LAYER_TYPE_C128A = "c128a"
+_ATOM_ROCM_DSV4_ENABLED = current_platform.is_rocm() and (
+    os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION", "0") == "1"
+    or os.environ.get("VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR", "0") == "1"
+    or os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV", "0") == "1"
+)
+_ATOM_ATTENTION_ENABLED = (
+    current_platform.is_rocm()
+    and os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION", "0") == "1"
+)
+_ATOM_ATTENTION_RATIOS = frozenset(
+    part.strip()
+    for part in os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION_RATIOS", "").split(",")
+    if part.strip()
+)
+_ATOM_ATTENTION_LAYERS = frozenset(
+    part.strip()
+    for part in os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION_LAYERS", "").split(",")
+    if part.strip()
+)
+_ATOM_RETURN_FALSE_AT_ENTRY = (
+    os.environ.get("VLLM_ROCM_DSV4_ATOM_RETURN_FALSE_AT_ENTRY", "0") == "1"
+)
+_ATOM_SKIP_DECODE_INDEX_WRITE = (
+    os.environ.get("VLLM_ROCM_DSV4_ATOM_SKIP_DECODE_INDEX_WRITE", "0") == "1"
+)
+
+
+def _atom_can_skip_legacy_decode_metadata() -> bool:
+    return (
+        _ATOM_ATTENTION_ENABLED
+        and not _ATOM_ATTENTION_RATIOS
+        and not _ATOM_ATTENTION_LAYERS
+        and not _ATOM_RETURN_FALSE_AT_ENTRY
+        and not _ATOM_SKIP_DECODE_INDEX_WRITE
+    )
+
+
+def _rocm_atom_dsv4_enabled() -> bool:
+    return _ATOM_ROCM_DSV4_ENABLED
 
 
 def _layer_type_for(compress_ratio: int) -> str:
@@ -69,10 +109,15 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
 
         # Block size is constrained by tensor sharing between SWA and C4A KV blocks.
         # Since both block types share the same physical tensor, they must use the
-        # same page size. The C4A KV block shape [256//4, head_dim] = [64, head_dim]
-        # determines the SWA block size of 64 tokens per block.
+        # same page size. The C4A KV block shape [block_size//4, head_dim] determines
+        # the SWA page size. vLLM's original DSV4 path uses block_size=256 -> 64.
+        # ATOM's DSV4 path uses block_size=128 -> 32.
         # TODO(yifan): make SWA block size automatically determined and configurable.
-        self.block_size = 64
+        self.block_size = (
+            max(1, cache_config.block_size // 4)
+            if _rocm_atom_dsv4_enabled()
+            else 64
+        )
         # uint8: legacy FlashMLA UE8M0 paged layout. bfloat16 / float8_e4m3fn:
         # FlashInfer contiguous full-cache layout.
         assert self.dtype in (torch.uint8, torch.bfloat16, torch.float8_e4m3fn)
@@ -105,7 +150,7 @@ class DeepseekSparseSWABackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [MultipleOf(64)]
+        return [MultipleOf(32)]
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
@@ -301,7 +346,12 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         is_valid_token.copy_(slot_mapping >= 0)
 
-        if num_decode_tokens > 0:
+        build_decode_swa = not (
+            num_decode_tokens > 0
+            and num_prefill_tokens == 0
+            and _atom_can_skip_legacy_decode_metadata()
+        )
+        if num_decode_tokens > 0 and build_decode_swa:
             self.decode_swa_lens[num_decode_tokens:] = 0
             _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
                 self.decode_swa_indices,
@@ -340,8 +390,14 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             slot_mapping=slot_mapping,
             is_valid_token=is_valid_token,
             token_to_req_indices=token_to_req_indices,
-            decode_swa_indices=self.decode_swa_indices[:num_decode_tokens],
-            decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
+            decode_swa_indices=(
+                self.decode_swa_indices[:num_decode_tokens]
+                if build_decode_swa
+                else None
+            ),
+            decode_swa_lens=(
+                self.decode_swa_lens[:num_decode_tokens] if build_decode_swa else None
+            ),
             block_size=self.block_size,
             num_decodes=num_decodes,
             num_prefills=num_prefills,

@@ -39,6 +39,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len, get_kv_cache_configs
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    DeepseekV4AtomMLAAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -52,7 +53,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.worker.utils import select_common_block_size
+from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
@@ -138,6 +139,110 @@ def model_runner():
 
 
 model_runner_2 = model_runner
+
+
+class _AtomPackedMLATestBackend:
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        *,
+        cache_dtype_str: str | None = None,
+    ) -> tuple[int, int, int]:
+        assert num_kv_heads == 1
+        if cache_dtype_str == "fp8_ds_mla":
+            return (num_blocks, block_size, 584)
+        return (num_blocks, block_size, head_size)
+
+
+def _reshape_only_runner(groups: list[AttentionGroup]) -> GPUModelRunner:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.runner_only_attn_layers = set()
+    runner.cache_config = SimpleNamespace(cache_dtype="auto")
+    runner._kv_cache_spec_attn_group_iterator = lambda: iter(groups)
+    return runner
+
+
+def test_gpu_model_runner_reshape_atom_packed_fp8_tail_keeps_prefix():
+    atom = DeepseekV4AtomMLAAttentionSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        compress_ratio=4,
+        cache_dtype_str="fp8_ds_mla",
+        model_version="deepseek_v4",
+        atom_swa_prefix_bytes=128,
+        atom_swa_pages=1,
+        atom_compressed_kv_dtype=torch.uint8,
+        atom_compressed_layout="fp8_ds_mla",
+    )
+    raw = torch.zeros(
+        atom.atom_swa_prefix_bytes + 3 * atom.page_size_bytes,
+        dtype=torch.int8,
+    )
+    raw[atom.atom_swa_prefix_bytes + atom.page_size_bytes] = 11
+    group = AttentionGroup(
+        backend=_AtomPackedMLATestBackend,  # type: ignore[arg-type]
+        layer_names=["atom"],
+        kv_cache_spec=atom,
+        kv_cache_group_id=0,
+    )
+    runner = _reshape_only_runner([group])
+
+    kv_caches = runner._reshape_kv_cache_tensors(
+        {"atom": raw},
+        kernel_block_sizes=[atom.storage_block_size],
+    )
+
+    kv_cache = kv_caches["atom"]
+    assert kv_cache.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
+    assert kv_cache.storage_offset() == atom.atom_swa_prefix_bytes
+    assert atom.real_page_size_bytes == atom.storage_block_size * 584
+    assert kv_cache.shape == (3, atom.storage_block_size, 584)
+    assert kv_cache.dtype == torch.uint8
+    assert kv_cache.stride(0) == atom.page_size_bytes
+    assert int(kv_cache[1, 0, 0]) == 11
+
+
+def test_gpu_model_runner_reshape_atom_sidecar_scale_tail_strides():
+    atom = DeepseekV4AtomMLAAttentionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.uint8,
+        atom_swa_prefix_bytes=100,
+        atom_swa_pages=5,
+        atom_compressed_kv_dtype=torch.uint8,
+        atom_compressed_scale_dtype=torch.float32,
+        atom_compressed_scale_bytes_per_page=16,
+    )
+    raw = torch.zeros(
+        atom.atom_swa_prefix_bytes + 2 * atom.page_size_bytes,
+        dtype=torch.int8,
+    )
+    raw[atom.atom_swa_prefix_bytes + atom.page_size_bytes] = 7
+    group = AttentionGroup(
+        backend=_AtomPackedMLATestBackend,  # type: ignore[arg-type]
+        layer_names=["atom"],
+        kv_cache_spec=atom,
+        kv_cache_group_id=0,
+    )
+    runner = _reshape_only_runner([group])
+
+    kv_caches = runner._reshape_kv_cache_tensors(
+        {"atom": raw},
+        kernel_block_sizes=[atom.block_size],
+    )
+
+    kv_cache = kv_caches["atom"]
+    assert kv_cache.storage_offset() == atom.atom_swa_prefix_bytes
+    assert kv_cache.shape == (2, 4, 8)
+    assert kv_cache.stride(0) == atom.page_size_bytes
+    assert kv_cache.stride(1) == 8 + atom.atom_compressed_scale_bytes_per_page
+    assert int(kv_cache[1, 0, 0]) == 7
 
 
 def _schedule_new_request(*req_ids: str) -> SchedulerOutput:

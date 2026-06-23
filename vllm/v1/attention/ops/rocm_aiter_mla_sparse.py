@@ -784,6 +784,12 @@ def rocm_aiter_sparse_attn_indexer(
             skip_k_cache_insert,
         )
     layer_attn_metadata = attn_metadata[k_cache_prefix]
+    if not isinstance(layer_attn_metadata, DeepseekV32IndexerMetadata):
+        indexer_metadata_alias = attn_metadata.get(
+            k_cache_prefix + ".__rocm_atom_indexer_metadata"
+        )
+        if isinstance(indexer_metadata_alias, DeepseekV32IndexerMetadata):
+            layer_attn_metadata = indexer_metadata_alias
     assert isinstance(layer_attn_metadata, DeepseekV32IndexerMetadata)
     assert topk_indices_buffer is not None
     assert scale_fmt is not None

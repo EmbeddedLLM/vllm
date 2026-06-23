@@ -23,7 +23,10 @@ from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
-from vllm.models.deepseek_v4.common.ops import fused_indexer_q_rope_quant
+from vllm.models.deepseek_v4.common.ops import (
+    fused_indexer_q_rope_quant,
+    scale_indexer_weights,
+)
 from vllm.utils.import_utils import has_cutedsl
 
 HEAD_DIM = 128
@@ -194,3 +197,21 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
         f"weights mismatch: max abs diff "
         f"{(weights_ref - weights_fused).abs().max().item()}"
     )
+
+
+@pytest.mark.parametrize("num_tokens", [0, 1, 17, 257])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_scale_indexer_weights_matches_atom_formula(num_tokens, dtype):
+    device = "cuda"
+    torch.manual_seed(1)
+
+    weights = torch.randn(num_tokens, N_HEAD, dtype=dtype, device=device)
+    q_scale = torch.rand(num_tokens, N_HEAD, 1, dtype=torch.float32, device=device)
+    weights_scale = 0.125
+
+    actual = scale_indexer_weights(weights, q_scale, weights_scale)
+    expected = weights.to(torch.float32) * q_scale.squeeze(-1) * weights_scale
+
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, expected)
