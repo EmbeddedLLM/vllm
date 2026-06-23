@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -55,12 +57,12 @@ import torch
 import triton
 import triton.language as tl
 
-_ATOM_DECODE_KV_SPLITS_OVERRIDE = os.environ.get(
-    "VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS"
+_ATOM_DECODE_KV_SPLITS_OVERRIDE = os.environ.get("VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS")
+_ATOM_DECODE_SPLIT_WORKSPACE = (
+    os.environ.get("VLLM_ROCM_DSV4_ATOM_DECODE_SPLIT_WORKSPACE", "torch_empty")
+    .strip()
+    .lower()
 )
-_ATOM_DECODE_SPLIT_WORKSPACE = os.environ.get(
-    "VLLM_ROCM_DSV4_ATOM_DECODE_SPLIT_WORKSPACE", "torch_empty"
-).strip().lower()
 _ATOM_USE_TRITON_ATTN = os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1"
 _ATOM_DECODE_TRUST_INDICES = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_DECODE_TRUST_INDICES", "1") != "0"
@@ -69,16 +71,17 @@ _ATOM_USE_AITER_PA_DECODE = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_USE_AITER_PA_DECODE", "0") == "1"
 )
 try:
-    from aiter.ops.triton.attention.pa_decode_sparse import (
-        pa_decode_sparse as _aiter_pa_decode_sparse,
-    )
     from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
         _pa_decode_sparse as _aiter_pa_decode_sparse_kernel,
+    )
+    from aiter.ops.triton.attention.pa_decode_sparse import (
+        pa_decode_sparse as _aiter_pa_decode_sparse,
     )
 except Exception:
     _aiter_pa_decode_sparse = None
     _aiter_pa_decode_sparse_kernel = None
 from aiter.ops.triton.utils.device_info import get_num_sms
+
 from vllm.models.deepseek_v4.amd.v4_kernels.reference import (
     sparse_attn_ragged_torch,
 )
@@ -188,9 +191,7 @@ def _aiter_pa_decode_sparse_reduce_zero_safe(
         + k_offs[:, None, None] * ap_stride_k
         + h_offs[None, :, None] * ap_stride_h
         + d_offs[None, None, :] * ap_stride_d,
-        mask=segm_mask[:, None, None]
-        & h_mask[None, :, None]
-        & d_mask[None, None, :],
+        mask=segm_mask[:, None, None] & h_mask[None, :, None] & d_mask[None, None, :],
         other=0.0,
     )
 
@@ -199,9 +200,7 @@ def _aiter_pa_decode_sparse_reduce_zero_safe(
     l_combined = tl.sum(l_p * alpha_split, axis=0)
     acc_combined = tl.sum(a_p * alpha_split[:, :, None], axis=0)
 
-    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(
-        tl.float32
-    )
+    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
     m_final = tl.maximum(m_max, sink)
     alpha_kv = tl.exp(m_max - m_final)
     alpha_sink = tl.exp(sink - m_final)
@@ -509,9 +508,7 @@ def _paged_decode_fused_kernel(
             # [BLOCK_K, BLOCK_D] scales tile but in IR is a coalesced
             # NUM_GROUPS-wide load per row.
             scales_full = tl.load(
-                kv_scales_ptr
-                + safe_slot[:, None] * ks_stride_n
-                + g_idx_per_d[None, :],
+                kv_scales_ptr + safe_slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
                 mask=slot_valid[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(q.dtype)
@@ -698,9 +695,7 @@ def _paged_decode_split_kv_fused_kernel(
                 & (csa_block_idx >= 0)
                 & (csa_block_idx < csa_block_table_stride)
             )
-            safe_csa_bid = tl.minimum(
-                tl.maximum(csa_bid, 0), csa_block_table_rows - 1
-            )
+            safe_csa_bid = tl.minimum(tl.maximum(csa_bid, 0), csa_block_table_rows - 1)
             safe_csa_block_idx = tl.minimum(
                 tl.maximum(csa_block_idx, 0), csa_block_table_stride - 1
             )
@@ -1200,9 +1195,7 @@ def _paged_decode_split_kernel(
         )
         if QUANT_KV:
             scales_full = tl.load(
-                kv_scales_ptr
-                + safe_slot[:, None] * ks_stride_n
-                + g_idx_per_d[None, :],
+                kv_scales_ptr + safe_slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
                 mask=slot_valid[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(q.dtype)
@@ -1680,8 +1673,9 @@ def sparse_attn_v4_paged_decode_reference(
         n = int(spans[t].item())
         if n > 0:
             topk_idxs[t, :n] = kv_indices[s : s + n].to(torch.int32)
-    result = sparse_attn_ragged_torch(q, unified_kv, attn_sink, topk_idxs,
-                                      softmax_scale)
+    result = sparse_attn_ragged_torch(
+        q, unified_kv, attn_sink, topk_idxs, softmax_scale
+    )
     if out is not None:
         out.copy_(result)
         return out
@@ -1718,10 +1712,10 @@ def _dequantize_packed_fp8_ds_mla_reference(
         for slot in range(block_size):
             page = block * block_size + slot
             data_start = slot * _PACKED_TOKEN_DATA_SIZE
-            scale_start = block_size * _PACKED_TOKEN_DATA_SIZE + slot * _PACKED_SCALE_DIM
-            fp8_bytes = block_bytes[
-                block, data_start : data_start + _PACKED_FP8_DIM
-            ]
+            scale_start = (
+                block_size * _PACKED_TOKEN_DATA_SIZE + slot * _PACKED_SCALE_DIM
+            )
+            fp8_bytes = block_bytes[block, data_start : data_start + _PACKED_FP8_DIM]
             fp8_vals = fp8_bytes.view(fp8_dtype).to(torch.float32)
             encoded = block_bytes[
                 block, scale_start : scale_start + (_PACKED_FP8_DIM // 64)
@@ -1766,9 +1760,7 @@ def sparse_attn_v4_paged_decode_split_kv_reference(
     pointers per slot without materialization.
     """
     if q.dtype not in (torch.bfloat16, torch.float16):
-        raise RuntimeError(
-            f"split KV reference expects fp16/bf16 q, got {q.dtype}"
-        )
+        raise RuntimeError(f"split KV reference expects fp16/bf16 q, got {q.dtype}")
     if swa_pages <= 0:
         raise RuntimeError(f"Invalid swa_pages={swa_pages}")
 
@@ -1793,8 +1785,7 @@ def sparse_attn_v4_paged_decode_split_kv_reference(
             )
     elif compressed_kv.shape[-1] != D:
         raise RuntimeError(
-            "compressed_kv last dim "
-            f"{compressed_kv.shape[-1]} does not match q dim {D}"
+            f"compressed_kv last dim {compressed_kv.shape[-1]} does not match q dim {D}"
         )
 
     swa_flat = swa_kv.reshape(-1, D)
@@ -1828,8 +1819,7 @@ def sparse_attn_v4_paged_decode_split_kv_reference(
             )
         if compressed_kv_scales.dtype != torch.float32:
             raise RuntimeError(
-                "compressed_kv_scales must be fp32, got "
-                f"{compressed_kv_scales.dtype}"
+                f"compressed_kv_scales must be fp32, got {compressed_kv_scales.dtype}"
             )
         if D % _FP8_GROUP_SIZE != 0:
             raise RuntimeError(
@@ -2130,9 +2120,7 @@ def sparse_attn_v4_paged_decode_split_kv(
             d_chunks_needed = max(1, target_reduce_wg // base_grid_t_h)
             d_chunks_needed = min(d_chunks_needed, block_d // 32)
             d_chunk = max(32, triton.next_power_of_2(block_d // d_chunks_needed))
-        _paged_decode_reduce_kernel[
-            (T, H, (D + d_chunk - 1) // d_chunk)
-        ](
+        _paged_decode_reduce_kernel[(T, H, (D + d_chunk - 1) // d_chunk)](
             m_partial,
             l_partial,
             acc_partial,

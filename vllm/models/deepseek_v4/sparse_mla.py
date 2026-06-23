@@ -277,8 +277,7 @@ class DeepseekV4FlashMLAMetadataBuilder(
             return False, call
         printed_count = call - _ATOM_PROFILE_METADATA_START_AFTER
         return (
-            printed_count <= 16
-            or printed_count % _ATOM_PROFILE_METADATA_EVERY == 0,
+            printed_count <= 16 or printed_count % _ATOM_PROFILE_METADATA_EVERY == 0,
             call,
         )
 

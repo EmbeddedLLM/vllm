@@ -457,24 +457,24 @@ Validation:
   vllm/models/deepseek_v4/amd/rocm.py
   vllm/models/deepseek_v4/compressor.py`
 - Default graph-mode accuracy after cleanup:
-  - Server:
+    - Server:
     `MAX_NUM_SEQS=256 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192`
     `GPU_MEMORY_UTILIZATION=0.9 bash launchdeepseekgraph.sh`
-  - Unchanged `lmeval.sh`
-  - GSM8K flexible: `0.9507 +/- 0.0060`
-  - GSM8K strict: `0.9515 +/- 0.0059`
+    - Unchanged `lmeval.sh`
+    - GSM8K flexible: `0.9507 +/- 0.0060`
+    - GSM8K strict: `0.9515 +/- 0.0059`
 - Fresh default C32 benchmark after cleanup:
-  - Server:
+    - Server:
     `MAX_NUM_SEQS=32 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192`
     `GPU_MEMORY_UTILIZATION=0.9 bash launchdeepseekgraph.sh`
-  - Result file:
+    - Result file:
     `bench-metadata-cleanup-c32/metadata-cleanup-c32-C32.json`
-  - Completed: `320`
-  - Failed: `0`
-  - Output throughput: `867.3439657962101 tok/s`
-  - Total throughput: `1738.0759939588118 tok/s`
-  - Mean TPOT: `35.89698607919532 ms`
-  - Mean TTFT: `1050.674704555422 ms`
+    - Completed: `320`
+    - Failed: `0`
+    - Output throughput: `867.3439657962101 tok/s`
+    - Total throughput: `1738.0759939588118 tok/s`
+    - Mean TPOT: `35.89698607919532 ms`
+    - Mean TTFT: `1050.674704555422 ms`
 
 This is essentially tied with the recent default-gated C32 run
 (`870.3875757954914 tok/s`, `35.80374276777991 ms` TPOT), slower than the
@@ -1351,16 +1351,16 @@ Validation:
   `MAX_NUM_SEQS=256 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192
   GPU_MEMORY_UTILIZATION=0.9 bash launchdeepseekgraph.sh`
 - Unchanged `lmeval.sh`:
-  - GSM8K flexible-extract exact match: `0.9530 +/- 0.0058`
-  - GSM8K strict-match exact match: `0.9538 +/- 0.0058`
+    - GSM8K flexible-extract exact match: `0.9530 +/- 0.0058`
+    - GSM8K strict-match exact match: `0.9538 +/- 0.0058`
 - Fresh C32 benchmark after restarting the server with `MAX_NUM_SEQS=32`:
-  - result file:
+    - result file:
     `bench-sparsemla/ds-v4-pro-nomtp-skip-legacy-decode-metadata-C32.json`
-  - log file: `runlogs/skip-legacy-decode-metadata-benchmark-c32.log`
-  - output throughput: `867.4619146726486 tok/s`
-  - total throughput: `1738.3123536264501 tok/s`
-  - mean TPOT: `35.91196604007207 ms`
-  - failed requests: `0`
+    - log file: `runlogs/skip-legacy-decode-metadata-benchmark-c32.log`
+    - output throughput: `867.4619146726486 tok/s`
+    - total throughput: `1738.3123536264501 tok/s`
+    - mean TPOT: `35.91196604007207 ms`
+    - failed requests: `0`
 
 Comparison:
 
@@ -1557,9 +1557,9 @@ Local compatibility optimization added after this audit:
   `python3 -m pytest tests/v1/worker/test_utils.py::test_reshape_kv_cache_atom_packed_fp8_tail_keeps_584_byte_slots tests/v1/worker/test_utils.py::test_deepseek_v4_post_bind_exposes_packed_atom_split_view tests/v1/core/test_kv_cache_utils.py::test_atom_mla_packed_fp8_tail_uses_dsv4_584_byte_pages tests/v1/core/test_kv_cache_utils.py::test_scheduler_atom_mla_preserves_packed_fp8_tail_contract -q`
   returned `4 passed`.
 - GPU synthetic validation after the scale-load change:
-  - packed split-KV decode versus split-KV reference:
+    - packed split-KV decode versus split-KV reference:
     max absolute diff `0.001953125`, finite outputs on both sides;
-  - packed split-KV prefill versus materialized-unified prefill reference:
+    - packed split-KV prefill versus materialized-unified prefill reference:
     max absolute diff `0.001953125`, finite outputs on both sides.
 - Fresh C32 benchmark after restarting the server with packed FP8 ATOM KV and
   the scale-load optimization:
@@ -1675,10 +1675,10 @@ Static checks:
 Small graph-mode smoke:
 
 - Server:
-  - `MAX_NUM_SEQS=4`
-  - `MAX_NUM_BATCHED_TOKENS=1024`
-  - `MAX_MODEL_LEN=2048`
-  - `ENFORCE_EAGER=0`
+    - `MAX_NUM_SEQS=4`
+    - `MAX_NUM_BATCHED_TOKENS=1024`
+    - `MAX_MODEL_LEN=2048`
+    - `ENFORCE_EAGER=0`
 - Health passed.
 - One `/v1/completions` request succeeded.
 - Logs confirmed V2 runner, breakable CUDA graph, and vLLM-owned ATOM unified
@@ -1687,52 +1687,52 @@ Small graph-mode smoke:
 Full accuracy:
 
 - Server:
-  - `MAX_NUM_SEQS=256`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - `ENFORCE_EAGER=0`
+    - `MAX_NUM_SEQS=256`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - `ENFORCE_EAGER=0`
 - Accuracy command:
-  - unchanged `bash lmeval.sh`
+    - unchanged `bash lmeval.sh`
 - Result file:
-  - `results_deepseekprographmtp_aitermhc_nobreakablecudagraph/deepseek-ai__DeepSeek-V4-Pro/results_2026-06-19T20-59-27.515513.json`
+    - `results_deepseekprographmtp_aitermhc_nobreakablecudagraph/deepseek-ai__DeepSeek-V4-Pro/results_2026-06-19T20-59-27.515513.json`
 - GSM8K:
-  - flexible exact match: `0.9553 +/- 0.0057`
-  - strict exact match: `0.9568 +/- 0.0056`
+    - flexible exact match: `0.9553 +/- 0.0057`
+    - strict exact match: `0.9568 +/- 0.0056`
 - This passes the requested `0.95 +/- 0.01` accuracy band.
 
 Fresh C32 benchmark after restarting the server:
 
 - Server:
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - `ENFORCE_EAGER=0`
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - `ENFORCE_EAGER=0`
 - Benchmark command:
-  - `RESULT_PREFIX=no-direct-csa-translate CONCURRENCIES=32 bash benchmarkvllm.sh`
+    - `RESULT_PREFIX=no-direct-csa-translate CONCURRENCIES=32 bash benchmarkvllm.sh`
 - Result file:
-  - `bench-sparsemla/no-direct-csa-translate-C32.json`
+    - `bench-sparsemla/no-direct-csa-translate-C32.json`
 - C32 result:
-  - completed `320`
-  - failed `0`
-  - output throughput: `885.16 tok/s`
-  - total throughput: `1773.77 tok/s`
-  - mean TPOT: `35.17 ms`
-  - median TPOT: `35.15 ms`
-  - p99 TPOT: `35.96 ms`
-  - mean TTFT: `1032.04 ms`
+    - completed `320`
+    - failed `0`
+    - output throughput: `885.16 tok/s`
+    - total throughput: `1773.77 tok/s`
+    - mean TPOT: `35.17 ms`
+    - median TPOT: `35.15 ms`
+    - p99 TPOT: `35.96 ms`
+    - mean TTFT: `1032.04 ms`
 
 Comparison:
 
 - Recent default-off/metadata-scratch C32:
-  - output `887.52 tok/s`
-  - mean TPOT `35.13 ms`
+    - output `887.52 tok/s`
+    - mean TPOT `35.13 ms`
 - No-direct-CSA translate path:
-  - output `885.16 tok/s`
-  - mean TPOT `35.17 ms`
+    - output `885.16 tok/s`
+    - mean TPOT `35.17 ms`
 - Historical fastest saved C32:
-  - `bench-sparsemla/revert-compressor-aux-nomtp-C32.json`
-  - output `926.06 tok/s`
-  - mean TPOT `33.50 ms`
+    - `bench-sparsemla/revert-compressor-aux-nomtp-C32.json`
+    - output `926.06 tok/s`
+    - mean TPOT `33.50 ms`
 
 Interpretation:
 
@@ -1767,10 +1767,10 @@ Static checks:
 Small graph-mode smoke:
 
 - Server:
-  - `MAX_NUM_SEQS=4`
-  - `MAX_NUM_BATCHED_TOKENS=1024`
-  - `MAX_MODEL_LEN=2048`
-  - `ENFORCE_EAGER=0`
+    - `MAX_NUM_SEQS=4`
+    - `MAX_NUM_BATCHED_TOKENS=1024`
+    - `MAX_MODEL_LEN=2048`
+    - `ENFORCE_EAGER=0`
 - Health passed.
 - One `/v1/completions` request succeeded.
 - Server was stopped after validation.
@@ -1781,9 +1781,9 @@ Change:
 
 - Extended `DeepseekV4AtomMLAAttentionSpec` with ROCm-only compressed-tail
   metadata:
-  - `atom_compressed_kv_dtype`
-  - `atom_compressed_scale_dtype`
-  - `atom_compressed_scale_bytes_per_page`
+    - `atom_compressed_kv_dtype`
+    - `atom_compressed_scale_dtype`
+    - `atom_compressed_scale_bytes_per_page`
 - `real_page_size_bytes` now includes
   `storage_block_size * atom_compressed_scale_bytes_per_page`, so future FP8
   tail scale storage is budgeted by the vLLM KV allocator instead of being
@@ -1836,10 +1836,10 @@ Change:
   layer.
 - `VLLM_ROCM_DSV4_ATOM_MIXED_KV=1` now makes
   `DeepseekV4Attention.get_kv_cache_spec()` emit a mixed ATOM spec with:
-  - BF16/model-dtype SWA prefix.
-  - `torch.float8_e4m3fnuz` compressed tail.
-  - FP32 per-1x64 scale sidecars.
-  - private `cache_dtype_str="atom_fp8_1x64"` so the DeepSeek V4 backend keeps
+    - BF16/model-dtype SWA prefix.
+    - `torch.float8_e4m3fnuz` compressed tail.
+    - FP32 per-1x64 scale sidecars.
+    - private `cache_dtype_str="atom_fp8_1x64"` so the DeepSeek V4 backend keeps
     the semantic `[num_blocks, block_size, head_dim]` shape instead of the
     `fp8_ds_mla` 584-byte format.
 - `DeepseekV4Attention.post_bind_kv_cache()` now binds one raw allocation into
@@ -1894,11 +1894,11 @@ Change:
   and indexer FP8 contracts, not the split scale-sidecar layout.
 - `DeepseekCompressor._maybe_atom_main_compressor_forward()` now distinguishes
   three output contracts:
-  - 128-dim indexer FP8 cache: existing `torch.uint8` raw allocation with
+    - 128-dim indexer FP8 cache: existing `torch.uint8` raw allocation with
     embedded scale region.
-  - 512-dim mixed main compressed tail: vLLM-owned
+    - 512-dim mixed main compressed tail: vLLM-owned
     `torch.float8_e4m3fnuz` rows plus separate fp32 1x64 scale sidecars.
-  - 512-dim BF16 main compressed tail: previous homogeneous ATOM unified KV
+    - 512-dim BF16 main compressed tail: previous homogeneous ATOM unified KV
     path.
 - If an FP8 compressed tail is present without a bound scale sidecar, the
   compressor now raises instead of falling through to the BF16 writer.
@@ -1944,10 +1944,10 @@ First smoke result:
   `_maybe_forward_prefill_atom()` to use split SWA/compressed views when no
   homogeneous unified tensor exists.
 - Third startup succeeded:
-  - KV cache initialized.
-  - Breakable graph capture completed.
-  - `/health` returned 200.
-  - A tiny `/v1/completions` request returned 200.
+    - KV cache initialized.
+    - Breakable graph capture completed.
+    - `/health` returned 200.
+    - A tiny `/v1/completions` request returned 200.
 - Tiny completion output was corrupted: prompt
   `"Question: What is 2+2? Answer:"` with `max_tokens=8`, `temperature=0`
   returned text like `����姸. .`. Therefore mixed FP8 tail is runnable but not
@@ -1996,8 +1996,8 @@ Full lmeval after fixing the mixed writer row-stride bug:
   `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=1`, no `--enforce-eager`.
 - Client: unchanged `bash lmeval.sh`.
 - Result:
-  - flexible-extract exact match: `0.8992 +/- 0.0083`
-  - strict-match exact match: `0.8984 +/- 0.0083`
+    - flexible-extract exact match: `0.8992 +/- 0.0083`
+    - strict-match exact match: `0.8984 +/- 0.0083`
 
 Conclusion: do not benchmark this run. It is runnable but outside the required
 `0.95 +/- 0.01` band.
@@ -2019,12 +2019,12 @@ Next implementation idea:
 
 - Either keep the main CSA/HCA compressed tail BF16 for accuracy, or implement
   the actual ATOM mixed slot layout in vLLM storage:
-  - compressed-tail raw storage as bytes, not a homogeneous
+    - compressed-tail raw storage as bytes, not a homogeneous
     `torch.float8_e4m3fnuz [pages, 512]` tensor;
-  - quantize/dequantize only the first `448` dimensions;
-  - preserve the last `64` RoPE dimensions as BF16;
-  - store `8` UE8M0 scale bytes per page;
-  - update split decode/prefill kernels to read this 584-byte layout directly.
+    - quantize/dequantize only the first `448` dimensions;
+    - preserve the last `64` RoPE dimensions as BF16;
+    - store `8` UE8M0 scale bytes per page;
+    - update split decode/prefill kernels to read this 584-byte layout directly.
 
 ## 2026-06-19 Practical ATOM Component Split Audit
 
@@ -2091,8 +2091,8 @@ Next kernel work:
 - Add packed writer support to `fused_compress_attn`: write token data at
   `block * block_stride + slot * 576`, store FP8 bytes for dims `[0, 448)`,
   store BF16 RoPE dims `[448, 512)` at byte offset `448`, and store 8 UE8M0
-  scales in the block scale region `block * block_stride + k_per_block * 576
-  + slot * 8`.
+  scales in the block scale region `block *block_stride + k_per_block* 576
+    - slot * 8`.
 - Add packed read support to split decode and prefill. They must compute the
   same block-packed offsets instead of treating `[block, slot, 584]` as
   per-token-interleaved 584-byte rows.
@@ -2107,10 +2107,10 @@ path:
 
 - `fused_compress_attn(..., packed_fp8_ds_mla=True)` writes the compressed tail
   in the block-packed `fp8_ds_mla` format:
-  - token data region: `block * block_stride + slot * 576`;
-  - NoPE dims `[0, 448)`: FP8 e4m3 bytes with one UE8M0 scale byte per 64 dims;
-  - RoPE dims `[448, 512)`: BF16 bytes at byte offset `448`;
-  - scale region: `block * block_stride + k_per_block * 576 + slot * 8`.
+    - token data region: `block * block_stride + slot * 576`;
+    - NoPE dims `[0, 448)`: FP8 e4m3 bytes with one UE8M0 scale byte per 64 dims;
+    - RoPE dims `[448, 512)`: BF16 bytes at byte offset `448`;
+    - scale region: `block * block_stride + k_per_block * 576 + slot * 8`.
 - `DeepseekCompressor` now accepts `atom_kv_layout=="fp8_ds_mla"` when the
   bound cache is `uint8 [num_blocks, k_per_block, 584]`, and calls the packed
   compressor writer.
@@ -2124,19 +2124,19 @@ path:
 GPU synthetic validation already completed:
 
 - One-slot packed compressor writer vs BF16 writer:
-  - BF16 reference finite: true
-  - packed output nonzero: true
-  - NoPE max diff after dequant: `0.109375`
-  - RoPE max diff: `0.0`
+    - BF16 reference finite: true
+    - packed output nonzero: true
+    - NoPE max diff after dequant: `0.109375`
+    - RoPE max diff: `0.0`
 - Split decode packed reader vs dense BF16 split reference:
-  - one tail slot max diff: `0.1171875`
+    - one tail slot max diff: `0.1171875`
 - Split prefill packed reader vs dense BF16 split reference:
-  - one tail slot max diff: `0.125`
+    - one tail slot max diff: `0.125`
 - `k_per_block=2`, slot 1 addressing:
-  - slot 0 writer max diff: `0.125`
-  - slot 1 writer max diff: `0.125`
-  - slot 1 RoPE max diff: `0.0`
-  - decode slot 1 max diff: `0.125`
+    - slot 0 writer max diff: `0.125`
+    - slot 1 writer max diff: `0.125`
+    - slot 1 RoPE max diff: `0.0`
+    - decode slot 1 max diff: `0.125`
 
 Focused non-GPU validation also passes after the packed runtime changes:
 
@@ -2193,8 +2193,8 @@ Full accuracy run:
 - Result file:
   `results_deepseekprographmtp_aitermhc_nobreakablecudagraph/deepseek-ai__DeepSeek-V4-Pro/results_2026-06-19T23-11-37.065327.json`
 - GSM8K:
-  - flexible-extract exact match: `0.9537528430629265 +/- 0.005784991662691855`
-  - strict-match exact match: `0.954510993176649 +/- 0.005739657656722217`
+    - flexible-extract exact match: `0.9537528430629265 +/- 0.005784991662691855`
+    - strict-match exact match: `0.954510993176649 +/- 0.005739657656722217`
 
 This passes the required `0.95 +/- 0.01` accuracy band.
 
@@ -2216,19 +2216,19 @@ Comparison:
 
 - Previous best BF16-tail run:
   `bench-sparsemla/revert-compressor-aux-nomtp-C32.json`
-  - output throughput: `926.0610778396323 tok/s`
-  - total throughput: `1855.7395817645756 tok/s`
-  - mean TPOT: `33.50296501712195 ms`
+    - output throughput: `926.0610778396323 tok/s`
+    - total throughput: `1855.7395817645756 tok/s`
+    - mean TPOT: `33.50296501712195 ms`
 - Previous no-direct-CSA translate run:
   `bench-sparsemla/no-direct-csa-translate-C32.json`
-  - output throughput: `885.1578831441936 tok/s`
-  - total throughput: `1773.7734142694192 tok/s`
-  - mean TPOT: `35.170615295353684 ms`
+    - output throughput: `885.1578831441936 tok/s`
+    - total throughput: `1773.7734142694192 tok/s`
+    - mean TPOT: `35.170615295353684 ms`
 - Previous current-default no-eager run:
   `bench-sparsemla/ds-v4-pro-nomtp-current-default-noeager-C32.json`
-  - output throughput: `916.2795284617761 tok/s`
-  - total throughput: `1836.1382738316058 tok/s`
-  - mean TPOT: `33.8685634798457 ms`
+    - output throughput: `916.2795284617761 tok/s`
+    - total throughput: `1836.1382738316058 tok/s`
+    - mean TPOT: `33.8685634798457 ms`
 
 Conclusion:
 
@@ -2296,21 +2296,21 @@ Current component status:
 Conclusion for the active integration plan:
 
 - Keep the current practical split:
-  - no GPU-worker changes for request rings;
-  - ROCm-only vLLM core/attention changes for DSV4 cache spec, binding, and
+    - no GPU-worker changes for request rings;
+    - ROCm-only vLLM core/attention changes for DSV4 cache spec, binding, and
     split/packed readers;
-  - CUDA untouched.
+    - CUDA untouched.
 - Current guard coverage for the split:
-  - `test_deepseek_v4_kv_cache_spec_stays_regular_mla_off_rocm` proves
+    - `test_deepseek_v4_kv_cache_spec_stays_regular_mla_off_rocm` proves
     non-ROCm does not emit `DeepseekV4AtomMLAAttentionSpec`, even when the
     ATOM unified/mixed flags are patched on.
-  - `test_deepseek_v4_model_state_cls_stays_default_off_rocm` and
+    - `test_deepseek_v4_model_state_cls_stays_default_off_rocm` and
     `test_deepseek_v4_model_state_cls_stays_default_without_atom_state` prove
     `DeepseekV4RocmAtomModelState` is selected only for ROCm plus the ATOM
     state flag.
-  - `test_deepseek_v4_post_bind_stays_noop_off_rocm` proves the ATOM unified
+    - `test_deepseek_v4_post_bind_stays_noop_off_rocm` proves the ATOM unified
     KV post-bind views are not created off ROCm.
-  - Targeted validation command passed:
+    - Targeted validation command passed:
     `pytest -q tests/v1/worker/test_utils.py -k 'deepseek_v4_kv_cache_spec_stays_regular_mla_off_rocm or deepseek_v4_kv_cache_spec_uses_atom_mla_only_for_rocm_unified or deepseek_v4_model_state_cls_stays_default_off_rocm or deepseek_v4_model_state_cls_stays_default_without_atom_state or deepseek_v4_model_state_cls_uses_atom_state_only_for_rocm_atom or deepseek_v4_post_bind_stays_noop_off_rocm'`.
 - Do not claim full ATOM-kernel benefit yet. The missing native component is
   not MHC. The blocking gap is native support for the packed DSV4 sparse
@@ -2329,10 +2329,10 @@ Change:
 - Added an opt-in decode-only fusion flag:
   `VLLM_ROCM_DSV4_ATOM_FUSE_CSA_TRANSLATE_DECODE=1`.
 - Scope is intentionally narrow:
-  - CSA/r4 decode only;
-  - split-KV decode only;
-  - `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=1`;
-  - default remains the validated ATOM-sequence path:
+    - CSA/r4 decode only;
+    - split-KV decode only;
+    - `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=1`;
+    - default remains the validated ATOM-sequence path:
     `indexer top-k -> csa_translate_pack -> paged sparse attention`.
 
 Behavior:
@@ -2353,25 +2353,25 @@ Focused validation:
 - `git diff --check -- vllm/models/deepseek_v4/amd/rocm.py
   vllm/models/deepseek_v4/amd/v4_kernels/paged_decode.py`
 - Synthetic dense-tail GPU check:
-  - baseline: `csa_translate_pack` then split-KV decode;
-  - fused: split-KV decode resolves CSA top-k directly;
-  - max absolute diff: `0.0`, finite outputs.
+    - baseline: `csa_translate_pack` then split-KV decode;
+    - fused: split-KV decode resolves CSA top-k directly;
+    - max absolute diff: `0.0`, finite outputs.
 - Synthetic packed `fp8_ds_mla` GPU check:
-  - same baseline/fused comparison with `[num_blocks, k_per_block, 584]`
+    - same baseline/fused comparison with `[num_blocks, k_per_block, 584]`
     compressed tail;
-  - max absolute diff: `0.0`, finite outputs.
+    - max absolute diff: `0.0`, finite outputs.
 - Small graph-mode server smoke:
-  - server flags included `MAX_NUM_SEQS=4`, `MAX_NUM_BATCHED_TOKENS=1024`,
+    - server flags included `MAX_NUM_SEQS=4`, `MAX_NUM_BATCHED_TOKENS=1024`,
     `MAX_MODEL_LEN=2048`, `ENFORCE_EAGER=0`,
     `VLLM_ROCM_DSV4_ATOM_MIXED_KV=1`,
     `VLLM_ROCM_DSV4_ATOM_SPLIT_KV_DECODE=1`,
     `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=1`, and
     `VLLM_ROCM_DSV4_ATOM_FUSE_CSA_TRANSLATE_DECODE=1`;
-  - graph capture completed;
-  - startup bound `layout_counts={'fp8_ds_mla': 61}`;
-  - `/v1/models` returned `200`;
-  - one short `/v1/completions` request returned `200`;
-  - server was stopped afterward and no stale vLLM/lm-eval/benchmark process
+    - graph capture completed;
+    - startup bound `layout_counts={'fp8_ds_mla': 61}`;
+    - `/v1/models` returned `200`;
+    - one short `/v1/completions` request returned `200`;
+    - server was stopped afterward and no stale vLLM/lm-eval/benchmark process
     remained.
 
 Full accuracy validation:
@@ -2384,8 +2384,8 @@ Full accuracy validation:
 - Result file:
   `results_deepseekprographmtp_aitermhc_nobreakablecudagraph/deepseek-ai__DeepSeek-V4-Pro/results_2026-06-20T00-03-01.986966.json`
 - GSM8K:
-  - flexible-extract exact match: `0.9514783927217589 +/- 0.0059184686189210885`
-  - strict-match exact match: `0.9522365428354814 +/- 0.005874387536229305`
+    - flexible-extract exact match: `0.9514783927217589 +/- 0.0059184686189210885`
+    - strict-match exact match: `0.9522365428354814 +/- 0.005874387536229305`
 
 This passes the required `0.95 +/- 0.01` accuracy band.
 
@@ -2407,14 +2407,14 @@ Comparison:
 
 - Previous packed FP8 ATOM KV run:
   `bench-sparsemla/ds-v4-pro-packed-fp8-atomkv-C32-20260619-C32.json`
-  - output throughput: `808.2077176284764 tok/s`
-  - total throughput: `1619.572496653939 tok/s`
-  - mean TPOT: `38.542512715599834 ms`
+    - output throughput: `808.2077176284764 tok/s`
+    - total throughput: `1619.572496653939 tok/s`
+    - mean TPOT: `38.542512715599834 ms`
 - Previous best BF16-tail run:
   `bench-sparsemla/revert-compressor-aux-nomtp-C32.json`
-  - output throughput: `926.0610778396323 tok/s`
-  - total throughput: `1855.7395817645756 tok/s`
-  - mean TPOT: `33.50296501712195 ms`
+    - output throughput: `926.0610778396323 tok/s`
+    - total throughput: `1855.7395817645756 tok/s`
+    - mean TPOT: `33.50296501712195 ms`
 
 Conclusion:
 
@@ -2449,16 +2449,16 @@ Verification:
 - `python3 -m py_compile vllm/envs.py`
 - `git diff --check -- vllm/envs.py docs/deepseek_v4_atom_integration_notes.md`
 - Source-used flag audit:
-  - scanned Python sources for `VLLM_ROCM_DSV4_*`;
-  - found `62` unique flags;
-  - direct `vllm.envs.validate_environ(hard_fail=True)` completed with
+    - scanned Python sources for `VLLM_ROCM_DSV4_*`;
+    - found `62` unique flags;
+    - direct `vllm.envs.validate_environ(hard_fail=True)` completed with
     `missing []`.
 - Deployment-shape audit:
-  - scanned Python and shell sources for `VLLM_ROCM_DSV4_*`;
-  - found `62` unique flags;
-  - `validate_environ(hard_fail=True)` and `enable_envs_cache()` completed with
+    - scanned Python and shell sources for `VLLM_ROCM_DSV4_*`;
+    - found `62` unique flags;
+    - `validate_environ(hard_fail=True)` and `enable_envs_cache()` completed with
     `missing []`;
-  - launch-like empty `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=` resolves to
+    - launch-like empty `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=` resolves to
     default `0`, matching `launchdeepseekgraph.sh` when the flag is unset.
 
 ## 2026-06-20 ROCm-Only KV Spec Gating Test
@@ -2477,13 +2477,13 @@ Why:
 Coverage:
 
 - Non-ROCm/default path:
-  - even if the ATOM unified flag is monkeypatched on, `current_platform.is_rocm`
+    - even if the ATOM unified flag is monkeypatched on, `current_platform.is_rocm`
     false returns `MLAAttentionSpec`;
-  - no `atom_vllm_unified_kv_*` attributes are attached to the attention stub.
+    - no `atom_vllm_unified_kv_*` attributes are attached to the attention stub.
 - ROCm + unified path:
-  - returns `DeepseekV4AtomMLAAttentionSpec`;
-  - records `fp8_ds_mla` compressed-tail layout;
-  - computes and stores the fixed SWA prefix bytes from
+    - returns `DeepseekV4AtomMLAAttentionSpec`;
+    - records `fp8_ds_mla` compressed-tail layout;
+    - computes and stores the fixed SWA prefix bytes from
     `max_num_seqs * sliding_window * head_dim * dtype_size`.
 
 Verification:
@@ -2509,12 +2509,12 @@ Why:
 Coverage:
 
 - Non-ROCm/default path:
-  - even if the ATOM state flag is monkeypatched on, `current_platform.is_rocm`
+    - even if the ATOM state flag is monkeypatched on, `current_platform.is_rocm`
     false returns vLLM's `DefaultModelState`.
 - ROCm without ATOM state:
-  - returns `DefaultModelState`.
+    - returns `DefaultModelState`.
 - ROCm + ATOM state:
-  - returns `DeepseekV4RocmAtomModelState`.
+    - returns `DeepseekV4RocmAtomModelState`.
 
 Verification:
 
@@ -2567,11 +2567,11 @@ Why:
 Coverage:
 
 - Off-ROCm path:
-  - even with ATOM unified-KV metadata present, `post_bind_kv_cache` returns
+    - even with ATOM unified-KV metadata present, `post_bind_kv_cache` returns
     before shape validation and does not attach `atom_swa_kv`,
     `atom_split_kv_compressed`, or `atom_unified_kv`.
 - ROCm SWA-only path:
-  - layers with `compress_ratio <= 1` also return without attaching ATOM
+    - layers with `compress_ratio <= 1` also return without attaching ATOM
     split/unified views.
 - Positive mixed and packed FP8 post-bind tests still verify that ROCm
   compressed MLA layers expose the expected SWA prefix, compressed tail, scale

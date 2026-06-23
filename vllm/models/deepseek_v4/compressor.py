@@ -45,28 +45,19 @@ _ATOM_MAIN_COMPRESSOR_ENABLED = (
 _ATOM_INDEXER_COMPRESSOR_ENABLED = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR", "0") == "1"
 )
-_ATOM_UNIFIED_KV_ENABLED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV", "0") == "1"
-)
+_ATOM_UNIFIED_KV_ENABLED = os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV", "0") == "1"
 _ATOM_UNIFIED_KV_FROM_VLLM = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM", "0") == "1"
 )
-_ATOM_MIXED_KV_ENABLED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_MIXED_KV", "0") == "1"
-)
+_ATOM_MIXED_KV_ENABLED = os.environ.get("VLLM_ROCM_DSV4_ATOM_MIXED_KV", "0") == "1"
 _ATOM_SKIP_PAGED_PREFILL = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_SKIP_PAGED_PREFILL", "1") == "1"
 )
 _ATOM_PREFILL_ALLOW_MIXED = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED", "0") == "1"
 )
-_ATOM_ROCM_DSV4_ENABLED = (
-    current_platform.is_rocm()
-    and (
-        _ATOM_ATTENTION_ENABLED
-        or _ATOM_MAIN_COMPRESSOR_ENABLED
-        or _ATOM_UNIFIED_KV_ENABLED
-    )
+_ATOM_ROCM_DSV4_ENABLED = current_platform.is_rocm() and (
+    _ATOM_ATTENTION_ENABLED or _ATOM_MAIN_COMPRESSOR_ENABLED or _ATOM_UNIFIED_KV_ENABLED
 )
 _ATOM_ATTENTION_RATIOS = frozenset(
     part.strip()
@@ -97,9 +88,7 @@ _ATOM_SKIP_COMPRESS_STATE_UPDATE = (
 _ATOM_NATIVE_AFTER_MAIN_COMPRESSOR = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_NATIVE_AFTER_MAIN_COMPRESSOR", "0") == "1"
 )
-_ATOM_HCA_FLAT_CACHE = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_HCA_FLAT_CACHE", "0") == "1"
-)
+_ATOM_HCA_FLAT_CACHE = os.environ.get("VLLM_ROCM_DSV4_ATOM_HCA_FLAT_CACHE", "0") == "1"
 _ATOM_PROFILE_COMPRESSOR = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR", "0") == "1"
 )
@@ -237,8 +226,7 @@ def _atom_profile_can_sync() -> bool:
 
 def _atom_profile_layer_matches(layer_id: int | None) -> bool:
     return (
-        _ATOM_PROFILE_COMPRESSOR_LAYER < 0
-        or layer_id == _ATOM_PROFILE_COMPRESSOR_LAYER
+        _ATOM_PROFILE_COMPRESSOR_LAYER < 0 or layer_id == _ATOM_PROFILE_COMPRESSOR_LAYER
     )
 
 
@@ -257,10 +245,7 @@ def _atom_profile_should_print(
     if count <= _ATOM_PROFILE_COMPRESSOR_START_AFTER:
         return False
     printed_count = count - _ATOM_PROFILE_COMPRESSOR_START_AFTER
-    return (
-        printed_count <= 3
-        or printed_count % _ATOM_PROFILE_COMPRESSOR_EVERY == 0
-    )
+    return printed_count <= 3 or printed_count % _ATOM_PROFILE_COMPRESSOR_EVERY == 0
 
 
 def _atom_profile_sync() -> None:
@@ -536,9 +521,11 @@ class DeepseekCompressor(nn.Module):
             sin_cache = cos_sin_cache[..., half_rope : 2 * half_rope]
         else:
             cos_cache = cos_sin_cache[..., :half_rope].to(dtype=dtype).contiguous()
-            sin_cache = cos_sin_cache[..., half_rope : 2 * half_rope].to(
-                dtype=dtype
-            ).contiguous()
+            sin_cache = (
+                cos_sin_cache[..., half_rope : 2 * half_rope]
+                .to(dtype=dtype)
+                .contiguous()
+            )
         self._atom_split_cos_sin_cache = (cache_key, cos_cache, sin_cache)
         return cos_cache, sin_cache
 
@@ -548,11 +535,7 @@ class DeepseekCompressor(nn.Module):
         block_tables: torch.Tensor,
         k_per_block: int,
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        if (
-            self.compress_ratio != 128
-            or k_per_block <= 1
-            or not _ATOM_HCA_FLAT_CACHE
-        ):
+        if self.compress_ratio != 128 or k_per_block <= 1 or not _ATOM_HCA_FLAT_CACHE:
             return kv_cache, block_tables, k_per_block
 
         # Diagnostic-only path. The fused compressor already resolves packed
@@ -722,14 +705,22 @@ class DeepseekCompressor(nn.Module):
             flat_cache = raw_kv_cache.view(raw_kv_cache.shape[0], -1)
             value_elems = k_per_block * self.head_dim
             fp8_dtype = current_platform.fp8_dtype()
-            kv_cache = flat_cache[:, :value_elems].view(fp8_dtype).view(
-                raw_kv_cache.shape[0],
-                k_per_block,
-                self.head_dim,
+            kv_cache = (
+                flat_cache[:, :value_elems]
+                .view(fp8_dtype)
+                .view(
+                    raw_kv_cache.shape[0],
+                    k_per_block,
+                    self.head_dim,
+                )
             )
-            cache_scale = flat_cache[:, value_elems:].view(torch.float32).view(
-                raw_kv_cache.shape[0],
-                k_per_block,
+            cache_scale = (
+                flat_cache[:, value_elems:]
+                .view(torch.float32)
+                .view(
+                    raw_kv_cache.shape[0],
+                    k_per_block,
+                )
             )
             fp8_fnuz = getattr(torch, "float8_e4m3fnuz", None)
             fp8_max = 224.0 if fp8_dtype == fp8_fnuz else 448.0

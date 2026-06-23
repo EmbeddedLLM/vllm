@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -49,6 +51,7 @@ import os
 import torch
 import triton
 import triton.language as tl
+
 from vllm.models.deepseek_v4.amd.v4_kernels.reference import (
     sparse_attn_ragged_torch,
 )
@@ -83,8 +86,7 @@ def _validate_split_kv_prefill_layout(
         )
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(
-            "sparse_attn_v4_paged_prefill_split_kv expects fp16/bf16 q, "
-            f"got {q.dtype}"
+            f"sparse_attn_v4_paged_prefill_split_kv expects fp16/bf16 q, got {q.dtype}"
         )
     if kv.dtype != q.dtype:
         raise RuntimeError(f"kv dtype mismatch: kv={kv.dtype}, q={q.dtype}")
@@ -455,9 +457,7 @@ def _sparse_attn_v4_paged_prefill_split_kv_kernel(
             )
             bf16_tail = tl.load(
                 bf16_ptr + bf16_offsets[None, :],
-                mask=tail_valid[:, None]
-                & d_mask[None, :]
-                & (d_offs[None, :] >= 448),
+                mask=tail_valid[:, None] & d_mask[None, :] & (d_offs[None, :] >= 448),
                 other=0.0,
             )
             tail_kv = tl.where(is_fp8_dim[None, :], fp8_dequant, bf16_tail)

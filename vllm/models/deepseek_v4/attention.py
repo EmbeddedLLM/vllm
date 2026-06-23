@@ -24,10 +24,10 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
+from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_q_kv_rmsnorm,
@@ -94,9 +94,7 @@ _ATOM_ROCM_DSV4_ENABLED = current_platform.is_rocm() and (
 _ATOM_UNIFIED_KV_FROM_VLLM_ENABLED = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM", "0") == "1"
 )
-_ATOM_MIXED_KV_ENABLED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_MIXED_KV", "0") == "1"
-)
+_ATOM_MIXED_KV_ENABLED = os.environ.get("VLLM_ROCM_DSV4_ATOM_MIXED_KV", "0") == "1"
 _ATOM_INDEXER_FASTPATH_ENABLED = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_INDEXER_FASTPATH", "0") == "1"
 )
@@ -114,12 +112,8 @@ _ATOM_INDEXER_FASTPATH_NEEDS_SENTINEL_FILL = not (
     and not _ATOM_ATTENTION_RATIOS
     and not _ATOM_ATTENTION_LAYERS
 )
-_ATOM_USE_INDEX_CACHE_OVERRIDE = os.environ.get(
-    "VLLM_ROCM_DSV4_ATOM_USE_INDEX_CACHE"
-)
-_ATOM_INDEX_TOPK_FREQ_OVERRIDE = os.environ.get(
-    "VLLM_ROCM_DSV4_ATOM_INDEX_TOPK_FREQ"
-)
+_ATOM_USE_INDEX_CACHE_OVERRIDE = os.environ.get("VLLM_ROCM_DSV4_ATOM_USE_INDEX_CACHE")
+_ATOM_INDEX_TOPK_FREQ_OVERRIDE = os.environ.get("VLLM_ROCM_DSV4_ATOM_INDEX_TOPK_FREQ")
 _ATOM_INDEX_TOPK_PATTERN_OVERRIDE = os.environ.get(
     "VLLM_ROCM_DSV4_ATOM_INDEX_TOPK_PATTERN"
 )
@@ -821,9 +815,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
         atom_block_size = int(vllm_config.cache_config.block_size)
         if (
-            (_ATOM_ROCM_DSV4_ENABLED or atom_vllm_owned_kv)
-            and atom_block_size % 128 != 0
-        ):
+            _ATOM_ROCM_DSV4_ENABLED or atom_vllm_owned_kv
+        ) and atom_block_size % 128 != 0:
             raise ValueError(
                 "ROCm DeepSeek-V4 ATOM kernels require --block-size to be a "
                 "multiple of lcm(4,128)=128 so CSA/HCA compressed entries fit "
@@ -878,9 +871,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 else None,
                 "atom_compressed_scale_bytes_per_page": atom_scale_bytes_per_page,
             }
-            self.atom_vllm_compressed_scale_bytes_per_page = (
-                atom_scale_bytes_per_page
-            )
+            self.atom_vllm_compressed_scale_bytes_per_page = atom_scale_bytes_per_page
         return spec_cls(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
@@ -915,9 +906,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self, "atom_vllm_unified_kv_swa_dtype", self.kv_cache_torch_dtype
         )
         swa_pages = int(getattr(self, "atom_vllm_unified_kv_swa_pages", 0) or 0)
-        prefix_bytes = int(
-            getattr(self, "atom_vllm_unified_kv_prefix_bytes", 0) or 0
-        )
+        prefix_bytes = int(getattr(self, "atom_vllm_unified_kv_prefix_bytes", 0) or 0)
         if swa_pages <= 0 or prefix_bytes <= 0:
             return
         compressed_layout = getattr(self, "atom_vllm_compressed_layout", "dense")
@@ -926,7 +915,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 "ROCm DSV4 ATOM vLLM-owned KV bind got unsupported compressed "
                 f"layout {compressed_layout!r} for {self.prefix}."
             )
-        expected_tail_width = 584 if compressed_layout == "fp8_ds_mla" else self.head_dim
+        expected_tail_width = (
+            584 if compressed_layout == "fp8_ds_mla" else self.head_dim
+        )
         if kv_cache.dim() != 3 or kv_cache.shape[-1] != expected_tail_width:
             raise RuntimeError(
                 "ROCm DSV4 ATOM vLLM-owned KV bind expected compressed tail "
@@ -1035,9 +1026,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             page_stride = (tail_page_bytes + scale_bytes_per_page) // get_dtype_size(
                 torch.float32
             )
-            scale_storage_offset = (
-                prefix_bytes + tail_page_bytes
-            ) // get_dtype_size(torch.float32)
+            scale_storage_offset = (prefix_bytes + tail_page_bytes) // get_dtype_size(
+                torch.float32
+            )
             scale_base = torch.empty((), dtype=torch.float32, device=kv_cache.device)
             scale_base.set_(
                 kv_cache.untyped_storage(),

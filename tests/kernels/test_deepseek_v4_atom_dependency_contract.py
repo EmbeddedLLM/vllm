@@ -1,8 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
 from pathlib import Path
 
 import pytest
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -91,9 +92,7 @@ def test_atom_native_abi_probe_reports_installed_aiter_gap():
     )
 
     status = probe_atom_native_abi()
-    audit = (
-        REPO_ROOT / "docs" / "deepseek_v4_atom_op_surface_audit.md"
-    ).read_text()
+    audit = (REPO_ROOT / "docs" / "deepseek_v4_atom_op_surface_audit.md").read_text()
 
     assert status.aiter_available
     assert not status.has_full_native_packed_main_path
@@ -174,9 +173,7 @@ def test_rocm_mhc_fused_post_pre_is_not_aiter_backed_until_aiter_exports_it():
 
 
 def test_atom_split_kv_decode_always_passes_ordered_metadata():
-    rocm_path = (
-        REPO_ROOT / "vllm" / "models" / "deepseek_v4" / "amd" / "rocm.py"
-    )
+    rocm_path = REPO_ROOT / "vllm" / "models" / "deepseek_v4" / "amd" / "rocm.py"
     tree = ast.parse(rocm_path.read_text(), filename=str(rocm_path))
     calls = [
         node
@@ -197,9 +194,7 @@ def test_atom_split_kv_decode_always_passes_ordered_metadata():
 
 
 def test_atom_attention_packed_deployment_routes_through_split_kv_branches():
-    rocm_path = (
-        REPO_ROOT / "vllm" / "models" / "deepseek_v4" / "amd" / "rocm.py"
-    )
+    rocm_path = REPO_ROOT / "vllm" / "models" / "deepseek_v4" / "amd" / "rocm.py"
     tree = ast.parse(rocm_path.read_text(), filename=str(rocm_path))
 
     split_decode_gate = ast.unparse(
@@ -226,7 +221,9 @@ def test_atom_attention_packed_deployment_routes_through_split_kv_branches():
 
     prefill_atom = _function_def(tree, "_maybe_forward_prefill_atom")
     prefill_source = ast.unparse(prefill_atom)
-    split_prefill = prefill_source.find("if use_split_kv_prefill and unified_kv is None:")
+    split_prefill = prefill_source.find(
+        "if use_split_kv_prefill and unified_kv is None:"
+    )
     homogeneous_prefill = prefill_source.find("sparse_attn_v4_paged_prefill(")
     assert -1 not in (split_prefill, homogeneous_prefill)
     assert split_prefill < homogeneous_prefill
@@ -256,10 +253,10 @@ def test_deepseek_v4_atom_model_state_does_not_use_workspace_manager():
 
 
 def test_dsv4_rocm_kv_workspace_plan_documents_current_ownership_split():
-    doc = (
-        REPO_ROOT / "docs" / "deepseek_v4_rocm_kv_workspace_plan.md"
+    doc = (REPO_ROOT / "docs" / "deepseek_v4_rocm_kv_workspace_plan.md").read_text()
+    workspace_source = (
+        REPO_ROOT / "vllm" / "v1" / "worker" / "workspace.py"
     ).read_text()
-    workspace_source = (REPO_ROOT / "vllm" / "v1" / "worker" / "workspace.py").read_text()
     kv_interface_source = (
         REPO_ROOT / "vllm" / "v1" / "kv_cache_interface.py"
     ).read_text()
@@ -364,7 +361,9 @@ def test_nvidia_deepseek_v4_path_does_not_import_rocm_atom_modules():
 
 
 def test_atom_kv_spec_uses_generic_full_attention_manager():
-    manager_path = REPO_ROOT / "vllm" / "v1" / "core" / "single_type_kv_cache_manager.py"
+    manager_path = (
+        REPO_ROOT / "vllm" / "v1" / "core" / "single_type_kv_cache_manager.py"
+    )
     source = manager_path.read_text()
 
     assert "DeepseekV4AtomMLAAttentionSpec" in source
@@ -406,14 +405,14 @@ def test_packed_atom_kv_spec_is_split_prefix_plus_compressed_tail_contract():
     assert "8 embedded UE8M0 scale bytes per compressed token" in kv_interface
 
     assert 'self.atom_vllm_compressed_layout = "fp8_ds_mla"' in attention
-    assert 'spec_dtype = torch.uint8' in attention
+    assert "spec_dtype = torch.uint8" in attention
     assert 'spec_cache_dtype = "fp8_ds_mla"' in attention
     assert '"atom_compressed_layout": self.atom_vllm_compressed_layout' in attention
 
     assert 'compressed_kv_layout[layer_id] = "fp8_ds_mla"' in model_state
     assert 'setattr(attn, "atom_split_kv_layout", "fp8_ds_mla")' in model_state
     assert 'if hasattr(attn, "atom_unified_kv"):' in model_state
-    assert "delattr(attn, \"atom_unified_kv\")" in model_state
+    assert 'delattr(attn, "atom_unified_kv")' in model_state
 
 
 def test_atom_main_compressor_preserves_read_before_update_ordering():
@@ -450,10 +449,7 @@ def test_rocm_attention_runtime_uses_atom_attention_ops():
     }
 
     assert "vllm.models.deepseek_v4.amd.v4_kernels" in imported
-    assert (
-        "vllm.models.deepseek_v4.amd.v4_kernels.qk_norm_rope_maybe_quant"
-        in imported
-    )
+    assert "vllm.models.deepseek_v4.amd.v4_kernels.qk_norm_rope_maybe_quant" in imported
     assert {
         "qk_norm_rope_maybe_quant",
         "swa_write",
@@ -617,12 +613,7 @@ def test_full_atom_indexer_prefill_decode_dispatch_is_not_default_integrated():
         REPO_ROOT / "vllm" / "models" / "deepseek_v4" / "attention.py"
     ).read_text()
     rocm_sparse_ops = (
-        REPO_ROOT
-        / "vllm"
-        / "v1"
-        / "attention"
-        / "ops"
-        / "rocm_aiter_mla_sparse.py"
+        REPO_ROOT / "vllm" / "v1" / "attention" / "ops" / "rocm_aiter_mla_sparse.py"
     ).read_text()
 
     assert "def _score_topk_prefill(" in atom_source
@@ -660,12 +651,7 @@ def test_atom_dual_stream_moe_and_aux_compressor_overlap_are_not_integrated():
         if path.name != "atom_native_abi.py"
     )
     probe_source = (
-        REPO_ROOT
-        / "vllm"
-        / "models"
-        / "deepseek_v4"
-        / "amd"
-        / "atom_native_abi.py"
+        REPO_ROOT / "vllm" / "models" / "deepseek_v4" / "amd" / "atom_native_abi.py"
     ).read_text()
     amd_model = (
         REPO_ROOT / "vllm" / "models" / "deepseek_v4" / "amd" / "model.py"
@@ -730,8 +716,7 @@ def test_packed_fp8_ds_mla_layout_is_shared_by_writer_and_readers():
     assert "_PACKED_SCALE_DIM = 8" in paged_decode
     assert "data_start = slot * _PACKED_TOKEN_DATA_SIZE" in paged_decode
     assert (
-        "scale_start = block_size * _PACKED_TOKEN_DATA_SIZE + "
-        "slot * _PACKED_SCALE_DIM"
+        "scale_start = block_size * _PACKED_TOKEN_DATA_SIZE + slot * _PACKED_SCALE_DIM"
     ) in paged_decode
 
 
@@ -746,8 +731,7 @@ def test_launch_defaults_select_rocm_atom_benchmark_path():
     assert "VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-1}" in launch
     assert "VLLM_ROCM_DSV4_USE_AITER_MHC=${VLLM_ROCM_DSV4_USE_AITER_MHC:-0}" in launch
     assert (
-        "VLLM_ROCM_DSV4_USE_AITER_HC_HEAD="
-        "${VLLM_ROCM_DSV4_USE_AITER_HC_HEAD:-0}"
+        "VLLM_ROCM_DSV4_USE_AITER_HC_HEAD=${VLLM_ROCM_DSV4_USE_AITER_HC_HEAD:-0}"
     ) in launch
     assert "VLLM_ROCM_DSV4_ATOM_STATE=${VLLM_ROCM_DSV4_ATOM_STATE:-1}" in launch
     assert (
@@ -755,10 +739,12 @@ def test_launch_defaults_select_rocm_atom_benchmark_path():
         "${VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM:-1}"
     ) in launch
     assert "VLLM_ROCM_DSV4_ATOM_MIXED_KV=${VLLM_ROCM_DSV4_ATOM_MIXED_KV:-0}" in launch
-    assert "VLLM_ROCM_DSV4_ATOM_COMPRESS_PLAN=${VLLM_ROCM_DSV4_ATOM_COMPRESS_PLAN:-1}" in launch
     assert (
-        "VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR="
-        "${VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR:-1}"
+        "VLLM_ROCM_DSV4_ATOM_COMPRESS_PLAN=${VLLM_ROCM_DSV4_ATOM_COMPRESS_PLAN:-1}"
+        in launch
+    )
+    assert (
+        "VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR=${VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR:-1}"
     ) in launch
     assert "VLLM_ROCM_DSV4_ATOM_ATTENTION=${VLLM_ROCM_DSV4_ATOM_ATTENTION:-1}" in launch
     assert "ATOM_USE_FUSED_Q_NORM_QUANT=${ATOM_USE_FUSED_Q_NORM_QUANT:-1}" in launch
@@ -780,7 +766,9 @@ def test_rocm_atom_mixed_decode_prefill_keeps_generic_sparse_metadata():
     assert "_ATOM_PREFILL_ALLOW_MIXED" in source
     assert "_ATOM_SKIP_PAGED_PREFILL" in source
 
-    skip_guard = ast.unparse(_function_def(tree, "_can_skip_generic_atom_decode_metadata"))
+    skip_guard = ast.unparse(
+        _function_def(tree, "_can_skip_generic_atom_decode_metadata")
+    )
     assert "return True" in skip_guard
     assert "return False" in skip_guard
     assert "_ATOM_SKIP_MIXED_GENERIC_DECODE_METADATA" in skip_guard
@@ -810,12 +798,16 @@ def test_rocm_atom_mixed_decode_prefill_preserves_indexer_metadata_alias():
     source = model_state_path.read_text()
     sparse_source = sparse_ops_path.read_text()
 
-    indexer_guard = ast.unparse(_function_def(tree, "_can_skip_generic_indexer_metadata"))
+    indexer_guard = ast.unparse(
+        _function_def(tree, "_can_skip_generic_indexer_metadata")
+    )
     assert "_ATOM_SKIP_MIXED_GENERIC_DECODE_METADATA" not in indexer_guard
     assert "_atom_mixed_batch_is_decode_then_prefill" not in indexer_guard
     assert "return pure_decode_one_token" in indexer_guard
 
-    attach_source = ast.unparse(_function_def(tree, "_attach_minimal_atom_decode_metadata"))
+    attach_source = ast.unparse(
+        _function_def(tree, "_attach_minimal_atom_decode_metadata")
+    )
     assert "DeepseekV32IndexerMetadata" in attach_source
     assert "_ATOM_INDEXER_METADATA_ALIAS_SUFFIX" in attach_source
     assert "existing_metadata = attn_metadata.get(layer_name)" in attach_source
@@ -824,7 +816,10 @@ def test_rocm_atom_mixed_decode_prefill_preserves_indexer_metadata_alias():
 
     assert '".__rocm_atom_indexer_metadata"' in sparse_source
     assert "indexer_metadata_alias = attn_metadata.get" in sparse_source
-    assert "isinstance(indexer_metadata_alias, DeepseekV32IndexerMetadata)" in sparse_source
+    assert (
+        "isinstance(indexer_metadata_alias, DeepseekV32IndexerMetadata)"
+        in sparse_source
+    )
 
 
 def test_deepseek_v4_atom_env_lookups_are_import_time_cached():
@@ -906,7 +901,9 @@ def test_deepseek_v4_atom_env_lookups_are_import_time_cached():
 
 
 def test_rocm_atom_separate_inverse_rope_path_is_opt_in():
-    rocm = (REPO_ROOT / "vllm" / "models" / "deepseek_v4" / "amd" / "rocm.py").read_text()
+    rocm = (
+        REPO_ROOT / "vllm" / "models" / "deepseek_v4" / "amd" / "rocm.py"
+    ).read_text()
     init = (
         REPO_ROOT
         / "vllm"

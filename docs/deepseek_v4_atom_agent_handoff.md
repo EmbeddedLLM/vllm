@@ -279,12 +279,12 @@ translated CSA indices on skip-top-k CSA layers. It is default-inactive unless
 Files touched for this candidate:
 
 - `vllm/models/deepseek_v4/amd/model_state.py`
-  - Added `csa_translate_key`, `csa_translate_hits`, and
+    - Added `csa_translate_key`, `csa_translate_hits`, and
     `csa_translate_writes` to prefill/decode per-forward caches.
 - `vllm/models/deepseek_v4/amd/rocm.py`
-  - Decode CSA path skips `csa_translate_pack()` when `skip_topk=True` and the
+    - Decode CSA path skips `csa_translate_pack()` when `skip_topk=True` and the
     cached translate key matches.
-  - Prefill CSA path does the analogous skip for `prefix_csa_indices`.
+    - Prefill CSA path does the analogous skip for `prefix_csa_indices`.
 
 Validation already run:
 

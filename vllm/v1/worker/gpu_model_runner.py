@@ -7108,9 +7108,10 @@ class GPUModelRunner(
                     else:
                         shape_block_size = kernel_block_size
 
-                    layer_cache_dtype = getattr(
-                        kv_cache_spec, "cache_dtype_str", None
-                    ) or self.cache_config.cache_dtype
+                    layer_cache_dtype = (
+                        getattr(kv_cache_spec, "cache_dtype_str", None)
+                        or self.cache_config.cache_dtype
+                    )
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
                         shape_block_size,

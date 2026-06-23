@@ -35,8 +35,7 @@ def _inverse_rope_gptj_inplace_kernel(
 
     positions = tl.load(positions_ptr + token_offsets, mask=token_mask, other=0)
     cos_offsets = (
-        positions[:, None] * stride_cos_t
-        + half_offsets[None, :] * stride_cos_d
+        positions[:, None] * stride_cos_t + half_offsets[None, :] * stride_cos_d
     )
     cos_mask = token_mask[:, None] & dim_mask[None, :]
     cos = tl.load(cos_ptr + cos_offsets, mask=cos_mask, other=1.0)

@@ -1,9 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
 import inspect
 from pathlib import Path
 
 import pytest
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ATOM_MODEL = REPO_ROOT.parent / "ATOM" / "atom" / "models" / "deepseek_v4.py"
@@ -28,18 +29,12 @@ VLLM_ATOM_OP_SURFACE = {
     "csa_translate_pack": (
         "vllm/models/deepseek_v4/amd/v4_kernels/csa_translate_pack.py"
     ),
-    "fused_compress_attn": (
-        "vllm/models/deepseek_v4/amd/v4_kernels/fused_compress.py"
-    ),
-    "inverse_rope_inplace": (
-        "vllm/models/deepseek_v4/amd/v4_kernels/inverse_rope.py"
-    ),
+    "fused_compress_attn": ("vllm/models/deepseek_v4/amd/v4_kernels/fused_compress.py"),
+    "inverse_rope_inplace": ("vllm/models/deepseek_v4/amd/v4_kernels/inverse_rope.py"),
     "qk_norm_rope_maybe_quant": (
         "vllm/models/deepseek_v4/amd/v4_kernels/qk_norm_rope_maybe_quant.py"
     ),
-    "scale_indexer_weights": (
-        "vllm/models/deepseek_v4/common/ops/fused_indexer_q.py"
-    ),
+    "scale_indexer_weights": ("vllm/models/deepseek_v4/common/ops/fused_indexer_q.py"),
     "sparse_attn_v4_paged_decode": (
         "vllm/models/deepseek_v4/amd/v4_kernels/paged_decode.py"
     ),
@@ -97,7 +92,7 @@ def _vllm_file_contains_symbol(rel_path: str, symbol: str) -> bool:
 def test_atom_v4_kernel_import_surface_is_explicitly_mapped_in_vllm():
     atom_imports = _imported_names_from("atom.model_ops.v4_kernels")
 
-    assert ATOM_V4_KERNEL_IMPORTS <= atom_imports
+    assert atom_imports >= ATOM_V4_KERNEL_IMPORTS
     assert set(VLLM_ATOM_OP_SURFACE) == ATOM_V4_KERNEL_IMPORTS
 
     missing = [
@@ -112,12 +107,10 @@ def test_atom_aiter_op_surface_is_classified_in_notes():
     if not ATOM_MODEL.exists():
         pytest.skip(f"ATOM model file is unavailable: {ATOM_MODEL}")
     atom_source = ATOM_MODEL.read_text()
-    notes = (
-        REPO_ROOT / "docs" / "deepseek_v4_atom_op_surface_audit.md"
-    ).read_text()
+    notes = (REPO_ROOT / "docs" / "deepseek_v4_atom_op_surface_audit.md").read_text()
 
     atom_hits = {name for name in ATOM_AITER_OP_STRINGS if name in atom_source}
-    assert ATOM_AITER_OP_STRINGS <= atom_hits
+    assert atom_hits >= ATOM_AITER_OP_STRINGS
 
     missing_from_notes = [
         name for name in sorted(ATOM_AITER_OP_STRINGS) if name not in notes
@@ -126,9 +119,7 @@ def test_atom_aiter_op_surface_is_classified_in_notes():
 
 
 def test_atom_attention_forward_order_is_documented():
-    notes = (
-        REPO_ROOT / "docs" / "deepseek_v4_atom_op_surface_audit.md"
-    ).read_text()
+    notes = (REPO_ROOT / "docs" / "deepseek_v4_atom_op_surface_audit.md").read_text()
     ordered_steps = [
         "maybe_compressors_async",
         "qk_norm_rope_maybe_quant",
@@ -149,9 +140,7 @@ def test_atom_attention_forward_order_is_documented():
 
 
 def test_component_verdict_matrix_keeps_full_scope_answer_explicit():
-    notes = (
-        REPO_ROOT / "docs" / "deepseek_v4_atom_op_surface_audit.md"
-    ).read_text()
+    notes = (REPO_ROOT / "docs" / "deepseek_v4_atom_op_surface_audit.md").read_text()
 
     required_phrases = [
         "## Component Verdict Matrix",
@@ -172,9 +161,7 @@ def test_component_verdict_matrix_keeps_full_scope_answer_explicit():
 
 
 def test_native_abi_integration_target_is_actionable():
-    notes = (
-        REPO_ROOT / "docs" / "deepseek_v4_atom_op_surface_audit.md"
-    ).read_text()
+    notes = (REPO_ROOT / "docs" / "deepseek_v4_atom_op_surface_audit.md").read_text()
 
     required_phrases = [
         "## Native ABI Integration Target",
@@ -185,7 +172,7 @@ def test_native_abi_integration_target_is_actionable():
         "atom_split_kv_swa",
         "atom_split_kv_compressed",
         "atom_split_kv_scales=None",
-        "atom_split_kv_layout=\"fp8_ds_mla\"",
+        'atom_split_kv_layout="fp8_ds_mla"',
         "packed `fp8_ds_mla` compressor dispatch no longer falls through",
         "packed `fp8_ds_mla` decode and prefill no longer require the Triton split-KV",
         "### Target B: ROCm-only homogeneous native ABI",
@@ -203,9 +190,7 @@ def test_installed_aiter_has_no_packed_fp8_ds_mla_attention_or_compressor_abi():
     flydsl_compress = pytest.importorskip(
         "aiter.ops.flydsl.kernels.fused_compress_attn"
     )
-    flydsl_hca = pytest.importorskip(
-        "aiter.ops.flydsl.kernels.fused_compress_attn_hca"
-    )
+    flydsl_hca = pytest.importorskip("aiter.ops.flydsl.kernels.fused_compress_attn_hca")
     opus_prefill = pytest.importorskip("aiter.ops.pa_sparse_prefill_opus")
     pa_mqa_logits = pytest.importorskip("aiter.ops.triton.attention.pa_mqa_logits")
 

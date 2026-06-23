@@ -1292,9 +1292,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
     ),
     # ROCm DeepSeek V4 ATOM integration and profiling flags.
-    "VLLM_ROCM_DSV4_USE_AITER_HC_HEAD": env_bool(
-        "VLLM_ROCM_DSV4_USE_AITER_HC_HEAD"
-    ),
+    "VLLM_ROCM_DSV4_USE_AITER_HC_HEAD": env_bool("VLLM_ROCM_DSV4_USE_AITER_HC_HEAD"),
     "VLLM_ROCM_DSV4_USE_AITER_MHC": env_bool("VLLM_ROCM_DSV4_USE_AITER_MHC"),
     "VLLM_ROCM_DSV4_ATOM_ATTENTION": env_bool("VLLM_ROCM_DSV4_ATOM_ATTENTION"),
     "VLLM_ROCM_DSV4_ATOM_ATTENTION_LAYERS": env_str(
@@ -1306,9 +1304,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_DSV4_ATOM_COMPRESS_FIRST": env_bool(
         "VLLM_ROCM_DSV4_ATOM_COMPRESS_FIRST"
     ),
-    "VLLM_ROCM_DSV4_ATOM_COMPRESS_PLAN": env_bool(
-        "VLLM_ROCM_DSV4_ATOM_COMPRESS_PLAN"
-    ),
+    "VLLM_ROCM_DSV4_ATOM_COMPRESS_PLAN": env_bool("VLLM_ROCM_DSV4_ATOM_COMPRESS_PLAN"),
     "VLLM_ROCM_DSV4_ATOM_DEBUG_COMPRESS_FIRST": env_bool(
         "VLLM_ROCM_DSV4_ATOM_DEBUG_COMPRESS_FIRST"
     ),
@@ -1385,9 +1381,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_DSV4_ATOM_PREFILL_INDEX_REUSE": env_bool(
         "VLLM_ROCM_DSV4_ATOM_PREFILL_INDEX_REUSE", True
     ),
-    "VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC": env_bool(
-        "VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC"
-    ),
+    "VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC": env_bool("VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC"),
     "VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_KIND": env_str(
         "VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_KIND", "device"
     ),
@@ -1415,9 +1409,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_DSV4_ATOM_PROFILE_EVERY": env_int(
         "VLLM_ROCM_DSV4_ATOM_PROFILE_EVERY", 200
     ),
-    "VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER": env_int(
-        "VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER"
-    ),
+    "VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER": env_int("VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER"),
     "VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA": env_bool(
         "VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA"
     ),
@@ -1470,12 +1462,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_ROCM_DSV4_ATOM_SPLIT_KV_DECODE"
     ),
     "VLLM_ROCM_DSV4_ATOM_STATE": env_bool("VLLM_ROCM_DSV4_ATOM_STATE"),
-    "VLLM_ROCM_DSV4_ATOM_STATE_ALLOC": env_bool(
-        "VLLM_ROCM_DSV4_ATOM_STATE_ALLOC"
-    ),
-    "VLLM_ROCM_DSV4_ATOM_UNIFIED_KV": env_bool(
-        "VLLM_ROCM_DSV4_ATOM_UNIFIED_KV"
-    ),
+    "VLLM_ROCM_DSV4_ATOM_STATE_ALLOC": env_bool("VLLM_ROCM_DSV4_ATOM_STATE_ALLOC"),
+    "VLLM_ROCM_DSV4_ATOM_UNIFIED_KV": env_bool("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV"),
     "VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM": env_bool(
         "VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM"
     ),

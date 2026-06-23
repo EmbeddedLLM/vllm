@@ -688,12 +688,12 @@ compressors.  It is still not a complete runnable ATOM path because:
 The sixth code slice prepares the attention side without switching dispatch:
 
 - `DeepseekV4RocmAtomStateMetadata` now carries:
-  - `batch_id_per_token`
-  - `batch_id_per_token_cpu`
-  - `n_committed_csa_per_seq`
-  - `n_committed_csa_per_seq_cpu`
-  - `n_committed_hca_per_seq`
-  - `n_committed_hca_per_seq_cpu`
+    - `batch_id_per_token`
+    - `batch_id_per_token_cpu`
+    - `n_committed_csa_per_seq`
+    - `n_committed_csa_per_seq_cpu`
+    - `n_committed_hca_per_seq`
+    - `n_committed_hca_per_seq_cpu`
 - These are built in `DeepseekV4RocmAtomModelState.prepare_attn` from vLLM's
   existing `InputBatch` scheduler state.
 - `DeepseekV4ROCMAiterMLAAttention._fused_qnorm_rope_kv_insert` preserves the
@@ -724,11 +724,11 @@ Code changes:
   invalidated normal graph capture and cannot remain in the non-eager target
   path.
 - Added defensive bounds to `swa_write`:
-  - `src_id` must be in `[0, total_tokens)`;
-  - request state slot must be in `[0, num_slots)`.
+    - `src_id` must be in `[0, total_tokens)`;
+    - request state slot must be in `[0, num_slots)`.
 - Added safe slot address formation in local paged decode:
-  - invalid slots are still masked out of attention math;
-  - pointer arithmetic uses a clamped `safe_slot` to avoid masked OOB pointer
+    - invalid slots are still masked out of attention math;
+    - pointer arithmetic uses a clamped `safe_slot` to avoid masked OOB pointer
     formation on ROCm.
 - Added diagnostic flag `VLLM_ROCM_DSV4_ATOM_DISABLE_SWA_WRITE=1`, default
   off, to isolate ATOM SWA ring writes from ATOM decode.
@@ -923,10 +923,10 @@ completion requests:
   intentionally zeroed in this mode, this is not a clean decode-index writer
   failure proof.
 - With the real SWA writer and ATOM HCA reader enabled:
-  - `max_tokens=1`: completed `128 / 128`
-  - `max_tokens=2`: completed `128 / 128`
-  - `max_tokens=4`: completed `128 / 128`
-  - `max_tokens=8`: failed after `8 / 128` completed
+    - `max_tokens=1`: completed `128 / 128`
+    - `max_tokens=2`: completed `128 / 128`
+    - `max_tokens=4`: completed `128 / 128`
+    - `max_tokens=8`: failed after `8 / 128` completed
 
 The fatal scheduler dump for the failing `max_tokens=8` run showed:
 
@@ -986,10 +986,10 @@ Validation:
   with zero throughput. This proves a single HCA layer is enough to reproduce the
   second-wave failure.
 - The same layer-0 run with `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=1` passed:
-  - `16 / 16`, `max_tokens=8`
-  - `128 / 128`, `max_tokens=8`
+    - `16 / 16`, `max_tokens=8`
+    - `128 / 128`, `max_tokens=8`
 - All HCA layers with `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=1` passed:
-  - `128 / 128`, `max_tokens=8`
+    - `128 / 128`, `max_tokens=8`
 - `ATOM_USE_TRITON_ATTN=0` is not a valid normal-cudagraph diagnostic for this
   path: the PyTorch reference calls `.item()` during capture and fails startup
   with `hipErrorStreamCaptureUnsupported`.
@@ -1030,27 +1030,27 @@ Follow-up audit:
 Initial validation:
 
 - Launched graph mode without `--enforce-eager` using:
-  - `MAX_NUM_SEQS=16`
-  - `MAX_NUM_BATCHED_TOKENS=2048`
-  - `MAX_MODEL_LEN=2048`
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-  - `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=4`
-  - `VLLM_ROCM_DSV4_ATOM_DECODE_SPLIT_WORKSPACE=torch_empty`
+    - `MAX_NUM_SEQS=16`
+    - `MAX_NUM_BATCHED_TOKENS=2048`
+    - `MAX_MODEL_LEN=2048`
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+    - `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=4`
+    - `VLLM_ROCM_DSV4_ATOM_DECODE_SPLIT_WORKSPACE=torch_empty`
 - A 16-way `/v1/completions` smoke with `max_tokens=8` completed `16 / 16`.
 - A 128-request reuse smoke at concurrency 16 completed `128 / 128`.
 - Server/client logs:
-  - `runlogs/splitk-torch-empty-smoke-server.log`
-  - `runlogs/splitk-torch-empty-smoke-client.log`
+    - `runlogs/splitk-torch-empty-smoke-server.log`
+    - `runlogs/splitk-torch-empty-smoke-client.log`
 - Log scan found no `hipError`, illegal address, traceback, runtime error, or
   assertion.
 - Repeated the same smoke with the default
   `VLLM_ROCM_DSV4_ATOM_DECODE_SPLIT_WORKSPACE=workspace`:
-  - server log: `runlogs/splitk-workspace-smoke-server.log`
-  - client log: `runlogs/splitk-workspace-smoke-client.log`
-  - `16 / 16` first-wave smoke passed;
-  - `128 / 128` reuse smoke at concurrency 16 passed;
-  - log scan found no `hipError`, illegal address, traceback, runtime error, or
+    - server log: `runlogs/splitk-workspace-smoke-server.log`
+    - client log: `runlogs/splitk-workspace-smoke-client.log`
+    - `16 / 16` first-wave smoke passed;
+    - `128 / 128` reuse smoke at concurrency 16 passed;
+    - log scan found no `hipError`, illegal address, traceback, runtime error, or
     assertion.
 
 Interpretation:
@@ -1067,29 +1067,29 @@ Interpretation:
 Larger-shape validation:
 
 - Repeated the split-K smoke at the historical larger shape:
-  - `MAX_NUM_SEQS=128`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=2048`
-  - `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=4`
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+    - `MAX_NUM_SEQS=128`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=2048`
+    - `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=4`
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
 - With `VLLM_ROCM_DSV4_ATOM_DECODE_SPLIT_WORKSPACE=workspace`:
-  - one `128 / 128` first-wave `/v1/completions` smoke passed;
-  - the next four-wave reuse run completed wave 0 (`128 / 128`) then stalled;
-  - server log showed `Running: 5 reqs`, zero throughput, then
+    - one `128 / 128` first-wave `/v1/completions` smoke passed;
+    - the next four-wave reuse run completed wave 0 (`128 / 128`) then stalled;
+    - server log showed `Running: 5 reqs`, zero throughput, then
     `No available shared memory broadcast block found in 60 seconds`;
-  - logs:
-    - `runlogs/splitk-workspace-maxseq128-smoke-server.log`
-    - `runlogs/splitk-workspace-maxseq128-smoke-client.log`
+    - logs:
+        - `runlogs/splitk-workspace-maxseq128-smoke-server.log`
+        - `runlogs/splitk-workspace-maxseq128-smoke-client.log`
 - With `VLLM_ROCM_DSV4_ATOM_DECODE_SPLIT_WORKSPACE=torch_empty`:
-  - one `128 / 128` first-wave smoke passed;
-  - the same four-wave reuse run completed all waves:
+    - one `128 / 128` first-wave smoke passed;
+    - the same four-wave reuse run completed all waves:
     `512 / 512` requests, no client errors;
-  - log scan found no `hipError`, illegal address, traceback, runtime error,
+    - log scan found no `hipError`, illegal address, traceback, runtime error,
     assertion, or shared-memory hang;
-  - logs:
-    - `runlogs/splitk-torch-empty-maxseq128-smoke-server.log`
-    - `runlogs/splitk-torch-empty-maxseq128-smoke-client.log`
+    - logs:
+        - `runlogs/splitk-torch-empty-maxseq128-smoke-server.log`
+        - `runlogs/splitk-torch-empty-maxseq128-smoke-client.log`
 
 Updated interpretation:
 
@@ -1099,8 +1099,8 @@ Updated interpretation:
   replay/reuse blocker for forced split-K decode.
 - Making split-K a production default should not use the global
   `WorkspaceManager.get_simultaneous(...)` partials as-is. It needs either:
-  - ATOM-style per-call graph-pool tensors; or
-  - a graph-safe persistent split-K partial allocator with lifetime isolated
+    - ATOM-style per-call graph-pool tensors; or
+    - a graph-safe persistent split-K partial allocator with lifetime isolated
     from unrelated workspace users and from repeated layer calls.
 - Updated `launchdeepseekgraph.sh` so
   `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS` defaults to an empty string instead of
@@ -1108,42 +1108,42 @@ Updated interpretation:
   now follows the ATOM/vendored heuristic and explicit overrides remain
   available for diagnostics.
 - Heuristic launch validation:
-  - launched without a split override at `MAX_NUM_SEQS=128`,
+    - launched without a split override at `MAX_NUM_SEQS=128`,
     `MAX_NUM_BATCHED_TOKENS=8192`, `MAX_MODEL_LEN=2048`, graph mode, V2 runner;
-  - one `128 / 128` first-wave smoke passed;
-  - the four-wave reuse smoke completed `512 / 512` requests;
-  - log scan found no `hipError`, illegal address, traceback, runtime error,
+    - one `128 / 128` first-wave smoke passed;
+    - the four-wave reuse smoke completed `512 / 512` requests;
+    - log scan found no `hipError`, illegal address, traceback, runtime error,
     assertion, or shared-memory hang;
-  - logs:
-    - `runlogs/splitk-heuristic-maxseq128-smoke-server.log`
-    - `runlogs/splitk-heuristic-maxseq128-smoke-client.log`
+    - logs:
+        - `runlogs/splitk-heuristic-maxseq128-smoke-server.log`
+        - `runlogs/splitk-heuristic-maxseq128-smoke-client.log`
 - Accuracy launch fix:
-  - an attempted default lmeval launch failed before serving because
+    - an attempted default lmeval launch failed before serving because
     `MAX_MODEL_LEN` defaulted empty, so vLLM tried DeepSeek-V4-Pro's full
     `1048576` context and rejected KV-cache allocation;
-  - updated `launchdeepseekgraph.sh` defaults to the prior accuracy-proven
+    - updated `launchdeepseekgraph.sh` defaults to the prior accuracy-proven
     launch shape: `MAX_MODEL_LEN=8192` and `GPU_MEMORY_UTILIZATION=0.9`.
 - Accuracy validation after enabling heuristic split-K:
-  - launch: default `launchdeepseekgraph.sh` after the above fixes,
+    - launch: default `launchdeepseekgraph.sh` after the above fixes,
     graph mode, V2 runner, no `--enforce-eager`, max seqs 256;
-  - command: unchanged `lmeval.sh`;
-  - result: GSM8K flexible exact match `0.9530`, strict exact match `0.9538`;
-  - this is inside the requested `0.95 ± 0.01` band;
-  - logs:
-    - `runlogs/heuristic-splitk-accuracy-server.log`
-    - `runlogs/heuristic-splitk-lmeval.log`
+    - command: unchanged `lmeval.sh`;
+    - result: GSM8K flexible exact match `0.9530`, strict exact match `0.9538`;
+    - this is inside the requested `0.95 ± 0.01` band;
+    - logs:
+        - `runlogs/heuristic-splitk-accuracy-server.log`
+        - `runlogs/heuristic-splitk-lmeval.log`
 - Fresh C32 benchmark after restarting the server:
-  - launch: `MAX_NUM_SEQS=32 bash launchdeepseekgraph.sh`;
-  - command: `RESULT_PREFIX=heuristic-splitk-current-default CONCURRENCIES=32 bash benchmarkvllm.sh`;
-  - successful requests: `320 / 320`;
-  - failed requests: `0`;
-  - output throughput: `882.5892 tok/s`;
-  - total token throughput: `1768.6260 tok/s`;
-  - mean TPOT: `35.2812 ms`;
-  - logs/results:
-    - `runlogs/heuristic-splitk-benchmark-server.log`
-    - `runlogs/heuristic-splitk-benchmark-c32.log`
-    - `bench-sparsemla/heuristic-splitk-current-default-C32.json`
+    - launch: `MAX_NUM_SEQS=32 bash launchdeepseekgraph.sh`;
+    - command: `RESULT_PREFIX=heuristic-splitk-current-default CONCURRENCIES=32 bash benchmarkvllm.sh`;
+    - successful requests: `320 / 320`;
+    - failed requests: `0`;
+    - output throughput: `882.5892 tok/s`;
+    - total token throughput: `1768.6260 tok/s`;
+    - mean TPOT: `35.2812 ms`;
+    - logs/results:
+        - `runlogs/heuristic-splitk-benchmark-server.log`
+        - `runlogs/heuristic-splitk-benchmark-c32.log`
+        - `bench-sparsemla/heuristic-splitk-current-default-C32.json`
 
 ### Thirteenth Diagnostic Slice
 
@@ -1165,22 +1165,22 @@ Decision:
 ATOM-attention run:
 
 - Launch:
-  - `MAX_NUM_SEQS=128`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `ENFORCE_EAGER=0`
-  - `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - `VLLM_ROCM_DSV4_ATOM_ATTENTION=1`
-  - `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=1`
+    - `MAX_NUM_SEQS=128`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `ENFORCE_EAGER=0`
+    - `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - `VLLM_ROCM_DSV4_ATOM_ATTENTION=1`
+    - `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=1`
 - `lmeval.sh` was unchanged.
 - Result: failed late in GSM8K generation. The server accepted and completed
   many requests, then `VllmWorker-0` died at `2026-06-18 15:36:25`.
 - Failure state:
-  - `num_running_reqs=118`
-  - `num_waiting_reqs=0`
-  - `kv_cache_usage=0.2726404963608161`
-  - decode step was scheduling one token per request
-  - engine then raised `RuntimeError: cancelled` from SHM broadcast after the
+    - `num_running_reqs=118`
+    - `num_waiting_reqs=0`
+    - `kv_cache_usage=0.2726404963608161`
+    - decode step was scheduling one token per request
+    - engine then raised `RuntimeError: cancelled` from SHM broadcast after the
     worker death
 - Interpretation: this is not KV exhaustion or a graph-capture startup issue.
   It is a late long-decode worker death in the ATOM attention path.
@@ -1189,37 +1189,37 @@ vLLM-attention isolation:
 
 - Launch was identical except `VLLM_ROCM_DSV4_ATOM_ATTENTION=0`.
 - This kept:
-  - V2 model runner
-  - normal cudagraph
-  - no `--enforce-eager`
-  - ATOM request-state allocation
-  - ATOM unified-KV allocation
-  - ATOM compressor planning/main compressor flags
-  - aiter fused MoE
-  - vLLM sparse attention path
+    - V2 model runner
+    - normal cudagraph
+    - no `--enforce-eager`
+    - ATOM request-state allocation
+    - ATOM unified-KV allocation
+    - ATOM compressor planning/main compressor flags
+    - aiter fused MoE
+    - vLLM sparse attention path
 - Unchanged `lmeval.sh` passed:
-  - GSM8K flexible exact match: `0.9560 +/- 0.0056`
-  - GSM8K strict exact match: `0.9568 +/- 0.0056`
+    - GSM8K flexible exact match: `0.9560 +/- 0.0056`
+    - GSM8K strict exact match: `0.9568 +/- 0.0056`
 
 Benchmark after a clean server restart:
 
 - Launch:
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `ENFORCE_EAGER=0`
-  - `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - `VLLM_ROCM_DSV4_ATOM_ATTENTION=0`
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `ENFORCE_EAGER=0`
+    - `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - `VLLM_ROCM_DSV4_ATOM_ATTENTION=0`
 - `benchmarkvllm.sh` result for random `1024/1024`, concurrency 32,
   320 prompts:
-  - successful requests: `320`
-  - failed requests: `0`
-  - benchmark duration: `384.46 s`
-  - output throughput: `852.30 tok/s`
-  - total throughput: `1707.93 tok/s`
-  - mean TPOT: `36.60 ms`
-  - median TPOT: `36.59 ms`
-  - P99 TPOT: `37.40 ms`
+    - successful requests: `320`
+    - failed requests: `0`
+    - benchmark duration: `384.46 s`
+    - output throughput: `852.30 tok/s`
+    - total throughput: `1707.93 tok/s`
+    - mean TPOT: `36.60 ms`
+    - median TPOT: `36.59 ms`
+    - P99 TPOT: `37.40 ms`
 
 Updated conclusion:
 
@@ -1287,26 +1287,26 @@ Syntax validation passed for:
 Post-fix short smoke:
 
 - Launch:
-  - `VLLM_ROCM_DSV4_ATOM_ATTENTION=1`
-  - `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=1`
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
-  - `ENFORCE_EAGER=0`
-  - `MAX_NUM_SEQS=128`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `VLLM_ROCM_DSV4_ATOM_ATTENTION=1`
+    - `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=1`
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
+    - `ENFORCE_EAGER=0`
+    - `MAX_NUM_SEQS=128`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
 - Graph capture completed with `VLLM_USE_BREAKABLE_CUDAGRAPH=0`, which was the
   stricter diagnostic graph mode used at that point in the investigation.
 - Random `1024/128`, concurrency 128, 128 prompts completed from the client
   perspective:
-  - successful requests: `128`
-  - failed requests: `0`
-  - output throughput: `959.72 tok/s`
-  - mean TPOT: `87.47 ms`
+    - successful requests: `128`
+    - failed requests: `0`
+    - output throughput: `959.72 tok/s`
+    - mean TPOT: `87.47 ms`
 - The worker still died at the tail of the run:
-  - `VllmWorker-1 died unexpectedly`
-  - scheduler dump showed about 120 running requests and no waiting requests
-  - KV cache usage was around 21.9%
-  - output tokens were in the `112-127` range
+    - `VllmWorker-1 died unexpectedly`
+    - scheduler dump showed about 120 running requests and no waiting requests
+    - KV cache usage was around 21.9%
+    - output tokens were in the `112-127` range
 
 Interpretation:
 
@@ -1314,8 +1314,8 @@ Interpretation:
   scheduler block table.
 - It did not make the ATOM attention path stable enough for full lm-eval.
 - The next isolation should split ATOM attention by compression ratio:
-  - CSA-only: `VLLM_ROCM_DSV4_ATOM_ATTENTION_RATIOS=4`
-  - HCA-only: `VLLM_ROCM_DSV4_ATOM_ATTENTION_RATIOS=128`
+    - CSA-only: `VLLM_ROCM_DSV4_ATOM_ATTENTION_RATIOS=4`
+    - HCA-only: `VLLM_ROCM_DSV4_ATOM_ATTENTION_RATIOS=128`
 - If HCA-only fails, compare native vLLM HCA index construction with
   `VLLM_ROCM_DSV4_ATOM_HCA_NATIVE_INDICES=1`.
 
@@ -1365,11 +1365,11 @@ Important code-path detail:
 - Even when both `VLLM_ROCM_DSV4_ATOM_SKIP_FUSED_COMPRESS=1` and
   `VLLM_ROCM_DSV4_ATOM_SKIP_COMPRESS_STATE_UPDATE=1` are set, the current
   ATOM main-compressor wrapper still:
-  - fetches ATOM state metadata and compression plans,
-  - fetches the vLLM compressed-cache metadata,
-  - builds or reuses the HCA flattened block table when
+    - fetches ATOM state metadata and compression plans,
+    - fetches the vLLM compressed-cache metadata,
+    - builds or reuses the HCA flattened block table when
     `VLLM_ROCM_DSV4_ATOM_HCA_FLAT_CACHE=1`,
-  - prepares RoPE views.
+    - prepares RoPE views.
 
 Current interpretation:
 
@@ -1377,9 +1377,9 @@ Current interpretation:
 - HCA `update_compressor_states` is sufficient to kill the worker in prior
   isolations, but it is not the only unsafe component.
 - The new tight suspect set is:
-  - HCA flattened block-table construction/replay,
-  - HCA ATOM decode metadata lifetime under vLLM graph replay,
-  - ATOM HCA attention path bookkeeping even when paged decode and decode
+    - HCA flattened block-table construction/replay,
+    - HCA ATOM decode metadata lifetime under vLLM graph replay,
+    - ATOM HCA attention path bookkeeping even when paged decode and decode
     index writes are bypassed.
 - The next highest-signal run is the same native-fallback/skip-both diagnostic
   with `VLLM_ROCM_DSV4_ATOM_HCA_FLAT_CACHE=0`. If that survives, the flattened
@@ -1441,33 +1441,33 @@ This matches the ATOM decode HCA index writer, which emits:
 Two normal-cudagraph runs were tested:
 
 - shared settings:
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
-  - `ENFORCE_EAGER=0`
-  - `MAX_NUM_SEQS=128`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - HCA-only ATOM attention:
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
+    - `ENFORCE_EAGER=0`
+    - `MAX_NUM_SEQS=128`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - HCA-only ATOM attention:
     `VLLM_ROCM_DSV4_ATOM_ATTENTION_RATIOS=128`
-  - `VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR=1`
-  - `VLLM_ROCM_DSV4_ATOM_HCA_FLAT_CACHE=0`
-  - `VLLM_ROCM_DSV4_ATOM_NATIVE_AFTER_MAIN_COMPRESSOR=1`
-  - decode output bypass:
+    - `VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR=1`
+    - `VLLM_ROCM_DSV4_ATOM_HCA_FLAT_CACHE=0`
+    - `VLLM_ROCM_DSV4_ATOM_NATIVE_AFTER_MAIN_COMPRESSOR=1`
+    - decode output bypass:
     `VLLM_ROCM_DSV4_ATOM_SKIP_PAGED_DECODE=1`
-  - decode index write bypass:
+    - decode index write bypass:
     `VLLM_ROCM_DSV4_ATOM_SKIP_DECODE_INDEX_WRITE=1`
-  - random `128/128`, concurrency 128, 128 warmups + 1280 main prompts
+    - random `128/128`, concurrency 128, 128 warmups + 1280 main prompts
 - fused HCA compressor enabled, HCA state update disabled:
-  - successful requests: `1280`
-  - failed requests: `0`
-  - output throughput: `2271.77 tok/s`
-  - total throughput: `4614.53 tok/s`
-  - mean TPOT: `48.77 ms`
+    - successful requests: `1280`
+    - failed requests: `0`
+    - output throughput: `2271.77 tok/s`
+    - total throughput: `4614.53 tok/s`
+    - mean TPOT: `48.77 ms`
 - fused HCA compressor enabled, HCA state update enabled:
-  - successful requests: `1280`
-  - failed requests: `0`
-  - output throughput: `2262.01 tok/s`
-  - total throughput: `4594.71 tok/s`
-  - mean TPOT: `49.00 ms`
+    - successful requests: `1280`
+    - failed requests: `0`
+    - output throughput: `2262.01 tok/s`
+    - total throughput: `4594.71 tok/s`
+    - mean TPOT: `49.00 ms`
 
 Code decision:
 
@@ -1683,24 +1683,24 @@ New opt-in flag:
 Code added:
 
 - `DeepseekV4AtomMLAAttentionSpec` in `vllm/v1/kv_cache_interface.py`
-  - subclass of `MLAAttentionSpec`
-  - keeps the normal compressed MLA page-size contract
-  - adds `atom_swa_prefix_bytes`, `atom_swa_pages`, and `atom_swa_dtype`
+    - subclass of `MLAAttentionSpec`
+    - keeps the normal compressed MLA page-size contract
+    - adds `atom_swa_prefix_bytes`, `atom_swa_pages`, and `atom_swa_dtype`
 - DeepSeek-V4 allocator support in `vllm/v1/core/kv_cache_utils.py`
-  - subtracts fixed ATOM SWA prefix bytes before computing `num_blocks`
-  - emits per-layer `KVCacheTensor` storage for ATOM-prefixed layers
-  - leaves the existing DeepSeek-V4 bucketed sharing path for regular layers
+    - subtracts fixed ATOM SWA prefix bytes before computing `num_blocks`
+    - emits per-layer `KVCacheTensor` storage for ATOM-prefixed layers
+    - leaves the existing DeepSeek-V4 bucketed sharing path for regular layers
 - reshape support in `vllm/v1/worker/gpu/attn_utils.py`
-  - skips the SWA prefix before forming the normal compressed `kv_cache` tensor
-  - preserves the existing attention-module `kv_cache` contract
+    - skips the SWA prefix before forming the normal compressed `kv_cache` tensor
+    - preserves the existing attention-module `kv_cache` contract
 - ROCm DSV4 spec emission in `vllm/models/deepseek_v4/attention.py`
-  - only on ROCm
-  - only when `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1`
-  - CUDA still emits the original `MLAAttentionSpec`
+    - only on ROCm
+    - only when `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1`
+    - CUDA still emits the original `MLAAttentionSpec`
 - model-state binding in `vllm/models/deepseek_v4/amd/model_state.py`
-  - attempts to alias ATOM unified views from vLLM-owned raw storage
-  - binds `atom_swa_kv`, `atom_unified_kv`, and compressor `atom_kv_cache`
-  - falls back to the known side allocation if the dtype contract is not
+    - attempts to alias ATOM unified views from vLLM-owned raw storage
+    - binds `atom_swa_kv`, `atom_unified_kv`, and compressor `atom_kv_cache`
+    - falls back to the known side allocation if the dtype contract is not
     compatible
 
 Static check:
@@ -1715,8 +1715,8 @@ Current limitation:
   model dtype.
 - Therefore the fp8 deployment cannot fully use vLLM-owned unified storage
   until the ATOM ROCm kernels accept either:
-  - split typed views: `swa_kv` plus compressed tail, or
-  - a raw unified byte allocation plus layout metadata.
+    - split typed views: `swa_kv` plus compressed tail, or
+    - a raw unified byte allocation plus layout metadata.
 
 Interpretation:
 
@@ -1736,18 +1736,18 @@ allocation/binding smoke.
 Additional code changes:
 
 - `KVCacheTensor.fixed_prefix_size`
-  - lets vLLM carry tensors with a fixed SWA prefix plus a scalable compressed
+    - lets vLLM carry tensors with a fixed SWA prefix plus a scalable compressed
     KV tail
-  - fixes the final cross-rank `min_num_blocks` shrink step so only the
+    - fixes the final cross-rank `min_num_blocks` shrink step so only the
     per-block tail is scaled
 - per-spec cache dtype in `vllm/v1/worker/gpu/attn_utils.py`
-  - the reshape path now passes `kv_cache_spec.cache_dtype_str` to the backend
+    - the reshape path now passes `kv_cache_spec.cache_dtype_str` to the backend
     shape helper when the spec provides one
-  - this avoids using global `fp8_ds_mla` shape rules for the opt-in bf16 ATOM
+    - this avoids using global `fp8_ds_mla` shape rules for the opt-in bf16 ATOM
     tail
 - opt-in ATOM vLLM-owned spec now advertises `cache_dtype_str="bf16"`
-  - this is not the final fp8 mixed-layout target
-  - it is a mechanical validation path for vLLM-owned storage with the current
+    - this is not the final fp8 mixed-layout target
+    - it is a mechanical validation path for vLLM-owned storage with the current
     homogeneous-`atom_unified_kv` kernels
 
 Smoke command:
@@ -1766,18 +1766,18 @@ Observed successful boundary:
 - KV-cache config was generated successfully.
 - GPU KV cache size was logged as `1,601,640` tokens for this small smoke.
 - All 8 workers logged:
-  - `Bound ROCm DSV4 ATOM unified KV views from vLLM-owned KV storage`
-  - `active_layers=61`
-  - `num_blocks=7486`
-  - `swa_pages=2048`
+    - `Bound ROCm DSV4 ATOM unified KV views from vLLM-owned KV storage`
+    - `active_layers=61`
+    - `num_blocks=7486`
+    - `swa_pages=2048`
 
 Observed failure after binding:
 
 - Engine failed during worker warmup/compile.
 - Root error came from the native fp8 cache dequant path:
-  - `Cannot bitcast data-type of size 16 to data-type of size 8`
-  - the failing code attempted to load fp8 token bytes and bitcast them to fp8
-  - the opt-in ATOM cache tail was bf16, so this native path was reading the
+    - `Cannot bitcast data-type of size 16 to data-type of size 8`
+    - the failing code attempted to load fp8 token bytes and bitcast them to fp8
+    - the opt-in ATOM cache tail was bf16, so this native path was reading the
     wrong layout
 
 Interpretation:
@@ -1786,11 +1786,11 @@ Interpretation:
   without GPU-worker changes.
 - The remaining gap is no longer the KV-cache allocator itself.
 - The remaining gap is attention/backend cache-op routing:
-  - with `--kv-cache-dtype fp8`, some native DeepSeek-V4 cache update/gather
+    - with `--kv-cache-dtype fp8`, some native DeepSeek-V4 cache update/gather
     paths still assume global `fp8_ds_mla` layout during warmup/prefill
-  - the ATOM path needs either a split typed kernel contract or backend metadata
+    - the ATOM path needs either a split typed kernel contract or backend metadata
     that routes ATOM-owned layers away from native fp8 dequant/update helpers
-  - the final target should be mixed-layout-aware rather than the temporary
+    - the final target should be mixed-layout-aware rather than the temporary
     homogeneous-bf16 validation path
 
 ## Twenty-fourth Diagnostic Slice
@@ -1801,12 +1801,12 @@ gather path.
 Additional code changes:
 
 - `vllm/models/deepseek_v4/amd/rocm.py`
-  - added `_gather_plain_k_cache_kernel`
-  - added `_gather_plain_k_cache`
-  - added `_gather_k_cache`
-  - native prefill now dispatches:
-    - `uint8` cache: existing `dequantize_and_gather_k_cache`
-    - BF16/model-dtype cache: direct plain gather
+    - added `_gather_plain_k_cache_kernel`
+    - added `_gather_plain_k_cache`
+    - added `_gather_k_cache`
+    - native prefill now dispatches:
+        - `uint8` cache: existing `dequantize_and_gather_k_cache`
+        - BF16/model-dtype cache: direct plain gather
 
 Smoke command:
 
@@ -1838,10 +1838,10 @@ Important implementation gap:
 - The current vLLM ROCm adapter only routes decode through the ATOM paged
   decode path.
 - Prefill still uses the native ROCm sparse prefill flow:
-  - gather compressed cache rows into a workspace
-  - gather SWA rows into a workspace
-  - combine top-k and SWA indices
-  - call `rocm_sparse_attn_prefill`
+    - gather compressed cache rows into a workspace
+    - gather SWA rows into a workspace
+    - combine top-k and SWA indices
+    - call `rocm_sparse_attn_prefill`
 - The paged-prefill index kernel already exists in
   `vllm/models/deepseek_v4/amd/v4_kernels/paged_prefill_indices.py`, but the
   model state does not yet expose persistent prefill indptr/index buffers, and
@@ -1862,8 +1862,8 @@ Current component status:
 - Request state rings: vLLM V2 `ModelState` owns persistent SWA and compressor
   state slots without GPU-worker changes.
 - Unified KV allocation:
-  - side allocation path is runnable and accuracy-validated in previous runs
-  - vLLM-owned allocation path can bind, run, pass GSM8K, and complete C32
+    - side allocation path is runnable and accuracy-validated in previous runs
+    - vLLM-owned allocation path can bind, run, pass GSM8K, and complete C32
     benchmark validation in later runs
 - ATOM decode attention: wired through `sparse_attn_v4_paged_decode`.
 - ATOM prefill attention: wired through `sparse_attn_v4_paged_prefill` for the
@@ -1900,12 +1900,12 @@ Validation:
 - Small V2 smoke launched with `--block-size 128`, breakable cudagraph enabled,
   and no `--enforce-eager`.
 - KV-cache allocation succeeded:
-  - available KV memory: 30.27 GiB
-  - GPU KV cache size: 4,594,363 tokens
+    - available KV memory: 30.27 GiB
+    - GPU KV cache size: 4,594,363 tokens
 - Breakable cudagraph capture completed in both PIECEWISE and FULL phases.
 - `/v1/models` returned HTTP 200.
 - Tiny completion request returned the expected arithmetic answer prefix:
-  `Question: What is 2+2? Answer:` -> ` 4`.
+  `Question: What is 2+2? Answer:` -> `4`.
 
 Next validation:
 
@@ -1917,19 +1917,19 @@ Results:
 - GSM8K with unchanged `lmeval.sh`, server launched with
   `MAX_NUM_SEQS=256`, `MAX_NUM_BATCHED_TOKENS=8192`, `BLOCK_SIZE=128`,
   `VLLM_USE_BREAKABLE_CUDAGRAPH=1`, no `--enforce-eager`:
-  - flexible-extract exact match: `0.9530 ± 0.0058`
-  - strict-match exact match: `0.9538 ± 0.0058`
-  - no lm-eval or server errors
+    - flexible-extract exact match: `0.9530 ± 0.0058`
+    - strict-match exact match: `0.9538 ± 0.0058`
+    - no lm-eval or server errors
 - C32 benchmark with fresh server restart, `MAX_NUM_SEQS=32`,
   `MAX_NUM_BATCHED_TOKENS=8192`, `BLOCK_SIZE=128`,
   `VLLM_USE_BREAKABLE_CUDAGRAPH=1`, no `--enforce-eager`:
-  - output throughput: `840.57 tok/s`
-  - total throughput: `1684.43 tok/s`
-  - request throughput: `0.82 req/s`
-  - mean TPOT: `37.07 ms`
-  - median TPOT: `37.02 ms`
-  - mean TTFT: `1054.92 ms`
-  - zero failed requests
+    - output throughput: `840.57 tok/s`
+    - total throughput: `1684.43 tok/s`
+    - request throughput: `0.82 req/s`
+    - mean TPOT: `37.07 ms`
+    - median TPOT: `37.02 ms`
+    - mean TTFT: `1054.92 ms`
+    - zero failed requests
 
 Notes:
 
@@ -1969,8 +1969,8 @@ Paged prefill validation:
 - Small prompt smoke passed.
 - Long prompt smoke passed.
 - Full unchanged `lmeval.sh` failed badly with paged prefill enabled:
-  - CSA tail-placement attempt: flexible `0.1016`, strict `0.0781`
-  - ATOM-commit head-placement attempt: flexible `0.0917`, strict `0.0728`
+    - CSA tail-placement attempt: flexible `0.1016`, strict `0.0781`
+    - ATOM-commit head-placement attempt: flexible `0.0917`, strict `0.0728`
 - Conclusion: the paged-prefill sparse attention path is runtime-stable but not
   correctness-valid. Do not use it for performance claims.
 
@@ -1987,8 +1987,8 @@ Compressor-first experiment:
 Default restored:
 
 - `launchdeepseekgraph.sh` now defaults to:
-  - `VLLM_ROCM_DSV4_ATOM_COMPRESS_FIRST=0`
-  - `VLLM_ROCM_DSV4_ATOM_SKIP_PAGED_PREFILL=1`
+    - `VLLM_ROCM_DSV4_ATOM_COMPRESS_FIRST=0`
+    - `VLLM_ROCM_DSV4_ATOM_SKIP_PAGED_PREFILL=1`
 - This keeps the server on the accuracy-valid path while leaving the
   experimental paged-prefill and compressor-first paths opt-in.
 
@@ -1997,21 +1997,21 @@ Validation after restoring defaults:
 - Server: `MAX_NUM_SEQS=256`, `MAX_NUM_BATCHED_TOKENS=8192`,
   `BLOCK_SIZE=128`, `VLLM_USE_BREAKABLE_CUDAGRAPH=1`, no `--enforce-eager`.
 - Unchanged `lmeval.sh`:
-  - flexible-extract exact match: `0.9530 ± 0.0058`
-  - strict-match exact match: `0.9538 ± 0.0058`
-  - zero lm-eval/server errors
+    - flexible-extract exact match: `0.9530 ± 0.0058`
+    - strict-match exact match: `0.9538 ± 0.0058`
+    - zero lm-eval/server errors
 - C32 benchmark after fresh server restart:
-  - server: `MAX_NUM_SEQS=32`, `MAX_NUM_BATCHED_TOKENS=8192`,
+    - server: `MAX_NUM_SEQS=32`, `MAX_NUM_BATCHED_TOKENS=8192`,
     `BLOCK_SIZE=128`, no `--enforce-eager`
-  - successful requests: `320`
-  - failed requests: `0`
-  - benchmark duration: `389.35 s`
-  - output throughput: `841.60 tok/s`
-  - total throughput: about `1686 tok/s`
-  - request throughput: `0.82 req/s`
-  - mean TTFT: `1097.20 ms`
-  - mean TPOT: `36.98 ms`
-  - median TPOT: `36.82 ms`
+    - successful requests: `320`
+    - failed requests: `0`
+    - benchmark duration: `389.35 s`
+    - output throughput: `841.60 tok/s`
+    - total throughput: about `1686 tok/s`
+    - request throughput: `0.82 req/s`
+    - mean TTFT: `1097.20 ms`
+    - mean TPOT: `36.98 ms`
+    - median TPOT: `36.82 ms`
 
 Current interpretation:
 
@@ -2021,11 +2021,11 @@ Current interpretation:
   scheduler, V2 model runner, vLLM KV allocation, ATOM-side request state
   buffers, and ATOM decode/state kernels.
 - The missing correctness-valid pieces for full ATOM benefit are:
-  - exact prefill unified-KV population/read ordering
-  - paged-prefill CSA/SWA packed layout parity
-  - compressor-first execution parity without breaking native fallback paths
-  - less Python/NumPy metadata preparation in the hot path
-  - eventually a ROCm-only unified DSV4 KV-cache spec/allocation path instead
+    - exact prefill unified-KV population/read ordering
+    - paged-prefill CSA/SWA packed layout parity
+    - compressor-first execution parity without breaking native fallback paths
+    - less Python/NumPy metadata preparation in the hot path
+    - eventually a ROCm-only unified DSV4 KV-cache spec/allocation path instead
     of side allocation plus vLLM paged-cache adaptation
 
 ## Twenty-seventh Diagnostic Slice: ATOM Decode Overhead Attribution
@@ -2038,25 +2038,25 @@ Question:
 Code added:
 
 - `vllm/models/deepseek_v4/amd/rocm.py` now has opt-in profiling flags:
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER=0` by default; set `-1` for all layers.
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_EVERY=200` by default.
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER=0` by default; set `-1` for all layers.
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_EVERY=200` by default.
 - The values are cached at module import, matching the rest of the ROCm ATOM
   flags and avoiding repeated `os.environ.get` in the hot path.
 
 What it measures:
 
 - `ATOM_PROFILE_DECODE` synchronizes around the ATOM decode wrapper segments:
-  - `index_ms`: ATOM decode indptr/index writes.
-  - `translate_ms`: CSA/HCA dense/native index translation into ATOM page ids.
-  - `kernel_ms`: `sparse_attn_v4_paged_decode` only.
-  - `total_ms`: wrapper total for the profiled layer call.
+    - `index_ms`: ATOM decode indptr/index writes.
+    - `translate_ms`: CSA/HCA dense/native index translation into ATOM page ids.
+    - `kernel_ms`: `sparse_attn_v4_paged_decode` only.
+    - `total_ms`: wrapper total for the profiled layer call.
 - `ATOM_PROFILE_METADATA` synchronizes around the ROCm metadata builders:
-  - `base_ms`: inherited vLLM sparse MLA/SWA metadata construction.
-  - `ragged_ms`: dense-to-ragged conversion and graph-stable buffer copy added
+    - `base_ms`: inherited vLLM sparse MLA/SWA metadata construction.
+    - `ragged_ms`: dense-to-ragged conversion and graph-stable buffer copy added
     for the ATOM decode wrapper.
-  - `total_ms`: builder total.
+    - `total_ms`: builder total.
 
 Important caveat:
 
@@ -2101,49 +2101,49 @@ Profiler implementation note:
 Short profiled run:
 
 - Server config:
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `BLOCK_SIZE=128`
-  - `ENFORCE_EAGER=0`
-  - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER=0`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_EVERY=50`
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `BLOCK_SIZE=128`
+    - `ENFORCE_EAGER=0`
+    - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER=0`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_EVERY=50`
 - Smoke request:
-  - prompt: `Question: What is 2+2? Answer:`
-  - `max_tokens=16`, `temperature=0`
-  - first answer token was correct: `4`
+    - prompt: `Question: What is 2+2? Answer:`
+    - `max_tokens=16`, `temperature=0`
+    - first answer token was correct: `4`
 - Log: `/app/atomdsv4/dsv4_profile_overhead_server.log`
 
 Observed decode timings:
 
 - Layer 0, ratio 128, T=32, per-rank steady samples were roughly:
-  - `index_ms`: about `2.1 ms`
-  - `translate_ms`: about `1.5 ms`
-  - `kernel_ms`: about `2.9 ms`
-  - `total_ms`: about `6.5 ms`
+    - `index_ms`: about `2.1 ms`
+    - `translate_ms`: about `1.5 ms`
+    - `kernel_ms`: about `2.9 ms`
+    - `total_ms`: about `6.5 ms`
 - T=24 samples:
-  - `index_ms`: about `1.04 ms`
-  - `translate_ms`: about `0.05 ms`
-  - `kernel_ms`: about `0.08 ms`
-  - `total_ms`: about `1.16 ms`
+    - `index_ms`: about `1.04 ms`
+    - `translate_ms`: about `0.05 ms`
+    - `kernel_ms`: about `0.08 ms`
+    - `total_ms`: about `1.16 ms`
 - T=16 samples:
-  - `index_ms`: about `0.065 ms`
-  - `translate_ms`: about `0.036 ms`
-  - `kernel_ms`: about `0.10 ms`
-  - `total_ms`: about `0.20 ms`
+    - `index_ms`: about `0.065 ms`
+    - `translate_ms`: about `0.036 ms`
+    - `kernel_ms`: about `0.10 ms`
+    - `total_ms`: about `0.20 ms`
 
 Observed metadata timings:
 
 - Warm-ish T=32 HCA metadata samples after cold setup:
-  - MLA ratio 128 base metadata: about `0.3-0.4 ms`
-  - dense-to-ragged/copy: about `0.1-0.17 ms`
-  - total: about `0.44-0.53 ms`
+    - MLA ratio 128 base metadata: about `0.3-0.4 ms`
+    - dense-to-ragged/copy: about `0.1-0.17 ms`
+    - total: about `0.44-0.53 ms`
 - Cold/setup samples are much larger:
-  - MLA ratio 128 T=32 total around `7 ms`
-  - SWA first T=32 metadata around `16 ms`
-  - These appear during graph warmup/capture setup and should not be mixed with
+    - MLA ratio 128 T=32 total around `7 ms`
+    - SWA first T=32 metadata around `16 ms`
+    - These appear during graph warmup/capture setup and should not be mixed with
     steady runtime estimates.
 
 Conclusion:
@@ -2167,47 +2167,47 @@ HCA native-index experiment:
   ATOM-side HCA head writer and copies prebuilt vLLM HCA ragged indices into the
   ATOM unified-KV index space.
 - Profiled smoke config:
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `BLOCK_SIZE=128`
-  - `ENFORCE_EAGER=0`
-  - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-  - profile layer 0
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `BLOCK_SIZE=128`
+    - `ENFORCE_EAGER=0`
+    - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+    - profile layer 0
 - Smoke request still produced a correct first answer token for `2+2`.
 
 Profile result versus default:
 
 - Default HCA writer, T=32 median:
-  - `index_ms`: `2.111`
-  - `translate_ms`: `1.502`
-  - `kernel_ms`: `2.902`
-  - `total_ms`: `6.514`
+    - `index_ms`: `2.111`
+    - `translate_ms`: `1.502`
+    - `kernel_ms`: `2.902`
+    - `total_ms`: `6.514`
 - HCA native indices, T=32 median:
-  - `index_ms`: `2.083`
-  - `translate_ms`: `0.010`
-  - `kernel_ms`: `2.912`
-  - `total_ms`: `4.998`
+    - `index_ms`: `2.083`
+    - `translate_ms`: `0.010`
+    - `kernel_ms`: `2.912`
+    - `total_ms`: `4.998`
 - HCA native indices, T=24 median:
-  - default total: `1.163 ms`
-  - native-index total: `1.128 ms`
+    - default total: `1.163 ms`
+    - native-index total: `1.128 ms`
 - HCA native indices, T=16 median:
-  - default total: `0.197 ms`
-  - native-index total: `0.164 ms`
+    - default total: `0.197 ms`
+    - native-index total: `0.164 ms`
 
 Accuracy validation:
 
 - Started a clean no-profile server:
-  - `MAX_NUM_SEQS=256`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `BLOCK_SIZE=128`
-  - `ENFORCE_EAGER=0`
-  - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-  - `VLLM_ROCM_DSV4_ATOM_HCA_NATIVE_INDICES=1`
+    - `MAX_NUM_SEQS=256`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `BLOCK_SIZE=128`
+    - `ENFORCE_EAGER=0`
+    - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+    - `VLLM_ROCM_DSV4_ATOM_HCA_NATIVE_INDICES=1`
 - Ran unchanged `/app/atomdsv4/lmeval.sh`.
 - Log: `/app/atomdsv4/lmeval_hca_native.log`
 - Result:
-  - flexible-extract exact match: `0.8908 ± 0.0086`
-  - strict-match exact match: `0.8893 ± 0.0086`
+    - flexible-extract exact match: `0.8908 ± 0.0086`
+    - strict-match exact match: `0.8893 ± 0.0086`
 
 Conclusion for HCA native-index path:
 
@@ -2233,10 +2233,10 @@ What changed:
   and HCA index buffers.
 - When the optional HCA arguments are provided, the same Triton launch also
   writes the HCA committed-head prefix:
-  - source: `attn_metadata.block_table`
-  - committed length: `atom_state.n_committed_hca_per_seq`
-  - destination: `hca_indices[hca_indptr[t] : hca_indptr[t] + n_hca]`
-  - value formula:
+    - source: `attn_metadata.block_table`
+    - committed length: `atom_state.n_committed_hca_per_seq`
+    - destination: `hca_indices[hca_indptr[t] : hca_indptr[t] + n_hca]`
+    - value formula:
     `swa_pages + physical_block * hca_block_capacity + slot_offset`
 - This is intended to be equivalent to the existing
   `_write_hca_compress_head` helper, but avoids the second HCA-head kernel
@@ -2255,12 +2255,12 @@ Why this is different from the failed native-index experiment:
 Validation performed so far:
 
 - `python -m py_compile` passed for:
-  - `vllm/models/deepseek_v4/amd/v4_kernels/paged_decode_indices.py`
-  - `vllm/models/deepseek_v4/amd/rocm.py`
+    - `vllm/models/deepseek_v4/amd/v4_kernels/paged_decode_indices.py`
+    - `vllm/models/deepseek_v4/amd/rocm.py`
 - A small CPU reference fixture passed, verifying that the helper writes:
-  - SWA tails at each ragged slice tail.
-  - HCA committed heads before the SWA tail.
-  - HCA values using the same block-table formula as `_write_hca_compress_head`.
+    - SWA tails at each ragged slice tail.
+    - HCA committed heads before the SWA tail.
+    - HCA values using the same block-table formula as `_write_hca_compress_head`.
 
 Validation still required before enabling by default:
 
@@ -2270,55 +2270,55 @@ Validation still required before enabling by default:
 Runtime validation:
 
 - Runtime smoke:
-  - `VLLM_ROCM_DSV4_ATOM_FUSED_HCA_INDEX=1`
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `BLOCK_SIZE=128`
-  - `ENFORCE_EAGER=0`
-  - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-  - result: server started, graph capture completed, minimal `2+2` completion
-    returned the correct first answer token, and no Triton/runtime error was
-    observed.
-- Full unchanged `/app/atomdsv4/lmeval.sh`:
-  - server config:
-    - `VLLM_ROCM_DSV4_ATOM_FUSED_HCA_INDEX=1`
-    - `MAX_NUM_SEQS=256`
-    - `MAX_NUM_BATCHED_TOKENS=8192`
-    - `BLOCK_SIZE=128`
-    - `ENFORCE_EAGER=0`
-  - log: `/app/atomdsv4/lmeval_fused_hca_index.log`
-  - result:
-    - flexible-extract exact match: `0.9515 +/- 0.0059`
-    - strict-match exact match: `0.9522 +/- 0.0059`
-  - conclusion: accuracy passes the required GSM8K `0.95 +/- 0.01` band.
-- C32 benchmark after a fresh server restart:
-  - server config:
     - `VLLM_ROCM_DSV4_ATOM_FUSED_HCA_INDEX=1`
     - `MAX_NUM_SEQS=32`
     - `MAX_NUM_BATCHED_TOKENS=8192`
     - `BLOCK_SIZE=128`
     - `ENFORCE_EAGER=0`
-  - benchmark log: `/app/atomdsv4/benchmark_fused_hca_index_c32.log`
-  - successful requests: `320`
-  - failed requests: `0`
-  - benchmark duration: `387.06 s`
-  - output throughput: `846.58 tok/s`
-  - total throughput: `1696.46 tok/s`
-  - mean TTFT: `913.70 ms`
-  - mean TPOT: `36.93 ms`
+    - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+    - result: server started, graph capture completed, minimal `2+2` completion
+    returned the correct first answer token, and no Triton/runtime error was
+    observed.
+- Full unchanged `/app/atomdsv4/lmeval.sh`:
+    - server config:
+        - `VLLM_ROCM_DSV4_ATOM_FUSED_HCA_INDEX=1`
+        - `MAX_NUM_SEQS=256`
+        - `MAX_NUM_BATCHED_TOKENS=8192`
+        - `BLOCK_SIZE=128`
+        - `ENFORCE_EAGER=0`
+    - log: `/app/atomdsv4/lmeval_fused_hca_index.log`
+    - result:
+        - flexible-extract exact match: `0.9515 +/- 0.0059`
+        - strict-match exact match: `0.9522 +/- 0.0059`
+    - conclusion: accuracy passes the required GSM8K `0.95 +/- 0.01` band.
+- C32 benchmark after a fresh server restart:
+    - server config:
+        - `VLLM_ROCM_DSV4_ATOM_FUSED_HCA_INDEX=1`
+        - `MAX_NUM_SEQS=32`
+        - `MAX_NUM_BATCHED_TOKENS=8192`
+        - `BLOCK_SIZE=128`
+        - `ENFORCE_EAGER=0`
+    - benchmark log: `/app/atomdsv4/benchmark_fused_hca_index_c32.log`
+    - successful requests: `320`
+    - failed requests: `0`
+    - benchmark duration: `387.06 s`
+    - output throughput: `846.58 tok/s`
+    - total throughput: `1696.46 tok/s`
+    - mean TTFT: `913.70 ms`
+    - mean TPOT: `36.93 ms`
 
 Comparison with previous validated C32 runs:
 
 - Default correct path before this change:
-  - output throughput: `841.60 tok/s`
-  - total throughput: about `1686 tok/s`
-  - mean TPOT: `36.98 ms`
+    - output throughput: `841.60 tok/s`
+    - total throughput: about `1686 tok/s`
+    - mean TPOT: `36.98 ms`
 - Earlier vLLM sparse baseline:
-  - output throughput: `852.30 tok/s`
+    - output throughput: `852.30 tok/s`
 - Fused HCA committed-head index fill:
-  - output throughput: `846.58 tok/s`
-  - total throughput: `1696.46 tok/s`
-  - mean TPOT: `36.93 ms`
+    - output throughput: `846.58 tok/s`
+    - total throughput: `1696.46 tok/s`
+    - mean TPOT: `36.93 ms`
 
 Conclusion:
 
@@ -2335,20 +2335,20 @@ Conclusion:
 Profile follow-up:
 
 - Started a profiled C32 server with:
-  - `VLLM_ROCM_DSV4_ATOM_FUSED_HCA_INDEX=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER=0`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_EVERY=20`
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `BLOCK_SIZE=128`
-  - `ENFORCE_EAGER=0`
+    - `VLLM_ROCM_DSV4_ATOM_FUSED_HCA_INDEX=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER=0`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_EVERY=20`
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `BLOCK_SIZE=128`
+    - `ENFORCE_EAGER=0`
 - Ran a short C32 random workload:
-  - input length: `1024`
-  - output length: `256`
-  - warmups: `32`
-  - prompts: `96`
-  - log: `/app/atomdsv4/benchmark_fused_hca_index_profile_c32_short.log`
+    - input length: `1024`
+    - output length: `256`
+    - warmups: `32`
+    - prompts: `96`
+    - log: `/app/atomdsv4/benchmark_fused_hca_index_profile_c32_short.log`
 - Server log parsed from:
   `/app/atomdsv4/dsv4prographnomtp-aitermhc_nobreakablecudagraph.log`
 
@@ -2381,9 +2381,9 @@ Interpretation:
   for comparing wrapper construction work between paths, but should not be read
   as literal per-token replay overhead.
 - The remaining work should target:
-  - eliminating or reducing the decode-index kernel itself,
-  - avoiding vLLM ragged/index conversion work where possible,
-  - moving closer to ATOM's persistent request-state/unified-KV index layout
+    - eliminating or reducing the decode-index kernel itself,
+    - avoiding vLLM ragged/index conversion work where possible,
+    - moving closer to ATOM's persistent request-state/unified-KV index layout
     instead of recreating compatible views from vLLM metadata.
 
 Twenty-ninth Diagnostic Slice: Can the decode-index kernel be removed?
@@ -2392,12 +2392,12 @@ Twenty-ninth Diagnostic Slice: Can the decode-index kernel be removed?
 Current sparse decode interface:
 
 - vLLM port:
-  - `vllm/models/deepseek_v4/amd/v4_kernels/paged_decode.py`
-  - `_sparse_attn_v4_paged_decode_triton(q, unified_kv, kv_indices,
+    - `vllm/models/deepseek_v4/amd/v4_kernels/paged_decode.py`
+    - `_sparse_attn_v4_paged_decode_triton(q, unified_kv, kv_indices,
     kv_indptr, ...)`
 - ATOM source:
-  - `ATOM/atom/model_ops/v4_kernels/paged_decode.py`
-  - same core contract: the attention kernel reads flat ragged
+    - `ATOM/atom/model_ops/v4_kernels/paged_decode.py`
+    - same core contract: the attention kernel reads flat ragged
     `kv_indices[kv_indptr[t] : kv_indptr[t + 1]]`.
 
 Implication:
@@ -2415,8 +2415,8 @@ What ATOM's vLLM bridge does:
 - `ATOM/atom/plugin/vllm/deepseek_v4_bridge.py` also builds per-forward V4
   decode indices before calling `sparse_attn_v4_paged_decode`.
 - That bridge uses:
-  - `write_v4_paged_decode_indices`
-  - a separate HCA compress-tail writer in older code
+    - `write_v4_paged_decode_indices`
+    - a separate HCA compress-tail writer in older code
 - So the current vLLM integration is structurally consistent with ATOM's vLLM
   bridge: ATOM kernels still consume a flat ragged index view.
 
@@ -2458,8 +2458,8 @@ Conclusion:
   get the full ATOM benefit without per-forward index materialization.
 - The next meaningful performance step is therefore not another small wrapper
   fusion; it is either:
-  - a new request-state sparse decode kernel, or
-  - a ROCm-only DSV4 cache/metadata path that maintains ATOM-compatible indices
+    - a new request-state sparse decode kernel, or
+    - a ROCm-only DSV4 cache/metadata path that maintains ATOM-compatible indices
     as persistent request state.
 
 Cleanup performed:
@@ -2485,46 +2485,46 @@ Prototype:
 - The direct path bypasses per-forward flat `kv_indices` materialization for
   ratio-128 HCA decode when `VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS=1`.
 - The kernel computes the committed-HCA and SWA-ring addresses from:
-  - `state_slot_per_seq`
-  - `batch_id_per_token`
-  - `positions`
-  - `n_committed_hca_per_seq`
-  - `block_table`
-  - `swa_pages`
-  - `win_with_spec`
+    - `state_slot_per_seq`
+    - `batch_id_per_token`
+    - `positions`
+    - `n_committed_hca_per_seq`
+    - `block_table`
+    - `swa_pages`
+    - `win_with_spec`
 - This keeps the vLLM scheduler active, but it avoids the flat ragged decode
   index writer for this narrow HCA path.
 
 Validation:
 
 - Full unchanged `lmeval.sh` passed with:
-  - `ENFORCE_EAGER=0`
-  - `BLOCK_SIZE=128`
-  - `MAX_NUM_SEQS=256`
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - `VLLM_ROCM_DSV4_ATOM_HCA_DIRECT_DECODE=1`
+    - `ENFORCE_EAGER=0`
+    - `BLOCK_SIZE=128`
+    - `MAX_NUM_SEQS=256`
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - `VLLM_ROCM_DSV4_ATOM_HCA_DIRECT_DECODE=1`
 - GSM8K:
-  - flexible-extract: `0.9507 +/- 0.0060`
-  - strict-match: `0.9515 +/- 0.0059`
+    - flexible-extract: `0.9507 +/- 0.0060`
+    - strict-match: `0.9515 +/- 0.0059`
 
 Deployment benchmark:
 
 - Fresh server restart before benchmark.
 - C32 random 1024/1024, `benchmarkvllm.sh` unchanged except result naming.
 - Config:
-  - `ENFORCE_EAGER=0`
-  - `BLOCK_SIZE=128`
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `VLLM_ROCM_DSV4_ATOM_HCA_DIRECT_DECODE=1`
+    - `ENFORCE_EAGER=0`
+    - `BLOCK_SIZE=128`
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `VLLM_ROCM_DSV4_ATOM_HCA_DIRECT_DECODE=1`
 - Result:
-  - successful requests: `320`
-  - failed requests: `0`
-  - benchmark duration: `387.09 s`
-  - output throughput: `846.52 tok/s`
-  - total throughput: `1696.35 tok/s`
-  - mean TTFT: `1097.14 ms`
-  - mean TPOT: `36.76 ms`
+    - successful requests: `320`
+    - failed requests: `0`
+    - benchmark duration: `387.09 s`
+    - output throughput: `846.52 tok/s`
+    - total throughput: `1696.35 tok/s`
+    - mean TTFT: `1097.14 ms`
+    - mean TPOT: `36.76 ms`
 
 Comparison:
 
@@ -2546,10 +2546,10 @@ Interpretation:
   removing only this one HCA flat-index writer is not enough to move end-to-end
   C32 throughput toward ATOM's published number.
 - The next useful analysis is to separate:
-  - graph-capture/setup-only metadata work,
-  - per-step CPU scheduler/metadata packing work,
-  - graph-replayed GPU kernels,
-  - address arithmetic inside the direct sparse attention kernel.
+    - graph-capture/setup-only metadata work,
+    - per-step CPU scheduler/metadata packing work,
+    - graph-replayed GPU kernels,
+    - address arithmetic inside the direct sparse attention kernel.
 
 Thirty-first Diagnostic Slice: vLLM-owned unified KV allocation
 ---------------------------------------------------------------
@@ -2571,30 +2571,30 @@ Implementation state:
   memory before calculating `num_blocks`.
 - `_reshape_kv_cache` now resolves the per-layer spec from
   `UniformTypeKVCacheSpecs` before computing:
-  - `prefix_bytes`
-  - page size
-  - dtype
-  - storage block size
+    - `prefix_bytes`
+    - page size
+    - dtype
+    - storage block size
   This matters for DSV4 because group-level specs can hide layer-specific ATOM
   prefix metadata.
 
 Structural validation:
 
 - Server starts with:
-  - `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1`
-  - `ENFORCE_EAGER=0`
-  - `BLOCK_SIZE=128`
-  - `MAX_NUM_SEQS=32`
+    - `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1`
+    - `ENFORCE_EAGER=0`
+    - `BLOCK_SIZE=128`
+    - `MAX_NUM_SEQS=32`
 - The model-state binder logs:
   `Bound ROCm DSV4 ATOM unified KV views from vLLM-owned KV storage`.
 - Observed allocation:
-  - `num_blocks=11053`
-  - `swa_pages=4096`
-  - GPU KV cache size: `801,182 tokens`
+    - `num_blocks=11053`
+    - `swa_pages=4096`
+    - GPU KV cache size: `801,182 tokens`
 - Compared to model-state side allocation, the vLLM-owned homogeneous BF16
   unified tail greatly reduces available KV capacity:
-  - side allocation run: about `2,352,349 tokens`
-  - vLLM-owned BF16 tail run: about `801,182 tokens`
+    - side allocation run: about `2,352,349 tokens`
+    - vLLM-owned BF16 tail run: about `801,182 tokens`
 
 Functional validation:
 
@@ -2661,31 +2661,31 @@ Validation:
   actual fault could be in the immediately preceding/following prefill index or
   attention sequence.
 - Full `lmeval.sh` with the mixed-batch guard passed:
-  - flexible `exact_match`: `0.9507 +/- 0.0060`
-  - strict `exact_match`: `0.9515 +/- 0.0059`
-  - log: `/app/atomdsv4/lmeval_atom_prefill_triton_guard.log`
+    - flexible `exact_match`: `0.9507 +/- 0.0060`
+    - strict `exact_match`: `0.9515 +/- 0.0059`
+    - log: `/app/atomdsv4/lmeval_atom_prefill_triton_guard.log`
 - C32 benchmark with the same passing guarded configuration:
-  - successful requests: `320`
-  - failed requests: `0`
-  - duration: `388.71 s`
-  - output throughput: `843.00 tok/s`
-  - total throughput: `1689.29 tok/s`
-  - mean TTFT: `1150.96 ms`
-  - mean TPOT: `36.86 ms`
-  - log: `/app/atomdsv4/benchmark_atom_prefill_triton_guard_c32.log`
+    - successful requests: `320`
+    - failed requests: `0`
+    - duration: `388.71 s`
+    - output throughput: `843.00 tok/s`
+    - total throughput: `1689.29 tok/s`
+    - mean TTFT: `1150.96 ms`
+    - mean TPOT: `36.86 ms`
+    - log: `/app/atomdsv4/benchmark_atom_prefill_triton_guard_c32.log`
 
 Comparison:
 
 - Previous passing fused-HCA committed-head-fill C32 run:
-  - output throughput: `846.58 tok/s`
-  - total throughput: `1696.46 tok/s`
-  - mean TTFT: `913.70 ms`
-  - mean TPOT: `36.93 ms`
+    - output throughput: `846.58 tok/s`
+    - total throughput: `1696.46 tok/s`
+    - mean TTFT: `913.70 ms`
+    - mean TPOT: `36.93 ms`
 - Previous passing direct-HCA decode C32 run:
-  - output throughput: `846.52 tok/s`
-  - total throughput: `1696.35 tok/s`
-  - mean TTFT: `1097.14 ms`
-  - mean TPOT: `36.76 ms`
+    - output throughput: `846.52 tok/s`
+    - total throughput: `1696.35 tok/s`
+    - mean TTFT: `1097.14 ms`
+    - mean TPOT: `36.76 ms`
 - Earlier native sparse baseline was about `852.30 tok/s` output throughput.
 - The ATOM recipe C32 target remains `1145.71 tok/s` output throughput.
 
@@ -2729,71 +2729,71 @@ Question:
 Implementation state:
 
 - Added opt-in ATOM prefill profiling in the ROCm DSV4 attention path:
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL_TRACE=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL_MIN_T=<tokens>`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL_MIN_TOKEN_OFFSET=<tokens>`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL_TRACE=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL_MIN_T=<tokens>`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL_MIN_TOKEN_OFFSET=<tokens>`
 - The hook times:
-  - CPU-side prefill indptr construction and H2D copies
-  - ATOM prefill index-write kernels
-  - CSA top-k packing
-  - `.contiguous()` materialization of the extend KV slice
-  - ATOM paged-prefill attention
-  - output copy
-  - SWA ring write
+    - CPU-side prefill indptr construction and H2D copies
+    - ATOM prefill index-write kernels
+    - CSA top-k packing
+    - `.contiguous()` materialization of the extend KV slice
+    - ATOM paged-prefill attention
+    - output copy
+    - SWA ring write
 - The hook is fully disabled by default and does not change default execution.
 
 Validation:
 
 - Diagnostic server:
-  - `MAX_NUM_SEQS=256`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `ENFORCE_EAGER=0`
-  - `BLOCK_SIZE=128`
-  - `HIP_LAUNCH_BLOCKING=1`
-  - `ATOM_FORCE_ATTN_TRITON=1`
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED=1`
+    - `MAX_NUM_SEQS=256`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `ENFORCE_EAGER=0`
+    - `BLOCK_SIZE=128`
+    - `HIP_LAUNCH_BLOCKING=1`
+    - `ATOM_FORCE_ATTN_TRITON=1`
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED=1`
 - Random high-concurrency run, `input_len=1024`, `output_len=128`,
   `num_prompts=288`, `max_concurrency=256`:
-  - successful requests: `288`
-  - failed requests: `0`
-  - output throughput: `942.97 tok/s`
-  - total throughput: `8516.22 tok/s`
-  - mean TTFT: `12240.24 ms`
-  - mean TPOT: `151.47 ms`
-  - log: `/app/atomdsv4/bench_atom_prefill_mixed_diag_s256_n288.log`
+    - successful requests: `288`
+    - failed requests: `0`
+    - output throughput: `942.97 tok/s`
+    - total throughput: `8516.22 tok/s`
+    - mean TTFT: `12240.24 ms`
+    - mean TPOT: `151.47 ms`
+    - log: `/app/atomdsv4/bench_atom_prefill_mixed_diag_s256_n288.log`
 - Random high-concurrency run, `input_len=4096`, `output_len=64`,
   `num_prompts=288`, `max_concurrency=256`:
-  - successful requests: `288`
-  - failed requests: `0`
-  - output throughput: `165.77 tok/s`
-  - total throughput: `10785.19 tok/s`
-  - mean TTFT: `48983.96 ms`
-  - mean TPOT: `586.97 ms`
-  - log: `/app/atomdsv4/bench_atom_prefill_mixed_diag_s256_i4096.log`
+    - successful requests: `288`
+    - failed requests: `0`
+    - output throughput: `165.77 tok/s`
+    - total throughput: `10785.19 tok/s`
+    - mean TTFT: `48983.96 ms`
+    - mean TPOT: `586.97 ms`
+    - log: `/app/atomdsv4/bench_atom_prefill_mixed_diag_s256_i4096.log`
 - No `Traceback`, HIP illegal access, or CUDA error signatures were found in
   the diagnostic server or benchmark logs.
 
 Representative prefill timings:
 
 - Mixed CSA layer, `layer=60`, `ratio=4`, `T=8191`, `token_offset=1`:
-  - `extend_total=983424`
-  - `prefix_csa_total=1046391`
-  - `build_ms=0.219`
-  - `index_ms=0.099`
-  - `csa_pack_ms=0.097`
-  - `kv_contig_ms=0.012`
-  - `kernel_ms=0.746`
-  - `output_ms=0.069`
-  - `swa_write_ms=0.045`
-  - `total_ms=1.288`
+    - `extend_total=983424`
+    - `prefix_csa_total=1046391`
+    - `build_ms=0.219`
+    - `index_ms=0.099`
+    - `csa_pack_ms=0.097`
+    - `kv_contig_ms=0.012`
+    - `kernel_ms=0.746`
+    - `output_ms=0.069`
+    - `swa_write_ms=0.045`
+    - `total_ms=1.288`
 - Mixed HCA layer, `layer=59`, `ratio=128`, `T=8191`, `token_offset=1`:
-  - `extend_total=983424`
-  - `prefix_hca_total=64533`
-  - `build_ms=0.208` to `0.212`
-  - `index_ms=0.080` to `0.086`
-  - `kernel_ms=0.469` to `0.480`
-  - `total_ms=0.883` to `0.906`
+    - `extend_total=983424`
+    - `prefix_hca_total=64533`
+    - `build_ms=0.208` to `0.212`
+    - `index_ms=0.080` to `0.086`
+    - `kernel_ms=0.469` to `0.480`
+    - `total_ms=0.883` to `0.906`
 
 Interpretation:
 
@@ -2834,63 +2834,63 @@ Question:
 Implementation state:
 
 - Added a default-off diagnostic fence:
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC=1`
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC=1`
 - The fence calls `torch.cuda.synchronize()` after the ATOM prefill sub-stages
   that the profiler already serialized:
-  - ATOM prefill index writes
-  - CSA translate/pack
-  - extend KV materialization
-  - ATOM paged-prefill attention
-  - output copy
-  - SWA ring write
+    - ATOM prefill index writes
+    - CSA translate/pack
+    - extend KV materialization
+    - ATOM paged-prefill attention
+    - output copy
+    - SWA ring write
 - This is intentionally a diagnostic mechanism. It is too coarse for the final
   performance path and should be replaced by precise stream/event dependencies.
 
 Validation:
 
 - Production-shaped unguarded mixed ATOM prefill without the fence:
-  - `MAX_NUM_SEQS=256`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `ENFORCE_EAGER=0`
-  - `BLOCK_SIZE=128`
-  - `ATOM_FORCE_ATTN_TRITON=1`
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED=1`
-  - no `HIP_LAUNCH_BLOCKING`
-  - no profiler flags
-  - result: failed during unchanged `lmeval.sh`
-  - first visible error:
-    - `[aiter] Error in moe_sorting: CUDA error: an illegal memory access was encountered`
-    - `topk_ids.shape=torch.Size([8192, 6])`
-    - `max_num_tokens_padded=98298`
-  - server log:
-    - `/app/atomdsv4/server_lmeval_unguarded_prefill_prod.log`
+    - `MAX_NUM_SEQS=256`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `ENFORCE_EAGER=0`
+    - `BLOCK_SIZE=128`
+    - `ATOM_FORCE_ATTN_TRITON=1`
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED=1`
+    - no `HIP_LAUNCH_BLOCKING`
+    - no profiler flags
+    - result: failed during unchanged `lmeval.sh`
+    - first visible error:
+        - `[aiter] Error in moe_sorting: CUDA error: an illegal memory access was encountered`
+        - `topk_ids.shape=torch.Size([8192, 6])`
+        - `max_num_tokens_padded=98298`
+    - server log:
+        - `/app/atomdsv4/server_lmeval_unguarded_prefill_prod.log`
 - Production-shaped unguarded mixed ATOM prefill with the diagnostic fence:
-  - same configuration, plus `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC=1`
-  - unchanged `lmeval.sh` completed
-  - GSM8K flexible exact match: `0.9515 +/- 0.0059`
-  - GSM8K strict exact match: `0.9522 +/- 0.0059`
-  - lm-eval log:
-    - `/app/atomdsv4/lmeval_unguarded_prefill_sync.log`
-  - server log:
-    - `/app/atomdsv4/server_lmeval_unguarded_prefill_sync.log`
+    - same configuration, plus `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC=1`
+    - unchanged `lmeval.sh` completed
+    - GSM8K flexible exact match: `0.9515 +/- 0.0059`
+    - GSM8K strict exact match: `0.9522 +/- 0.0059`
+    - lm-eval log:
+        - `/app/atomdsv4/lmeval_unguarded_prefill_sync.log`
+    - server log:
+        - `/app/atomdsv4/server_lmeval_unguarded_prefill_sync.log`
 - Fresh C32 benchmark with the diagnostic fence:
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `ENFORCE_EAGER=0`
-  - `BLOCK_SIZE=128`
-  - `ATOM_FORCE_ATTN_TRITON=1`
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED=1`
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC=1`
-  - successful requests: `320`
-  - failed requests: `0`
-  - output throughput: `843.43 tok/s`
-  - total throughput: `1690.15 tok/s`
-  - mean TTFT: `1114.16 ms`
-  - mean TPOT: `36.88 ms`
-  - benchmark log:
-    - `/app/atomdsv4/benchmark_unguarded_prefill_sync_c32.log`
-  - server log:
-    - `/app/atomdsv4/server_benchmark_unguarded_prefill_sync_c32.log`
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `ENFORCE_EAGER=0`
+    - `BLOCK_SIZE=128`
+    - `ATOM_FORCE_ATTN_TRITON=1`
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED=1`
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC=1`
+    - successful requests: `320`
+    - failed requests: `0`
+    - output throughput: `843.43 tok/s`
+    - total throughput: `1690.15 tok/s`
+    - mean TTFT: `1114.16 ms`
+    - mean TPOT: `36.88 ms`
+    - benchmark log:
+        - `/app/atomdsv4/benchmark_unguarded_prefill_sync_c32.log`
+    - server log:
+        - `/app/atomdsv4/server_benchmark_unguarded_prefill_sync_c32.log`
 
 Interpretation:
 
@@ -2907,9 +2907,9 @@ Interpretation:
   run in this branch (`846.58 tok/s` with fused HCA index, and about `852 tok/s`
   for the native baseline). So the fence is not a performance feature.
 - The practical conclusion is:
-  - guarded mixed prefill remains the safe default for now;
-  - unguarded mixed prefill is accuracy-capable only when serialized;
-  - the next useful implementation step is replacing global sync with narrow
+    - guarded mixed prefill remains the safe default for now;
+    - unguarded mixed prefill is accuracy-capable only when serialized;
+    - the next useful implementation step is replacing global sync with narrow
     event/stream waits around the exact producer-consumer boundaries.
 
 Next analysis ideas:
@@ -2933,59 +2933,59 @@ Question:
 Code change:
 
 - Replaced the single all-stage diagnostic switch with optional named stages:
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC=1` still synchronizes all stages.
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_STAGES=<comma-separated stages>`
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC=1` still synchronizes all stages.
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_STAGES=<comma-separated stages>`
     synchronizes only selected stages.
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_KIND=stream|device` chooses
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_KIND=stream|device` chooses
     `torch.cuda.current_stream().synchronize()` or `torch.cuda.synchronize()`.
 - Available stage labels in the ATOM mixed prefill path:
-  - `post_index`
-  - `post_pack`
-  - `pre_attn`
-  - `post_attn`
-  - `post_output`
-  - `post_swa`
+    - `post_index`
+    - `post_pack`
+    - `pre_attn`
+    - `post_attn`
+    - `post_output`
+    - `post_swa`
 
 Validation:
 
 - Production-shaped unguarded mixed ATOM prefill with only a post-attention
   stream-local fence:
-  - `MAX_NUM_SEQS=256`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `ENFORCE_EAGER=0`
-  - `BLOCK_SIZE=128`
-  - `ATOM_FORCE_ATTN_TRITON=1`
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED=1`
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC=0`
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_STAGES=post_attn`
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_KIND=stream`
-  - unchanged `lmeval.sh` completed
-  - GSM8K flexible exact match: `0.9530 +/- 0.0058`
-  - GSM8K strict exact match: `0.9538 +/- 0.0058`
-  - lm-eval log:
-    - `/app/atomdsv4/lmeval_unguarded_prefill_postattn_stream.log`
-  - server log:
-    - `/app/atomdsv4/server_lmeval_unguarded_prefill_postattn_stream.log`
+    - `MAX_NUM_SEQS=256`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `ENFORCE_EAGER=0`
+    - `BLOCK_SIZE=128`
+    - `ATOM_FORCE_ATTN_TRITON=1`
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED=1`
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC=0`
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_STAGES=post_attn`
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_KIND=stream`
+    - unchanged `lmeval.sh` completed
+    - GSM8K flexible exact match: `0.9530 +/- 0.0058`
+    - GSM8K strict exact match: `0.9538 +/- 0.0058`
+    - lm-eval log:
+        - `/app/atomdsv4/lmeval_unguarded_prefill_postattn_stream.log`
+    - server log:
+        - `/app/atomdsv4/server_lmeval_unguarded_prefill_postattn_stream.log`
 - Fresh C32 benchmark with the same post-attention stream-local fence:
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `ENFORCE_EAGER=0`
-  - `BLOCK_SIZE=128`
-  - `ATOM_FORCE_ATTN_TRITON=1`
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED=1`
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC=0`
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_STAGES=post_attn`
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_KIND=stream`
-  - successful requests: `320`
-  - failed requests: `0`
-  - output throughput: `844.12 tok/s`
-  - total throughput: `1691.54 tok/s`
-  - mean TTFT: `1047.86 ms`
-  - mean TPOT: `36.91 ms`
-  - benchmark log:
-    - `/app/atomdsv4/benchmark_unguarded_prefill_postattn_stream_c32.log`
-  - server log:
-    - `/app/atomdsv4/server_benchmark_unguarded_prefill_postattn_stream_c32.log`
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `ENFORCE_EAGER=0`
+    - `BLOCK_SIZE=128`
+    - `ATOM_FORCE_ATTN_TRITON=1`
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED=1`
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC=0`
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_STAGES=post_attn`
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_KIND=stream`
+    - successful requests: `320`
+    - failed requests: `0`
+    - output throughput: `844.12 tok/s`
+    - total throughput: `1691.54 tok/s`
+    - mean TTFT: `1047.86 ms`
+    - mean TPOT: `36.91 ms`
+    - benchmark log:
+        - `/app/atomdsv4/benchmark_unguarded_prefill_postattn_stream_c32.log`
+    - server log:
+        - `/app/atomdsv4/server_benchmark_unguarded_prefill_postattn_stream_c32.log`
 
 Interpretation:
 
@@ -2997,11 +2997,11 @@ Interpretation:
   are reused by subsequent layers; if the attention kernel is still reading them,
   the next layer can overwrite them.
 - The throughput remains in the same band as guarded/native runs:
-  - guarded ATOM prefill: `843.00 tok/s`
-  - all-stage diagnostic sync: `843.43 tok/s`
-  - post-attention stream sync: `844.12 tok/s`
-  - fused HCA index best in this branch: `846.58 tok/s`
-  - native baseline observed earlier: about `852 tok/s`
+    - guarded ATOM prefill: `843.00 tok/s`
+    - all-stage diagnostic sync: `843.43 tok/s`
+    - post-attention stream sync: `844.12 tok/s`
+    - fused HCA index best in this branch: `846.58 tok/s`
+    - native baseline observed earlier: about `852 tok/s`
 - So the post-attention stream fence is a correctness improvement over the
   coarse sync, but it is not a performance breakthrough.
 
@@ -3009,12 +3009,12 @@ Metadata/conversion overhead hypothesis:
 
 - The current ATOM mixed prefill path pays nontrivial setup cost outside the
   sparse attention math kernel:
-  - sparse prefill index metadata build,
-  - CSA translate/pack,
-  - `kv_actual = kv_full[...].contiguous()`,
-  - output copy,
-  - SWA ring write,
-  - and now a stream-local wait after the attention kernel.
+    - sparse prefill index metadata build,
+    - CSA translate/pack,
+    - `kv_actual = kv_full[...].contiguous()`,
+    - output copy,
+    - SWA ring write,
+    - and now a stream-local wait after the attention kernel.
 - In the earlier profiled layer-60 S256 prefill sample, the attention kernel was
   about `1.597 ms` while the measured end-to-end prefill attention block was
   about `2.163 ms`. That means roughly one quarter of that measured block was
@@ -3027,12 +3027,12 @@ Metadata/conversion overhead hypothesis:
 Next analysis ideas:
 
 - Add per-stage timing under the same deployment flags for:
-  - index metadata build,
-  - CSA translate/pack,
-  - `kv_actual.contiguous()`,
-  - prefill attention kernel,
-  - output copy,
-  - SWA write.
+    - index metadata build,
+    - CSA translate/pack,
+    - `kv_actual.contiguous()`,
+    - prefill attention kernel,
+    - output copy,
+    - SWA write.
 - Replace the post-attention stream synchronize with an explicit event on the
   stream used by the ATOM prefill attention kernel once the actual producer
   stream is confirmed.
@@ -3047,36 +3047,36 @@ Next analysis ideas:
 Current component status:
 
 - Present and usable without GPU worker changes:
-  - ROCm DSV4 model-specific `ModelState`.
-  - Persistent per-request SWA/compressor state buffers.
-  - Per-forward request-slot metadata attached to vLLM attention metadata.
-  - ATOM-style compress-plan buffers.
-  - Side-allocated ATOM homogeneous `unified_kv` buffers.
-  - ATOM decode/prefill index builders and attention kernels.
-  - ATOM SWA ring writes.
-  - ATOM fused compressor path for the side-allocated unified KV path.
-  - vLLM weight loading remains in use.
+    - ROCm DSV4 model-specific `ModelState`.
+    - Persistent per-request SWA/compressor state buffers.
+    - Per-forward request-slot metadata attached to vLLM attention metadata.
+    - ATOM-style compress-plan buffers.
+    - Side-allocated ATOM homogeneous `unified_kv` buffers.
+    - ATOM decode/prefill index builders and attention kernels.
+    - ATOM SWA ring writes.
+    - ATOM fused compressor path for the side-allocated unified KV path.
+    - vLLM weight loading remains in use.
 - Present and accuracy-validated, but not yet a final performance path:
-  - vLLM-owned ATOM unified KV via `DeepseekV4AtomMLAAttentionSpec`.
-  - DeepSeek-V4-specific KV allocation that reserves a fixed SWA prefix before
+    - vLLM-owned ATOM unified KV via `DeepseekV4AtomMLAAttentionSpec`.
+    - DeepSeek-V4-specific KV allocation that reserves a fixed SWA prefix before
     the scalable compressed tail.
-  - GPU reshape logic that skips the fixed SWA prefix when binding the normal
+    - GPU reshape logic that skips the fixed SWA prefix when binding the normal
     compressed tail view.
-  - Model-state binding that can reconstruct ATOM `unified_kv`,
+    - Model-state binding that can reconstruct ATOM `unified_kv`,
     `atom_swa_kv`, and compressed tail views from the same vLLM-owned storage.
 - Missing or unresolved for full ATOM benefit:
-  - A stricter ROCm DSV4 backend contract that prevents native `fp8_ds_mla`
+    - A stricter ROCm DSV4 backend contract that prevents native `fp8_ds_mla`
     sparse paths from reading BF16 ATOM unified storage.
-  - A CSA indexer integration cleanup that reduces the generic vLLM
+    - A CSA indexer integration cleanup that reduces the generic vLLM
     sparse-indexer metadata/wrapper overhead now that the FP8 cache path,
     scale view, gather, logits, and top-k kernel family have been audited
     against ATOM's modeling-file behavior.
-  - A way to avoid or greatly reduce per-layer metadata/conversion overhead:
+    - A way to avoid or greatly reduce per-layer metadata/conversion overhead:
     index build, CSA translate/pack, `kv_actual.contiguous()`, output copy, and
     ordering fences.
-  - A precise event dependency replacing the post-attention stream
+    - A precise event dependency replacing the post-attention stream
     synchronization used to make unguarded mixed prefill accuracy-valid.
-  - More C32 performance proof after reducing the request-state/indexer/overlap
+    - More C32 performance proof after reducing the request-state/indexer/overlap
     gap. Accuracy for the vLLM-owned BF16 unified-KV path has already passed
     GSM8K in later validation.
 
@@ -3098,44 +3098,44 @@ Code hardening added after this audit:
 Smoke validation after hardening:
 
 - Command shape:
-  - `MAX_NUM_SEQS=4`
-  - `MAX_NUM_BATCHED_TOKENS=512`
-  - `ENFORCE_EAGER=0`
-  - `BLOCK_SIZE=128`
-  - `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1`
-  - `VLLM_ROCM_DSV4_ATOM_SKIP_PAGED_PREFILL=1`
-  - V2 model runner and breakable CUDA graph enabled by launch defaults.
+    - `MAX_NUM_SEQS=4`
+    - `MAX_NUM_BATCHED_TOKENS=512`
+    - `ENFORCE_EAGER=0`
+    - `BLOCK_SIZE=128`
+    - `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1`
+    - `VLLM_ROCM_DSV4_ATOM_SKIP_PAGED_PREFILL=1`
+    - V2 model runner and breakable CUDA graph enabled by launch defaults.
 - Server log:
-  - `/app/atomdsv4/server_from_vllm_bind_smoke.log`
+    - `/app/atomdsv4/server_from_vllm_bind_smoke.log`
 - Startup result:
-  - server reached readiness;
-  - graph capture completed;
-  - no runtime errors were logged;
-  - all workers logged:
-    - `Bound ROCm DSV4 ATOM unified KV views from vLLM-owned KV storage`
-    - `ratio_counts={128: 31, 4: 30}`
-    - `num_blocks=15489`
-    - `swa_pages=512`
-    - `win_with_spec=128`
-    - `head_dim=512`
-    - `dtype=torch.bfloat16`
+    - server reached readiness;
+    - graph capture completed;
+    - no runtime errors were logged;
+    - all workers logged:
+        - `Bound ROCm DSV4 ATOM unified KV views from vLLM-owned KV storage`
+        - `ratio_counts={128: 31, 4: 30}`
+        - `num_blocks=15489`
+        - `swa_pages=512`
+        - `win_with_spec=128`
+        - `head_dim=512`
+        - `dtype=torch.bfloat16`
 - Tiny request result:
-  - prompt: `What is 2+2? Answer briefly.`
-  - request completed, but output was nonsensical.
-  - This is a silent correctness failure, not a capacity or crash failure.
+    - prompt: `What is 2+2? Answer briefly.`
+    - request completed, but output was nonsensical.
+    - This is a silent correctness failure, not a capacity or crash failure.
 - Follow-up change:
-  - Added a generic optional `post_bind_kv_cache(kv_cache)` hook in
+    - Added a generic optional `post_bind_kv_cache(kv_cache)` hook in
     `vllm/v1/worker/utils.py`.
-  - Implemented the hook on `DeepseekV4Attention` for the ROCm
+    - Implemented the hook on `DeepseekV4Attention` for the ROCm
     `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1` path.
-  - The hook derives `atom_unified_kv`, `atom_swa_kv`, and
+    - The hook derives `atom_unified_kv`, `atom_swa_kv`, and
     `atom_compressed_kv_cache` immediately when vLLM binds the layer KV cache,
     before graph capture replays can depend on those attributes.
 - Follow-up smoke:
-  - server log: `/app/atomdsv4/server_from_vllm_prebind_smoke.log`
-  - startup still succeeded;
-  - graph capture still completed;
-  - tiny request still returned nonsensical text.
+    - server log: `/app/atomdsv4/server_from_vllm_prebind_smoke.log`
+    - startup still succeeded;
+    - graph capture still completed;
+    - tiny request still returned nonsensical text.
 
 Interpretation:
 
@@ -3152,17 +3152,17 @@ Interpretation:
   an explicit backend contract for the BF16 ATOM layout.
 - The follow-up pre-bind smoke makes graph-capture timing less likely as the
   primary cause of the bad output. The next likely causes are:
-  - native prefill/routing still reading or writing a different semantic layout
+    - native prefill/routing still reading or writing a different semantic layout
     than ATOM decode expects;
-  - BF16 homogeneous main cache matching ATOM's model file but not matching
+    - BF16 homogeneous main cache matching ATOM's model file but not matching
     vLLM's global fp8 assumptions in every native fallback path;
-  - a remaining mismatch between vLLM block-table metadata and ATOM's unified
+    - a remaining mismatch between vLLM block-table metadata and ATOM's unified
     cache indices for the vLLM-owned allocation path.
 - The practical split still holds:
-  - no GPU worker changes are needed for persistent per-request state;
-  - vLLM core/attention changes are needed for ROCm-only DSV4 unified KV cache
+    - no GPU worker changes are needed for persistent per-request state;
+    - vLLM core/attention changes are needed for ROCm-only DSV4 unified KV cache
     layout, spec accounting, backend metadata, and kernels reading that layout;
-  - CUDA should remain untouched because the custom spec is emitted only by the
+    - CUDA should remain untouched because the custom spec is emitted only by the
     ROCm DSV4 path when the ATOM unified-KV experiment is enabled.
 
 ### vLLM-Owned Unified KV Accuracy And C32 Benchmark
@@ -3213,13 +3213,13 @@ Validation:
 - `MAX_NUM_SEQS=32`, `MAX_MODEL_LEN=2304`,
   `GPU_MEMORY_UTILIZATION=0.9`, V2 runner, no `--enforce-eager`,
   `benchmarkvllm.sh` C32 completed:
-  - successful requests: `320 / 320`
-  - output throughput: `850.82 tok/s`
-  - total throughput: `1704.97 tok/s`
-  - mean TPOT: `36.58 ms`
-  - mean TTFT: `1086.10 ms`
-  - server-reported KV capacity: `22,656 tokens`
-  - server-reported maximum full-length concurrency:
+    - successful requests: `320 / 320`
+    - output throughput: `850.82 tok/s`
+    - total throughput: `1704.97 tok/s`
+    - mean TPOT: `36.58 ms`
+    - mean TTFT: `1086.10 ms`
+    - server-reported KV capacity: `22,656 tokens`
+    - server-reported maximum full-length concurrency:
     `9.83x` for 2304-token requests
 
 Comparison to known C32 runs:
@@ -3256,9 +3256,9 @@ unified KV path is BF16, even when the recipe/server argument says
   BF16 tensor with layout:
   `[num_slots * win_with_spec + compressed_pages, head_dim]`.
 - `build_kv_cache_tensor()` binds:
-  - `attn.unified_kv` to that full BF16 tensor.
-  - `attn.swa_kv` to the BF16 SWA prefix.
-  - CSA/HCA main `compressor.kv_cache` to BF16 views into the compressed tail.
+    - `attn.unified_kv` to that full BF16 tensor.
+    - `attn.swa_kv` to the BF16 SWA prefix.
+    - CSA/HCA main `compressor.kv_cache` to BF16 views into the compressed tail.
 - `DeepseekV4Attention.forward_impl()` passes that same `self.unified_kv` to
   `sparse_attn_v4_paged_decode()` and `sparse_attn_v4_paged_prefill()`.
 - The FP8 cache in the V4 path is the CSA indexer cache
@@ -3327,11 +3327,11 @@ The current vLLM ROCm path is close at the kernel level:
 - `SparseAttnIndexer.forward_hip()` dispatches to
   `torch.ops.vllm.rocm_aiter_sparse_attn_indexer`.
 - `rocm_aiter_sparse_attn_indexer()` calls:
-  - `cp_gather_indexer_k_quant_cache` or the local Triton equivalent for
+    - `cp_gather_indexer_k_quant_cache` or the local Triton equivalent for
     prefill gather;
-  - aiter `fp8_mqa_logits` for prefill when available;
-  - aiter `deepgemm_fp8_paged_mqa_logits` for decode when available;
-  - aiter `top_k_per_row_prefill` / `top_k_per_row_decode` when available.
+    - aiter `fp8_mqa_logits` for prefill when available;
+    - aiter `deepgemm_fp8_paged_mqa_logits` for decode when available;
+    - aiter `top_k_per_row_prefill` / `top_k_per_row_decode` when available.
 
 The remaining difference is therefore not "missing aiter indexer ops". It is the
 wrapper and metadata contract:
@@ -3361,12 +3361,12 @@ Implementation step added:
 - `DeepseekV4Indexer` now has an opt-in ROCm decode fast path behind
   `VLLM_ROCM_DSV4_ATOM_INDEXER_FASTPATH=1`.
 - The path is intentionally narrow:
-  - ROCm only;
-  - FP8 indexer cache only, not FP4;
-  - pure decode only;
-  - one token per sequence;
-  - no packed/unpacked padding case;
-  - requires `DeepseekV4RocmAtomStateMetadata` from the parent SWA metadata.
+    - ROCm only;
+    - FP8 indexer cache only, not FP4;
+    - pure decode only;
+    - one token per sequence;
+    - no packed/unpacked padding case;
+    - requires `DeepseekV4RocmAtomStateMetadata` from the parent SWA metadata.
 - It still reuses the same aiter-backed vLLM wrappers for
   `rocm_fp8_paged_mqa_logits` and `_top_k_per_row_decode`, but bypasses the
   generic `SparseAttnIndexer` custom-op body and uses ATOM ModelState's
@@ -3447,20 +3447,20 @@ Latest C32 prefill attribution run:
 Large prefill chunk (`T=3696`) summary:
 
 - CSA layers (`ratio=4`, 163 rows):
-  - `total_ms`: mean `0.758`, p50 `0.767`
-  - `kernel_ms`: mean `0.280`, p50 `0.277`
-  - `build_ms`: mean `0.249`, p50 `0.249`
-  - `index_ms`: mean `0.076`, p50 `0.074`
-  - `csa_pack_ms`: mean `0.061`, p50 `0.060`
-  - `kv_contig_ms`: mean `0.006`, p50 `0.006`
-  - overhead excluding the attention kernel: mean `0.478`, p50 `0.480`
+    - `total_ms`: mean `0.758`, p50 `0.767`
+    - `kernel_ms`: mean `0.280`, p50 `0.277`
+    - `build_ms`: mean `0.249`, p50 `0.249`
+    - `index_ms`: mean `0.076`, p50 `0.074`
+    - `csa_pack_ms`: mean `0.061`, p50 `0.060`
+    - `kv_contig_ms`: mean `0.006`, p50 `0.006`
+    - overhead excluding the attention kernel: mean `0.478`, p50 `0.480`
 - HCA layers (`ratio=128`, 177 rows):
-  - `total_ms`: mean `0.715`, p50 `0.660`
-  - `kernel_ms`: mean `0.278`, p50 `0.269`
-  - `build_ms`: mean `0.230`, p50 `0.232`
-  - `index_ms`: mean `0.069`, p50 `0.065`
-  - `kv_contig_ms`: mean `0.007`, p50 `0.007`
-  - overhead excluding the attention kernel: mean `0.437`, p50 `0.390`
+    - `total_ms`: mean `0.715`, p50 `0.660`
+    - `kernel_ms`: mean `0.278`, p50 `0.269`
+    - `build_ms`: mean `0.230`, p50 `0.232`
+    - `index_ms`: mean `0.069`, p50 `0.065`
+    - `kv_contig_ms`: mean `0.007`, p50 `0.007`
+    - overhead excluding the attention kernel: mean `0.437`, p50 `0.390`
 
 Smaller chunk (`T=264`) summary:
 
@@ -3539,14 +3539,14 @@ Runtime smoke/profile with reuse enabled:
 Large chunk (`T=3696`) comparison:
 
 - CSA (`ratio=4`):
-  - previous: `total_ms` mean `0.758`, `build_ms` mean `0.249`,
+    - previous: `total_ms` mean `0.758`, `build_ms` mean `0.249`,
     `index_ms` mean `0.076`, overhead excluding kernel mean `0.478`
-  - reuse: `total_ms` mean `0.460`, `build_ms` mean `0.005`,
+    - reuse: `total_ms` mean `0.460`, `build_ms` mean `0.005`,
     `index_ms` mean `0.000`, overhead excluding kernel mean `0.171`
 - HCA (`ratio=128`):
-  - previous: `total_ms` mean `0.715`, `build_ms` mean `0.230`,
+    - previous: `total_ms` mean `0.715`, `build_ms` mean `0.230`,
     `index_ms` mean `0.069`, overhead excluding kernel mean `0.437`
-  - reuse: `total_ms` mean `0.461`, `build_ms` mean `0.017`,
+    - reuse: `total_ms` mean `0.461`, `build_ms` mean `0.017`,
     `index_ms` mean `0.005`, overhead excluding kernel mean `0.171`
 
 Interpretation:
@@ -3565,29 +3565,29 @@ Interpretation:
 Validation after enabling prefill index reuse:
 
 - `python3 -m py_compile` passed for:
-  - `vllm/models/deepseek_v4/amd/rocm.py`
-  - `vllm/models/deepseek_v4/amd/model_state.py`
-  - `vllm/models/deepseek_v4/amd/v4_kernels/paged_prefill_indices.py`
-  - `vllm/models/deepseek_v4/amd/v4_kernels/csa_translate_pack.py`
+    - `vllm/models/deepseek_v4/amd/rocm.py`
+    - `vllm/models/deepseek_v4/amd/model_state.py`
+    - `vllm/models/deepseek_v4/amd/v4_kernels/paged_prefill_indices.py`
+    - `vllm/models/deepseek_v4/amd/v4_kernels/csa_translate_pack.py`
 - GSM8K with unchanged `lmeval.sh`, V2 runner, no `--enforce-eager`,
   `MAX_NUM_SEQS=64`, `MAX_MODEL_LEN=8192`,
   `VLLM_ROCM_DSV4_ATOM_PREFILL_INDEX_REUSE=1`:
-  - flexible exact match: `0.9530 +/- 0.0058`
-  - strict exact match: `0.9538 +/- 0.0058`
-  - result is within the required `0.95 +/- 0.01` band.
+    - flexible exact match: `0.9530 +/- 0.0058`
+    - strict exact match: `0.9538 +/- 0.0058`
+    - result is within the required `0.95 +/- 0.01` band.
 - Fresh C32 benchmark server, V2 runner, no `--enforce-eager`,
   `MAX_NUM_SEQS=32`, `MAX_MODEL_LEN=2304`,
   `GPU_MEMORY_UTILIZATION=0.9`,
   `VLLM_ROCM_DSV4_ATOM_PREFILL_INDEX_REUSE=1`:
-  - result file:
+    - result file:
     `/app/atomdsv4/bench-prefill-reuse-gpu90-len2304/ds-v4-pro-prefill-reuse-gpu90-len2304-C32.json`
-  - completed requests: `320`
-  - failed requests: `0`
-  - output throughput: `855.67 tok/s`
-  - total throughput: `1714.68 tok/s`
-  - mean TPOT: `36.35 ms`
-  - median TPOT: `36.23 ms`
-  - mean TTFT: `1102.81 ms`
+    - completed requests: `320`
+    - failed requests: `0`
+    - output throughput: `855.67 tok/s`
+    - total throughput: `1714.68 tok/s`
+    - mean TPOT: `36.35 ms`
+    - median TPOT: `36.23 ms`
+    - mean TTFT: `1102.81 ms`
 
 Comparison against the previous fastest validated C32 run with indexer
 fastpath but without prefill index reuse:
@@ -3626,31 +3626,31 @@ Expected effect:
 Verification for the cleanup:
 
 - `python3 -m py_compile` passed for:
-  - `vllm/models/deepseek_v4/amd/model_state.py`
-  - `vllm/models/deepseek_v4/amd/rocm.py`
-  - `vllm/models/deepseek_v4/compressor.py`
-  - `vllm/models/deepseek_v4/attention.py`
+    - `vllm/models/deepseek_v4/amd/model_state.py`
+    - `vllm/models/deepseek_v4/amd/rocm.py`
+    - `vllm/models/deepseek_v4/compressor.py`
+    - `vllm/models/deepseek_v4/attention.py`
 - `rg` found no remaining `torch.from_numpy` or `.to(self.device)` conversions
   in `vllm/models/deepseek_v4/amd/model_state.py`.
 
 Runtime validation after the cleanup:
 
 - Smoke request:
-  - prompt: `What is 2+2? Answer briefly.`
-  - output: `4`
+    - prompt: `What is 2+2? Answer briefly.`
+    - output: `4`
 - GSM8K with unchanged `lmeval.sh`, `MAX_NUM_SEQS=64`,
   `MAX_MODEL_LEN=8192`, V2 runner, no `--enforce-eager`:
-  - flexible exact match: `0.9530`
-  - strict exact match: `0.9538`
-  - result is within the required `0.95 +/- 0.01` band.
+    - flexible exact match: `0.9530`
+    - strict exact match: `0.9538`
+    - result is within the required `0.95 +/- 0.01` band.
 - C32 benchmark with `MAX_NUM_SEQS=32`, `MAX_MODEL_LEN=2304`,
   `GPU_MEMORY_UTILIZATION=0.9`, V2 runner, no `--enforce-eager`:
-  - successful requests: `320 / 320`
-  - output throughput: `853.60 tok/s`
-  - total throughput: `1710.54 tok/s`
-  - mean TPOT: `36.44 ms`
-  - mean TTFT: `1106.48 ms`
-  - result file:
+    - successful requests: `320 / 320`
+    - output throughput: `853.60 tok/s`
+    - total throughput: `1710.54 tok/s`
+    - mean TPOT: `36.44 ms`
+    - mean TTFT: `1106.48 ms`
+    - result file:
     `/app/atomdsv4/bench-from-vllm-unified-pinnedmeta-gpu90-len2304/ds-v4-pro-from-vllm-unified-pinnedmeta-gpu90-len2304-C32.json`
 
 Comparison against the pre-cleanup vLLM-owned BF16 unified-KV C32 baseline:
@@ -3688,18 +3688,18 @@ Runtime validation:
 - GSM8K with unchanged `lmeval.sh`, `MAX_NUM_SEQS=64`,
   `MAX_MODEL_LEN=8192`, V2 runner, no `--enforce-eager`,
   `VLLM_ROCM_DSV4_ATOM_INDEXER_FASTPATH=1`:
-  - flexible exact match: `0.9553`
-  - strict exact match: `0.9560`
-  - result is within the required `0.95 +/- 0.01` band.
+    - flexible exact match: `0.9553`
+    - strict exact match: `0.9560`
+    - result is within the required `0.95 +/- 0.01` band.
 - C32 benchmark with `MAX_NUM_SEQS=32`, `MAX_MODEL_LEN=2304`,
   `GPU_MEMORY_UTILIZATION=0.9`, V2 runner, no `--enforce-eager`,
   `VLLM_ROCM_DSV4_ATOM_INDEXER_FASTPATH=1`:
-  - successful requests: `320 / 320`
-  - output throughput: `857.47 tok/s`
-  - total throughput: `1718.30 tok/s`
-  - mean TPOT: `36.27 ms`
-  - mean TTFT: `1099.73 ms`
-  - result file:
+    - successful requests: `320 / 320`
+    - output throughput: `857.47 tok/s`
+    - total throughput: `1718.30 tok/s`
+    - mean TPOT: `36.27 ms`
+    - mean TTFT: `1099.73 ms`
+    - result file:
     `/app/atomdsv4/bench-from-vllm-unified-indexerfast-gpu90-len2304/ds-v4-pro-from-vllm-unified-indexerfast-gpu90-len2304-C32.json`
 
 Comparison against the pinned-metadata C32 run:
@@ -3731,12 +3731,12 @@ Verification for the cleanup:
 
 - `rg` found no remaining imports of the deleted module.
 - `python3 -m py_compile` passed for:
-  - `vllm/models/deepseek_v4/amd/v4_kernels/reference.py`
-  - `vllm/models/deepseek_v4/amd/v4_kernels/paged_decode.py`
-  - `vllm/models/deepseek_v4/amd/v4_kernels/paged_prefill.py`
-  - `vllm/models/deepseek_v4/amd/rocm.py`
-  - `vllm/models/deepseek_v4/attention.py`
-  - `vllm/models/deepseek_v4/compressor.py`
+    - `vllm/models/deepseek_v4/amd/v4_kernels/reference.py`
+    - `vllm/models/deepseek_v4/amd/v4_kernels/paged_decode.py`
+    - `vllm/models/deepseek_v4/amd/v4_kernels/paged_prefill.py`
+    - `vllm/models/deepseek_v4/amd/rocm.py`
+    - `vllm/models/deepseek_v4/attention.py`
+    - `vllm/models/deepseek_v4/compressor.py`
 
 ### Metadata Profiling Diagnostic
 
@@ -3768,17 +3768,17 @@ target performance benchmark; it exists only to exercise live metadata paths.
 Request-time profile summary from `/app/atomdsv4/server_metadata_profile_c32.log`:
 
 - Live C32 decode samples (`reqs=32`, `tokens=32`, 16 samples):
-  - `super`: mean `0.964 ms`, min `0.782 ms`, max `1.207 ms`
-  - `unified`: mean `0.002 ms`
-  - `plans`: mean `0.166 ms`, min `0.135 ms`, max `0.210 ms`
-  - `state`: mean `0.129 ms`, min `0.110 ms`, max `0.154 ms`
-  - `attach`: mean `0.011 ms`
-  - `total`: mean `1.272 ms`, min `1.040 ms`, max `1.574 ms`
+    - `super`: mean `0.964 ms`, min `0.782 ms`, max `1.207 ms`
+    - `unified`: mean `0.002 ms`
+    - `plans`: mean `0.166 ms`, min `0.135 ms`, max `0.210 ms`
+    - `state`: mean `0.129 ms`, min `0.110 ms`, max `0.154 ms`
+    - `attach`: mean `0.011 ms`
+    - `total`: mean `1.272 ms`, min `1.040 ms`, max `1.574 ms`
 - Live C32 prefill-ish samples (`reqs=32`, `tokens=64`, 8 samples):
-  - `super`: mean `2.435 ms`
-  - `plans`: mean `0.198 ms`
-  - `state`: mean `0.145 ms`
-  - `total`: mean `2.792 ms`
+    - `super`: mean `2.435 ms`
+    - `plans`: mean `0.198 ms`
+    - `state`: mean `0.145 ms`
+    - `total`: mean `2.792 ms`
 - Capture samples are noisier, with `total` mean `5.302 ms` and a max
   `54.789 ms`; those include graph-capture warmup behavior and should not be
   used as steady-state evidence.
@@ -3821,22 +3821,22 @@ Parsed profile rows from `/app/atomdsv4/server_decode_profile_c32.log`:
 For `T=32` rows:
 
 - CSA (`ratio=4`, 238 rows):
-  - `index_ms`: mean `0.0967`, p50 `0.0615`
-  - `translate_ms`: mean `0.1020`, p50 `0.0380`
-  - `kernel_ms`: mean `0.0872`, p50 `0.0530`
-  - `total_ms`: mean `0.2862`, p50 `0.1550`
+    - `index_ms`: mean `0.0967`, p50 `0.0615`
+    - `translate_ms`: mean `0.1020`, p50 `0.0380`
+    - `kernel_ms`: mean `0.0872`, p50 `0.0530`
+    - `total_ms`: mean `0.2862`, p50 `0.1550`
 - HCA (`ratio=128`, 248 rows):
-  - `index_ms`: mean `0.1481`, p50 `0.0600`
-  - `translate_ms`: mean `0.0032`, p50 `0.0030`
-  - `kernel_ms`: mean `0.1472`, p50 `0.0540`
-  - `total_ms`: mean `0.2987`, p50 `0.1190`
+    - `index_ms`: mean `0.1481`, p50 `0.0600`
+    - `translate_ms`: mean `0.0032`, p50 `0.0030`
+    - `kernel_ms`: mean `0.1472`, p50 `0.0540`
+    - `total_ms`: mean `0.2987`, p50 `0.1190`
 
 For `T=1` rows:
 
 - CSA (`ratio=4`, 240 rows):
-  - `total_ms`: mean `0.1866`, p50 `0.1500`
+    - `total_ms`: mean `0.1866`, p50 `0.1500`
 - HCA (`ratio=128`, 248 rows):
-  - `total_ms`: mean `0.1504`, p50 `0.1130`
+    - `total_ms`: mean `0.1504`, p50 `0.1130`
 
 Interpretation:
 
@@ -3934,21 +3934,21 @@ Validation after enabling decode index reuse:
 
 - Accuracy command: unchanged `/app/atomdsv4/lmeval.sh`.
 - Server configuration:
-  - `MAX_NUM_SEQS=64`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - `GPU_MEMORY_UTILIZATION=0.9`
-  - `ENFORCE_EAGER=0`
-  - `BLOCK_SIZE=128`
-  - `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1`
-  - `VLLM_ROCM_DSV4_ATOM_SKIP_PAGED_PREFILL=0`
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED=1`
-  - `VLLM_ROCM_DSV4_ATOM_INDEXER_FASTPATH=1`
-  - `VLLM_ROCM_DSV4_ATOM_PREFILL_INDEX_REUSE=1`
-  - `VLLM_ROCM_DSV4_ATOM_DECODE_INDEX_REUSE=1`
+    - `MAX_NUM_SEQS=64`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - `GPU_MEMORY_UTILIZATION=0.9`
+    - `ENFORCE_EAGER=0`
+    - `BLOCK_SIZE=128`
+    - `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1`
+    - `VLLM_ROCM_DSV4_ATOM_SKIP_PAGED_PREFILL=0`
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED=1`
+    - `VLLM_ROCM_DSV4_ATOM_INDEXER_FASTPATH=1`
+    - `VLLM_ROCM_DSV4_ATOM_PREFILL_INDEX_REUSE=1`
+    - `VLLM_ROCM_DSV4_ATOM_DECODE_INDEX_REUSE=1`
 - Result from `/app/atomdsv4/lmeval_decode_reuse.log`:
-  - `gsm8k` flexible-extract exact match: `0.9522 +/- 0.0059`
-  - `gsm8k` strict-match exact match: `0.9530 +/- 0.0058`
+    - `gsm8k` flexible-extract exact match: `0.9522 +/- 0.0059`
+    - `gsm8k` strict-match exact match: `0.9530 +/- 0.0058`
 
 Performance after enabling decode index reuse:
 
@@ -3980,11 +3980,11 @@ Comparison against all saved historical C32 JSONs under `/app/atomdsv4`:
   vLLM-owned unified-KV ATOM integration series.
 - It is not the fastest historical C32 JSON in the workspace. Older
   `bench-sparsemla` runs remain higher, for example:
-  - `/app/atomdsv4/bench-sparsemla/revert-compressor-aux-nomtp-C32.json`:
+    - `/app/atomdsv4/bench-sparsemla/revert-compressor-aux-nomtp-C32.json`:
     `926.06 tok/s`, mean TPOT `33.50 ms`
-  - `/app/atomdsv4/bench-sparsemla/ds-v4-pro-nomtp-compressor-order-off-C32.json`:
+    - `/app/atomdsv4/bench-sparsemla/ds-v4-pro-nomtp-compressor-order-off-C32.json`:
     `925.13 tok/s`, mean TPOT `33.50 ms`
-  - `/app/atomdsv4/bench-sparsemla/fused-clamp-actmul-C32.json`:
+    - `/app/atomdsv4/bench-sparsemla/fused-clamp-actmul-C32.json`:
     `922.73 tok/s`, mean TPOT `33.71 ms`
 - Treat those as historical comparison points, not proof that the current
   ATOM unified-KV path has reached that level. They came from earlier
@@ -4125,11 +4125,11 @@ Purpose:
 - Remove the separate `csa_translate_pack` launch for ratio-4 pure decode.
 - Consume the indexer's raw seq-local top-k directly in the attention kernel.
 - Compute the physical ATOM unified-KV slot inline:
-  - `block_idx = topk // csa_block_capacity`
-  - `slot = topk % csa_block_capacity`
-  - `physical_block = block_table[batch_id, block_idx]`
-  - `csa_slot = swa_pages + physical_block * csa_block_capacity + slot`
-  - append the SWA ring tail using `state_slot * win_with_spec + (abs_pos % win_with_spec)`
+    - `block_idx = topk // csa_block_capacity`
+    - `slot = topk % csa_block_capacity`
+    - `physical_block = block_table[batch_id, block_idx]`
+    - `csa_slot = swa_pages + physical_block * csa_block_capacity + slot`
+    - append the SWA ring tail using `state_slot * win_with_spec + (abs_pos % win_with_spec)`
 
 Scope of this first version:
 
@@ -4269,23 +4269,23 @@ Evidence:
   Python timing/print path. Therefore the C32 timings below are captured graph
   timings, not a no-graph eager runtime profile.
 - Captured C32 CSA layer-2 samples:
-  - `T=32`, `n=8`
-  - `translate_ms` mean `2.264`, p50 `2.325`
-  - `kernel_ms` mean `1.104`, p50 `1.098`
-  - `total_ms` mean `3.385`, p50 `3.430`
-  - translate/kernel mean ratio: `2.05x`
+    - `T=32`, `n=8`
+    - `translate_ms` mean `2.264`, p50 `2.325`
+    - `kernel_ms` mean `1.104`, p50 `1.098`
+    - `total_ms` mean `3.385`, p50 `3.430`
+    - translate/kernel mean ratio: `2.05x`
 - Captured smaller-shape samples:
-  - `T=16`: translate mean `0.057 ms`, kernel mean `0.064 ms`
-  - `T=8`: translate mean `0.056 ms`, kernel mean `0.061 ms`
-  - `T=4`: translate mean `0.058 ms`, kernel mean `0.055 ms`
+    - `T=16`: translate mean `0.057 ms`, kernel mean `0.064 ms`
+    - `T=8`: translate mean `0.056 ms`, kernel mean `0.061 ms`
+    - `T=4`: translate mean `0.058 ms`, kernel mean `0.055 ms`
 - Runtime metadata samples from the same layer-2 profiling series showed
   ModelState metadata attach/planning overhead around `0.98 ms` at `tokens=32`
   (`super` about `0.73 ms`, plans about `0.125 ms`, state about `0.112 ms`).
 - Inference JIT warnings still included:
-  - `_build_prefill_chunk_metadata_kernel`
-  - `_compute_prefill_metadata_kernel`
-  - `_v4_paged_prefill_indices_kernel`
-  - `_csa_translate_pack_kernel`
+    - `_build_prefill_chunk_metadata_kernel`
+    - `_compute_prefill_metadata_kernel`
+    - `_v4_paged_prefill_indices_kernel`
+    - `_csa_translate_pack_kernel`
 
 Standalone `csa_translate_pack` microbenchmark:
 
@@ -4293,10 +4293,10 @@ Standalone `csa_translate_pack` microbenchmark:
   `csa_block_capacity=32`, `window_size=128`, and repeated the isolated
   `csa_translate_pack` call with CUDA events after warmup.
 - Results:
-  - effective valid K `512`: `0.0153 ms`
-  - effective valid K `640`: `0.0159 ms`
-  - effective valid K `768`: `0.0157 ms`
-  - effective valid K `1024`: `0.0159 ms`
+    - effective valid K `512`: `0.0153 ms`
+    - effective valid K `640`: `0.0159 ms`
+    - effective valid K `768`: `0.0157 ms`
+    - effective valid K `1024`: `0.0159 ms`
 - This means the standalone translation kernel is not the 2 ms bottleneck.
   The model-level `translate_ms` bucket is a queue-synchronization segment that
   includes dependency/backlog from work launched before the translation call,
@@ -4330,21 +4330,21 @@ Question:
 ATOM model-file behavior:
 
 - `ATOM/atom/models/deepseek_v4.py` imports:
-  - `aiter.ops.topk.top_k_per_row_decode`
-  - `aiter.ops.topk.top_k_per_row_prefill`
+    - `aiter.ops.topk.top_k_per_row_decode`
+    - `aiter.ops.topk.top_k_per_row_prefill`
 - Its `Indexer.forward_batched` computes:
-  - replicated `wq_b`
-  - RoPE + rotate activation
-  - per-1x128 FP8 q quant
-  - replicated `weights_proj`
-  - scaled indexer weights
+    - replicated `wq_b`
+    - RoPE + rotate activation
+    - per-1x128 FP8 q quant
+    - replicated `weights_proj`
+    - scaled indexer weights
 - Then it calls:
-  - `torch.ops.aiter.indexer_score_topk(q_fp8, weights, self.prefix, self.index_topk)`
+    - `torch.ops.aiter.indexer_score_topk(q_fp8, weights, self.prefix, self.index_topk)`
 - ATOM's own comment says that dispatcher calls back into the Python module's
   `Indexer.indexer_score_topk(...)`, which then calls the actual kernels:
-  - prefill: `cp_gather_indexer_k_quant_cache`, `fp8_mqa_logits`,
+    - prefill: `cp_gather_indexer_k_quant_cache`, `fp8_mqa_logits`,
     `top_k_per_row_prefill`
-  - decode: paged FP8 MQA logits, `top_k_per_row_decode`
+    - decode: paged FP8 MQA logits, `top_k_per_row_decode`
 
 Installed aiter 0.1.15.post1 runtime check:
 
@@ -4376,10 +4376,10 @@ Current vLLM status:
   scoring/top-k.
 - The narrow ROCm `VLLM_ROCM_DSV4_ATOM_INDEXER_FASTPATH=1` decode path bypasses
   the generic `SparseAttnIndexer` wrapper and directly uses:
-  - `rocm_fp8_paged_mqa_logits`
-  - `_top_k_per_row_decode`
-  - ModelState `n_committed_csa_per_seq`
-  - vLLM decode block table
+    - `rocm_fp8_paged_mqa_logits`
+    - `_top_k_per_row_decode`
+    - ModelState `n_committed_csa_per_seq`
+    - vLLM decode block table
 - The generic path still exists for prefill and fallback cases.
 
 Conclusion:
@@ -4389,9 +4389,9 @@ Conclusion:
   level kernels, not a separate fused kernel exposed by aiter 0.1.15.post1.
 - vLLM is already using the available aiter indexer kernels, but not through the
   ATOM dispatcher shape. The remaining difference is structural:
-  - ATOM's dispatcher reads forward-context metadata shaped for ATOM's
+    - ATOM's dispatcher reads forward-context metadata shaped for ATOM's
     request-state/indexer contract.
-  - vLLM still builds and adapts generic sparse-indexer metadata, then bridges
+    - vLLM still builds and adapts generic sparse-indexer metadata, then bridges
     it into the ModelState path for attention.
 - Therefore, the next useful work is not "enable `indexer_score_topk`"; it is
   to reduce or replace the generic vLLM indexer metadata wrapper for ROCm DSV4
@@ -4401,10 +4401,10 @@ Conclusion:
 Follow-up implementation:
 
 - `DeepseekV4RocmAtomStateMetadata` now carries:
-  - `indexer_decode_block_table`
-  - `indexer_decode_schedule_metadata`
-  - `indexer_decode_requires_padding`
-  - `indexer_decode_num_tokens`
+    - `indexer_decode_block_table`
+    - `indexer_decode_schedule_metadata`
+    - `indexer_decode_requires_padding`
+    - `indexer_decode_num_tokens`
 - `DeepseekV4RocmAtomModelState.prepare_attn(...)` hoists these fields from the
   vLLM-built indexer decode metadata into the ATOM ModelState once per forward.
 - `DeepseekV4Indexer._maybe_atom_decode_indexer_fastpath(...)` now consumes
@@ -4427,17 +4427,17 @@ What this does and does not solve:
 Validation:
 
 - Static compile:
-  - `python3 -m py_compile vllm/models/deepseek_v4/amd/model_state.py vllm/models/deepseek_v4/attention.py`
+    - `python3 -m py_compile vllm/models/deepseek_v4/amd/model_state.py vllm/models/deepseek_v4/attention.py`
 - Smoke server:
-  - `MAX_NUM_SEQS=32 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192 GPU_MEMORY_UTILIZATION=0.9 bash launchdeepseekgraph.sh`
-  - no `--enforce-eager`
-  - V2 Model Runner
-  - graph capture completed
-  - vLLM-owned unified KV views were bound
+    - `MAX_NUM_SEQS=32 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192 GPU_MEMORY_UTILIZATION=0.9 bash launchdeepseekgraph.sh`
+    - no `--enforce-eager`
+    - V2 Model Runner
+    - graph capture completed
+    - vLLM-owned unified KV views were bound
 - Smoke request:
-  - prompt: `Question: What is 2+2? Answer:`
-  - `max_tokens=16`, `temperature=0`
-  - first answer token was `4`
+    - prompt: `Question: What is 2+2? Answer:`
+    - `max_tokens=16`, `temperature=0`
+    - first answer token was `4`
 - No runtime errors were present in `server_modelstate_indexer_smoke.log`.
 
 ## Direct ModelState Indexer Decode Metadata
@@ -4456,17 +4456,17 @@ Implemented slice:
 - `prepare_attn(...)` tries to attach indexer decode metadata directly from
   ModelState inputs before falling back to the generic indexer metadata hoist.
 - The direct path is intentionally narrow:
-  - pure decode only,
-  - one scheduled token per live request,
-  - no padding expansion,
-  - no mixed prefill/decode,
-  - no speculative flattening.
+    - pure decode only,
+    - one scheduled token per live request,
+    - no padding expansion,
+    - no mixed prefill/decode,
+    - no speculative flattening.
 - It locates the `DEEPSEEK_V4_INDEXER` attention group, reuses that group's
   vLLM block table, and attaches:
-  - `indexer_decode_block_table`
-  - `indexer_decode_schedule_metadata`
-  - `indexer_decode_num_tokens`
-  - `indexer_decode_requires_padding=False`
+    - `indexer_decode_block_table`
+    - `indexer_decode_schedule_metadata`
+    - `indexer_decode_num_tokens`
+    - `indexer_decode_requires_padding=False`
 
 Important ROCm observation:
 
@@ -4498,17 +4498,17 @@ What this does not yet solve:
 Validation:
 
 - Static compile:
-  - `python3 -m py_compile vllm/models/deepseek_v4/amd/model_state.py vllm/models/deepseek_v4/attention.py`
+    - `python3 -m py_compile vllm/models/deepseek_v4/amd/model_state.py vllm/models/deepseek_v4/attention.py`
 - Smoke server:
-  - `MAX_NUM_SEQS=32 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192 GPU_MEMORY_UTILIZATION=0.9 bash launchdeepseekgraph.sh`
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - no `--enforce-eager`
-  - graph capture completed
-  - vLLM-owned unified KV views were bound
+    - `MAX_NUM_SEQS=32 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192 GPU_MEMORY_UTILIZATION=0.9 bash launchdeepseekgraph.sh`
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - no `--enforce-eager`
+    - graph capture completed
+    - vLLM-owned unified KV views were bound
 - Smoke request:
-  - prompt: `Question: What is 2+2? Answer:`
-  - `max_tokens=16`, `temperature=0`
-  - first answer token was `4`
+    - prompt: `Question: What is 2+2? Answer:`
+    - `max_tokens=16`, `temperature=0`
+    - first answer token was `4`
 - Log file: `server_direct_indexer_smoke.log`.
 - No full `lmeval.sh` or C32 benchmark was run for this slice.
 
@@ -4554,16 +4554,16 @@ Conclusion:
   fully to the ATOM/ModelState metadata contract.
 - C32 deployment benchmark, 1024 input / 1024 output / 320 prompts, did not
   show a throughput win from this metadata skip:
-  - default generic indexer metadata:
-    - output throughput: 865.11 tok/s
-    - total throughput: 1733.60 tok/s
-    - mean TPOT: 36.07 ms
-  - `VLLM_ROCM_DSV4_ATOM_SKIP_INDEXER_METADATA=1` with minimal indexer
+    - default generic indexer metadata:
+        - output throughput: 865.11 tok/s
+        - total throughput: 1733.60 tok/s
+        - mean TPOT: 36.07 ms
+    - `VLLM_ROCM_DSV4_ATOM_SKIP_INDEXER_METADATA=1` with minimal indexer
     K-cache metadata:
-    - output throughput: 862.96 tok/s
-    - total throughput: 1729.30 tok/s
-    - mean TPOT: 36.14 ms
-  - delta: about -0.25% output throughput and +0.20% mean TPOT, which is
+        - output throughput: 862.96 tok/s
+        - total throughput: 1729.30 tok/s
+        - mean TPOT: 36.14 ms
+    - delta: about -0.25% output throughput and +0.20% mean TPOT, which is
     within benchmark noise and does not support generic indexer metadata prep
     as the dominant C32 deployment bottleneck.
 - The skip flag now defaults to off (`0`) and should remain an explicit
@@ -4573,24 +4573,24 @@ Conclusion:
 Validation after disabling the probe by default:
 
 - Static compile:
-  - `python3 -m py_compile vllm/models/deepseek_v4/amd/model_state.py vllm/models/deepseek_v4/attention.py`
+    - `python3 -m py_compile vllm/models/deepseek_v4/amd/model_state.py vllm/models/deepseek_v4/attention.py`
 - Default smoke server:
-  - `MAX_NUM_SEQS=32 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192 GPU_MEMORY_UTILIZATION=0.9 bash launchdeepseekgraph.sh`
-  - no `--enforce-eager`
-  - graph capture completed
-  - vLLM-owned unified KV views were bound
+    - `MAX_NUM_SEQS=32 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192 GPU_MEMORY_UTILIZATION=0.9 bash launchdeepseekgraph.sh`
+    - no `--enforce-eager`
+    - graph capture completed
+    - vLLM-owned unified KV views were bound
 - Smoke request:
-  - prompt: `Question: What is 2+2? Answer:`
-  - `max_tokens=16`, `temperature=0`
-  - first answer token was `4`
+    - prompt: `Question: What is 2+2? Answer:`
+    - `max_tokens=16`, `temperature=0`
+    - first answer token was `4`
 - Log files:
-  - failed probe: `server_skip_indexer_metadata_smoke.log`
-  - restored default path: `server_default_after_skip_probe_smoke.log`
-  - minimal metadata probe: `server_minimal_indexer_metadata_smoke2.log`
-  - default C32 benchmark: `bench_default_metadata_client.log`,
+    - failed probe: `server_skip_indexer_metadata_smoke.log`
+    - restored default path: `server_default_after_skip_probe_smoke.log`
+    - minimal metadata probe: `server_minimal_indexer_metadata_smoke2.log`
+    - default C32 benchmark: `bench_default_metadata_client.log`,
     `bench_default_metadata_server.log`,
     `bench-metadata-compare/default_metadata-C32.json`
-  - minimal-metadata C32 benchmark: `bench_minimal_metadata_client.log`,
+    - minimal-metadata C32 benchmark: `bench_minimal_metadata_client.log`,
     `bench_minimal_metadata_server.log`,
     `bench-metadata-compare/minimal_metadata-C32.json`
 
@@ -4608,40 +4608,40 @@ Probe:
 - Enabled the existing lightweight CPU-side metadata profiler:
   `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`.
 - Server:
-  - `MAX_NUM_SEQS=32 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192 GPU_MEMORY_UTILIZATION=0.9 bash launchdeepseekgraph.sh`
-  - no `--enforce-eager`
-  - Model Runner V2
-  - block size 128
+    - `MAX_NUM_SEQS=32 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192 GPU_MEMORY_UTILIZATION=0.9 bash launchdeepseekgraph.sh`
+    - no `--enforce-eager`
+    - Model Runner V2
+    - block size 128
 - Short load:
-  - `vllm bench serve`
-  - C32, 64 prompts
-  - 1024 input / 128 output
-  - 8 warmups
+    - `vllm bench serve`
+    - C32, 64 prompts
+    - 1024 input / 128 output
+    - 8 warmups
 
 Observed `prepare_attn` profile:
 
 - Capture calls:
-  - first C32 calls include one-time unified KV binding and generic metadata
+    - first C32 calls include one-time unified KV binding and generic metadata
     setup; totals were about 50-55 ms on the first worker calls.
-  - after first bind, capture calls settled around 1.1-2.0 ms for common C32
+    - after first bind, capture calls settled around 1.1-2.0 ms for common C32
     decode-like shapes.
 - Runtime calls:
-  - all non-capture rows: mean total 1.49 ms, p50 0.99 ms.
-  - C32 / 32-token runtime rows: mean total 1.21 ms, p50 0.99 ms.
-  - C32 / 64-token runtime rows: mean total 2.86 ms, p50 2.89 ms.
+    - all non-capture rows: mean total 1.49 ms, p50 0.99 ms.
+    - C32 / 32-token runtime rows: mean total 1.21 ms, p50 0.99 ms.
+    - C32 / 64-token runtime rows: mean total 2.86 ms, p50 2.89 ms.
 - ATOM-specific pieces inside `ModelState.prepare_attn` were smaller:
-  - compress plan build: about 0.15 ms mean for C32 / 32-token rows.
-  - ATOM state build: about 0.14 ms mean for C32 / 32-token rows.
-  - unified binding after startup: effectively 0.00 ms.
-  - attach: about 0.01 ms.
+    - compress plan build: about 0.15 ms mean for C32 / 32-token rows.
+    - ATOM state build: about 0.14 ms mean for C32 / 32-token rows.
+    - unified binding after startup: effectively 0.00 ms.
+    - attach: about 0.01 ms.
 
 Observed attention metadata helper profile:
 
 - HCA/MLA ratio 128 was the larger metadata-side cost:
-  - C32 rows averaged about 2.65 ms total in the helper profile, with about
+    - C32 rows averaged about 2.65 ms total in the helper profile, with about
     0.64 ms in ragged work.
 - CSA/MLA ratio 4 was small:
-  - C32 rows averaged about 0.16 ms total.
+    - C32 rows averaged about 0.16 ms total.
 
 Interpretation:
 
@@ -4651,10 +4651,10 @@ Interpretation:
   36 ms TPOT at C32. It can matter for latency and graph replay overhead, but
   it does not explain the large gap to ATOM's target C32 figure by itself.
 - The higher-signal conversion/prep suspects are now:
-  - HCA ratio-128 attention metadata preparation.
-  - Ragged/layout translation feeding ATOM paged attention.
-  - Any remaining block-table to unified-KV conversion around HCA decode.
-  - Device-side q norm/quant and top-k translate/pack kernels, which are not
+    - HCA ratio-128 attention metadata preparation.
+    - Ragged/layout translation feeding ATOM paged attention.
+    - Any remaining block-table to unified-KV conversion around HCA decode.
+    - Device-side q norm/quant and top-k translate/pack kernels, which are not
     captured by the CPU-only `prepare_attn` profiler.
 
 Artifacts:
@@ -4689,9 +4689,9 @@ Current vLLM-owned allocation path:
 - `bind_kv_cache(...)` calls `post_bind_kv_cache(...)`, and
   `DeepseekV4Attention.post_bind_kv_cache(...)` creates ATOM views over the
   same storage:
-  - `atom_unified_kv = [swa_pages + num_blocks * k_per_block, head_dim]`
-  - `atom_swa_kv = [max_num_seqs, win_with_spec, head_dim]`
-  - `atom_compressed_kv_cache = [num_blocks, k_per_block, head_dim]`
+    - `atom_unified_kv = [swa_pages + num_blocks * k_per_block, head_dim]`
+    - `atom_swa_kv = [max_num_seqs, win_with_spec, head_dim]`
+    - `atom_compressed_kv_cache = [num_blocks, k_per_block, head_dim]`
 - `DeepseekV4RocmAtomModelState._try_bind_atom_unified_kv_from_vllm(...)`
   validates and binds the same views again from model state, so graph capture
   and runtime use the same vLLM-owned storage.
@@ -4717,9 +4717,9 @@ Remaining adapter layers:
   uses the vLLM indexer/cache metadata contract for prefill and fallback cases.
 - The compressor/indexer/attention do not yet share one native ATOM metadata
   object end to end:
-  - ModelState builds ATOM state and compress plans.
-  - vLLM still builds common MLA/SWA/indexer metadata.
-  - The ROCm wrapper adapts those into ATOM decode/prefill index buffers.
+    - ModelState builds ATOM state and compress plans.
+    - vLLM still builds common MLA/SWA/indexer metadata.
+    - The ROCm wrapper adapts those into ATOM decode/prefill index buffers.
 - The current homogeneous BF16 unified tensor is accuracy-valid, but it is not
   the final mixed FP8/BF16 ATOM storage contract. Supporting FP8 compressed
   tails inside the same logical unified layout would require either split-view
@@ -4769,37 +4769,37 @@ Source of truth:
 Active or available in the current vLLM ROCm path:
 
 - `qk_norm_rope_maybe_quant`
-  - ATOM calls this for per-head Q RMSNorm, KV RMSNorm, and RoPE.
-  - vLLM imports the same local kernel wrapper from
+    - ATOM calls this for per-head Q RMSNorm, KV RMSNorm, and RoPE.
+    - vLLM imports the same local kernel wrapper from
     `amd/v4_kernels/qk_norm_rope_maybe_quant.py` and calls it from
     `DeepseekV4ROCMAiterMLAAttention._fused_qnorm_rope_kv_insert`.
-  - The current active path sets `quant_q=False` and `quant_k=False`, matching
+    - The current active path sets `quant_q=False` and `quant_k=False`, matching
     ATOM's default sparse-attention path. `ATOM_USE_FUSED_Q_NORM_QUANT=1`
     affects the earlier q-lora RMSNorm/quant path, not this kernel's
     `quant_q` flag.
 - `swa_write`
-  - ATOM writes decode SWA before attention and prefill SWA after attention.
-  - vLLM calls the same local `swa_write` in `_maybe_atom_swa_write` and after
+    - ATOM writes decode SWA before attention and prefill SWA after attention.
+    - vLLM calls the same local `swa_write` in `_maybe_atom_swa_write` and after
     ATOM prefill attention.
 - `fused_compress_attn`
-  - ATOM runs this before `update_compressor_states`.
-  - vLLM runs the same local wrapper in
+    - ATOM runs this before `update_compressor_states`.
+    - vLLM runs the same local wrapper in
     `DeepseekCompressor._maybe_atom_main_compressor_forward`.
 - `update_compressor_states`
-  - ATOM updates the per-request compressor rings after fused compression.
-  - vLLM runs the same local wrapper after `fused_compress_attn`.
+    - ATOM updates the per-request compressor rings after fused compression.
+    - vLLM runs the same local wrapper after `fused_compress_attn`.
 - `sparse_attn_v4_paged_decode`
-  - ATOM's decode sparse attention kernel is present locally and used in
+    - ATOM's decode sparse attention kernel is present locally and used in
     vLLM's ATOM attention decode path.
 - `sparse_attn_v4_paged_prefill`
-  - ATOM's two-source prefill sparse attention kernel is present locally and
+    - ATOM's two-source prefill sparse attention kernel is present locally and
     used when `VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED=1`.
 - `csa_translate_pack`
-  - ATOM uses this to translate CSA indexer top-k rows into paged offsets.
-  - vLLM uses the local kernel in both decode and prefill CSA paths.
+    - ATOM uses this to translate CSA indexer top-k rows into paged offsets.
+    - vLLM uses the local kernel in both decode and prefill CSA paths.
 - `inverse_rope_inplace`
-  - ATOM uses an inverse-RoPE output step before grouped output LoRA.
-  - vLLM uses a fused ROCm inverse-RoPE + cached BF16 `wo_a` path through
+    - ATOM uses an inverse-RoPE output step before grouped output LoRA.
+    - vLLM uses a fused ROCm inverse-RoPE + cached BF16 `wo_a` path through
     `rocm_inv_rope_einsum`. This is equivalent in intent, but not the exact
     ATOM model-file call.
 
@@ -4823,9 +4823,9 @@ ATOM model-file sequence:
 - `get_hip_quant(QuantType.per_1x128)` for indexer Q
 - `scale_indexer_weights`
 - `torch.ops.aiter.indexer_score_topk(...)`
-  - prefill internally uses `cp_gather_indexer_k_quant_cache`,
+    - prefill internally uses `cp_gather_indexer_k_quant_cache`,
     `fp8_mqa_logits`, and `top_k_per_row_prefill`.
-  - decode internally uses `deepgemm_fp8_paged_mqa_logits` and
+    - decode internally uses `deepgemm_fp8_paged_mqa_logits` and
     `top_k_per_row_decode`.
 
 vLLM status:
@@ -4837,12 +4837,12 @@ vLLM status:
   weight scaling are one local vLLM helper instead of ATOM's separate
   `rope_rotate_activation`, `get_hip_quant`, and `scale_indexer_weights` calls.
 - vLLM implements the same lower-level indexer scoring pieces:
-  - `indexer_k_quant_and_cache`
-  - `cp_gather_indexer_k_quant_cache`
-  - `rocm_fp8_mqa_logits`
-  - `rocm_fp8_paged_mqa_logits`
-  - `_top_k_per_row_prefill`
-  - `_top_k_per_row_decode`
+    - `indexer_k_quant_and_cache`
+    - `cp_gather_indexer_k_quant_cache`
+    - `rocm_fp8_mqa_logits`
+    - `rocm_fp8_paged_mqa_logits`
+    - `_top_k_per_row_prefill`
+    - `_top_k_per_row_decode`
 - The normal vLLM path still routes through `SparseAttnIndexer`, while the
   ROCm ATOM decode fastpath in `DeepseekV4Indexer._maybe_atom_decode_indexer_fastpath`
   bypasses the generic wrapper for pure decode and reuses ModelState metadata.
@@ -4885,8 +4885,8 @@ Missing or different:
 Active or available:
 
 - Installed `aiter==0.1.15.post1` exposes:
-  - `mhc_pre`
-  - `mhc_post`
+    - `mhc_pre`
+    - `mhc_post`
 - vLLM's ROCm model uses `MHCPreOp` and `MHCPostOp`; when `HAS_AITER_MHC` is
   true it selects the unfused aiter pre/post path.
 
@@ -5022,8 +5022,8 @@ Comparison notes:
 
 - This is close to the previous current-branch best vLLM-owned unified-KV
   C32 measurements:
-  - default metadata: `865.11 tok/s`, `36.07 ms` mean TPOT.
-  - minimal metadata probe: `862.96 tok/s`, `36.14 ms` mean TPOT.
+    - default metadata: `865.11 tok/s`, `36.07 ms` mean TPOT.
+    - minimal metadata probe: `862.96 tok/s`, `36.14 ms` mean TPOT.
 - It is below older pre-unified/adifferent-configuration C32 runs around
   `925-926 tok/s` and well below ATOM's documented C32 target
   (`1145.71 tok/s`, `26.90 ms` mean TPOT).
@@ -5043,63 +5043,63 @@ number by itself.
 Existing profiling hooks:
 
 - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
-  - profiles `DeepseekV4RocmAtomModelState.prepare_attn`.
-  - breaks total metadata time into:
-    - `super`: inherited vLLM attention metadata builder;
-    - `unified`: unified-KV allocation/binding check;
-    - `plans`: ATOM compressor plan construction;
-    - `state`: ATOM request-state metadata construction;
-    - `attach`: attaching ATOM state to per-layer metadata objects.
+    - profiles `DeepseekV4RocmAtomModelState.prepare_attn`.
+    - breaks total metadata time into:
+        - `super`: inherited vLLM attention metadata builder;
+        - `unified`: unified-KV allocation/binding check;
+        - `plans`: ATOM compressor plan construction;
+        - `state`: ATOM request-state metadata construction;
+        - `attach`: attaching ATOM state to per-layer metadata objects.
 - `VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE=1`
-  - profiles the ROCm ATOM decode wrapper for one selected layer.
-  - breaks time into:
-    - `index_ms`;
-    - `translate_ms`;
-    - `kernel_ms`;
-    - `total_ms`.
+    - profiles the ROCm ATOM decode wrapper for one selected layer.
+    - breaks time into:
+        - `index_ms`;
+        - `translate_ms`;
+        - `kernel_ms`;
+        - `total_ms`.
 - `VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL=1`
-  - profiles ATOM paged prefill with:
-    - `build_ms`;
-    - `index_ms`;
-    - `csa_pack_ms`;
-    - `kv_contig_ms`;
-    - `kernel_ms`;
-    - `output_ms`;
-    - `swa_write_ms`.
+    - profiles ATOM paged prefill with:
+        - `build_ms`;
+        - `index_ms`;
+        - `csa_pack_ms`;
+        - `kv_contig_ms`;
+        - `kernel_ms`;
+        - `output_ms`;
+        - `swa_write_ms`.
 - `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR=1`
-  - profiles the ROCm ATOM main compressor wrapper.
-  - use `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_LAYER=<layer>` to choose one
+    - profiles the ROCm ATOM main compressor wrapper.
+    - use `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_LAYER=<layer>` to choose one
     layer, or `-1` for all layers.
-  - use `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_EVERY=<N>` to reduce logging
+    - use `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_EVERY=<N>` to reduce logging
     frequency.
-  - use `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_START_AFTER=<N>` to skip the
+    - use `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_START_AFTER=<N>` to skip the
     first N calls per compressor module. This is useful because graph warmup can
     otherwise consume the default first-three profile samples before serving
     traffic starts.
-  - reports:
-    - `prep_ms`: state lookup, metadata lookup, optional HCA block-table
+    - reports:
+        - `prep_ms`: state lookup, metadata lookup, optional HCA block-table
       flattening, dtype conversion, and RoPE cache preparation;
-    - `fused_ms`: `fused_compress_attn`;
-    - `state_ms`: `update_compressor_states`;
-    - `tail_ms`: return-path checks, including prefill/native fallback
+        - `fused_ms`: `fused_compress_attn`;
+        - `state_ms`: `update_compressor_states`;
+        - `tail_ms`: return-path checks, including prefill/native fallback
       decision;
-    - `total_ms`;
-    - `num_compress`, `num_write`, `k_per_block`, `num_prefills`, and path
+        - `total_ms`;
+        - `num_compress`, `num_write`, `k_per_block`, `num_prefills`, and path
       label.
 
 Observed metadata profile, steady C32 decode (`reqs=32`, `tokens=32`):
 
 - Source logs:
-  - `profile_metadata_server.log`.
-  - `server_profile_csa_layer2.log`.
+    - `profile_metadata_server.log`.
+    - `server_profile_csa_layer2.log`.
 - Across sampled workers/steps:
-  - inherited vLLM metadata builder: about `0.88-0.91 ms` mean,
+    - inherited vLLM metadata builder: about `0.88-0.91 ms` mean,
     about `0.73-0.74 ms` median.
-  - ATOM compressor plans: about `0.15 ms` mean.
-  - ATOM request-state metadata: about `0.13 ms` mean.
-  - ATOM unified-KV check/bind after startup: about `0.001 ms`.
-  - metadata attach: about `0.011-0.013 ms`.
-  - total metadata: about `1.17-1.21 ms` mean, about `0.99 ms` median.
+    - ATOM compressor plans: about `0.15 ms` mean.
+    - ATOM request-state metadata: about `0.13 ms` mean.
+    - ATOM unified-KV check/bind after startup: about `0.001 ms`.
+    - metadata attach: about `0.011-0.013 ms`.
+    - total metadata: about `1.17-1.21 ms` mean, about `0.99 ms` median.
 
 Observed mixed/prefill-like C32 metadata profile (`reqs=32`, `tokens=64`):
 
@@ -5109,17 +5109,17 @@ Observed mixed/prefill-like C32 metadata profile (`reqs=32`, `tokens=64`):
 Observed CSA decode wrapper profile for one ratio-4 layer:
 
 - For normal decode sizes after capture:
-  - `T=1`: total about `0.15 ms`, translate about `0.05 ms`, kernel about
+    - `T=1`: total about `0.15 ms`, translate about `0.05 ms`, kernel about
     `0.09 ms`.
-  - `T=16`: total about `0.12-0.13 ms`, translate about `0.05-0.06 ms`,
+    - `T=16`: total about `0.12-0.13 ms`, translate about `0.05-0.06 ms`,
     kernel about `0.06 ms`.
-  - `T=24`: total about `0.15-0.16 ms`, translate about `0.05-0.06 ms`,
+    - `T=24`: total about `0.15-0.16 ms`, translate about `0.05-0.06 ms`,
     kernel about `0.08-0.09 ms`.
 - During capture/profile-heavy paths, `T=32` shows a much larger
   synchronized sample:
-  - translate about `2.0-2.3 ms`;
-  - kernel about `1.1 ms`;
-  - total about `3.1-3.4 ms`.
+    - translate about `2.0-2.3 ms`;
+    - kernel about `1.1 ms`;
+    - total about `3.1-3.4 ms`.
   This should be treated as a capture/profiling artifact unless reproduced
   during steady-state non-capture serving.
 
@@ -5173,9 +5173,9 @@ Server configuration:
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
 - normal ROCm ATOM feature flags from `launchdeepseekgraph.sh`
 - profiling:
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_LAYER=-1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_EVERY=100000`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_LAYER=-1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_EVERY=100000`
 
 Short client workload:
 
@@ -5210,18 +5210,18 @@ Captured non-outlier compressor timing samples (`total_ms < 2`) from
 `dsv4prographnomtp-aitermhc_nobreakablecudagraph.log`:
 
 - CSA ratio 4:
-  - all non-outlier samples: `n=712`, mean total `0.280 ms`, median
+    - all non-outlier samples: `n=712`, mean total `0.280 ms`, median
     `0.222 ms`, p90 `0.400 ms`.
-  - `tokens=16`: mean total `0.218 ms`; `prep_ms=0.042`,
+    - `tokens=16`: mean total `0.218 ms`; `prep_ms=0.042`,
     `fused_ms=0.124`, `state_ms=0.048`.
-  - `tokens=32`: mean total `0.375 ms`; `prep_ms=0.190`,
+    - `tokens=32`: mean total `0.375 ms`; `prep_ms=0.190`,
     `fused_ms=0.131`, `state_ms=0.050`.
 - HCA ratio 128:
-  - all non-outlier samples: `n=736`, mean total `0.217 ms`, median
+    - all non-outlier samples: `n=736`, mean total `0.217 ms`, median
     `0.157 ms`, p90 `0.334 ms`.
-  - `tokens=16`: mean total `0.153 ms`; `prep_ms=0.041`,
+    - `tokens=16`: mean total `0.153 ms`; `prep_ms=0.041`,
     `fused_ms=0.069`, `state_ms=0.040`.
-  - `tokens=32`: mean total `0.314 ms`; `prep_ms=0.192`,
+    - `tokens=32`: mean total `0.314 ms`; `prep_ms=0.192`,
     `fused_ms=0.076`, `state_ms=0.041`.
 
 Warmup/JIT outliers:
@@ -5248,35 +5248,35 @@ Interpretation:
 Follow-up start-after serving probe:
 
 - Server added:
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_START_AFTER=20`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_EVERY=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_START_AFTER=20`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_EVERY=1`
 - Short client workload:
-  - `RESULT_DIR=./bench-compressor-profile-steady-short`
-  - `RESULT_PREFIX=compressor-profile-steady-short`
-  - `CONCURRENCIES=4`
-  - `INPUT_LEN=128`
-  - `OUTPUT_LEN=32`
+    - `RESULT_DIR=./bench-compressor-profile-steady-short`
+    - `RESULT_PREFIX=compressor-profile-steady-short`
+    - `CONCURRENCIES=4`
+    - `INPUT_LEN=128`
+    - `OUTPUT_LEN=32`
 - Client result:
-  - Successful requests: `40`.
-  - Failed requests: `0`.
-  - Output throughput: `107.76 tok/s`.
-  - Total throughput: `552.25 tok/s`.
-  - Mean TPOT: `30.15 ms`.
-  - Mean TTFT: `250.44 ms`.
-  - Result JSON:
+    - Successful requests: `40`.
+    - Failed requests: `0`.
+    - Output throughput: `107.76 tok/s`.
+    - Total throughput: `552.25 tok/s`.
+    - Mean TPOT: `30.15 ms`.
+    - Mean TTFT: `250.44 ms`.
+    - Result JSON:
     `bench-compressor-profile-steady-short/compressor-profile-steady-short-C4.json`.
 - Parsed profile lines:
-  - `4392` rows, all `path=atom_prefill`.
-  - The probe did not capture `path=atom_decode` samples. It therefore measures
+    - `4392` rows, all `path=atom_prefill`.
+    - The probe did not capture `path=atom_decode` samples. It therefore measures
     serving-time prefill compressor overhead after graph warmup, not decode
     compressor overhead.
-  - CSA ratio 4: `n=2160`, mean total `0.230 ms`, p50 `0.230 ms`, p90
+    - CSA ratio 4: `n=2160`, mean total `0.230 ms`, p50 `0.230 ms`, p90
     `0.248 ms`, p99 `0.261 ms`, max `0.280 ms`.
-    - Mean breakdown: `prep_ms=0.039`, `fused_ms=0.129`,
+        - Mean breakdown: `prep_ms=0.039`, `fused_ms=0.129`,
       `state_ms=0.058`, `tail_ms=0.004`.
-  - HCA ratio 128: `n=2232`, mean total `0.222 ms`, p50 `0.221 ms`, p90
+    - HCA ratio 128: `n=2232`, mean total `0.222 ms`, p50 `0.221 ms`, p90
     `0.236 ms`, p99 `0.291 ms`, max `0.355 ms`.
-    - Mean breakdown: `prep_ms=0.040`, `fused_ms=0.131`,
+        - Mean breakdown: `prep_ms=0.040`, `fused_ms=0.131`,
       `state_ms=0.047`, `tail_ms=0.004`.
 
 Implication:
@@ -5303,10 +5303,10 @@ Purpose:
   attention/compressor kernels, are a meaningful part of the remaining
   performance gap versus ATOM.
 - Instrumented:
-  - `DeepseekV4RocmAtomModelState.prepare_attn()`.
-  - `DeepseekV4RocmAtomModelState._build_atom_state_metadata()`.
-  - `DeepseekV4FlashMLAMetadataBuilder.build()`.
-  - Existing ROCm `DeepseekV4ROCMAiterMLASparseMetadataBuilder` and
+    - `DeepseekV4RocmAtomModelState.prepare_attn()`.
+    - `DeepseekV4RocmAtomModelState._build_atom_state_metadata()`.
+    - `DeepseekV4FlashMLAMetadataBuilder.build()`.
+    - Existing ROCm `DeepseekV4ROCMAiterMLASparseMetadataBuilder` and
     `DeepseekV4ROCMAiterSparseSWAMetadataBuilder` profile rows.
 
 Server configuration:
@@ -5320,9 +5320,9 @@ Server configuration:
 - no `--enforce-eager`
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
 - profiling:
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_START_AFTER=20`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_EVERY=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_START_AFTER=20`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_EVERY=1`
 
 Short client workload:
 
@@ -5356,48 +5356,48 @@ Parsed model-state rows from
 - Rows: `2944`.
 - Likely decode rows (`tokens == reqs`): `2784`.
 - Model-specific ATOM state conversion is small:
-  - `_build_atom_state_metadata()` likely decode rows: mean `0.095 ms`, p50
+    - `_build_atom_state_metadata()` likely decode rows: mean `0.095 ms`, p50
     `0.094 ms`, p90 `0.101 ms`, p99 `0.109 ms`, max `0.169 ms`.
-  - Breakdown: `map_batch` mean `0.021 ms`, `pos_commit` mean `0.019 ms`,
+    - Breakdown: `map_batch` mean `0.021 ms`, `pos_commit` mean `0.019 ms`,
     `dataclass` mean `0.015 ms`, `decode_indptr` mean `0.040 ms`.
 - The inherited `super().prepare_attn()` metadata path dominates:
-  - likely decode rows: mean `0.894 ms`, p50 `0.807 ms`, p90 `0.842 ms`,
+    - likely decode rows: mean `0.894 ms`, p50 `0.807 ms`, p90 `0.842 ms`,
     p99 `0.987 ms`, max `28.869 ms`.
-  - total `prepare_attn()` likely decode rows: mean `1.163 ms`, p50
+    - total `prepare_attn()` likely decode rows: mean `1.163 ms`, p50
     `1.073 ms`, p90 `1.116 ms`, p99 `1.302 ms`, max `29.152 ms`.
-  - The `28-29 ms` outliers occur at call `200`, shape `(reqs=4,tokens=4)`,
+    - The `28-29 ms` outliers occur at call `200`, shape `(reqs=4,tokens=4)`,
     across workers, so treat them as first-use/JIT/synchronization artifacts
     until reproduced without synchronized profiling.
 
 Parsed sparse MLA builder rows:
 
 - Ratio 4:
-  - `2944` rows.
-  - total mean `0.060 ms`, p50 `0.059 ms`, p90 `0.063 ms`, max `0.104 ms`.
-  - `req_ids` mean `0.029 ms`, compressed slot mean `0.029 ms`.
+    - `2944` rows.
+    - total mean `0.060 ms`, p50 `0.059 ms`, p90 `0.063 ms`, max `0.104 ms`.
+    - `req_ids` mean `0.029 ms`, compressed slot mean `0.029 ms`.
 - Ratio 128:
-  - `2944` rows.
-  - total mean `0.099 ms`, p50 `0.097 ms`, p90 `0.106 ms`, p99
+    - `2944` rows.
+    - total mean `0.099 ms`, p50 `0.097 ms`, p90 `0.106 ms`, p99
     `0.142 ms`, max `0.222 ms`.
-  - `req_ids` mean `0.030 ms`, compressed slot mean `0.036 ms`,
+    - `req_ids` mean `0.030 ms`, compressed slot mean `0.036 ms`,
     C128A metadata mean `0.030 ms`.
 
 Parsed existing synchronized ROCm backend metadata rows, excluding rows with
 `total_ms >= 5` as warmup/JIT outliers:
 
 - HCA/MLA ratio 128:
-  - clean rows: `23`.
-  - total mean `0.887 ms`, p50 `0.333 ms`, p90 `2.169 ms`, max `2.360 ms`.
-  - base mean `0.777 ms`; ragged conversion mean `0.109 ms`.
+    - clean rows: `23`.
+    - total mean `0.887 ms`, p50 `0.333 ms`, p90 `2.169 ms`, max `2.360 ms`.
+    - base mean `0.777 ms`; ragged conversion mean `0.109 ms`.
 - CSA/MLA ratio 4:
-  - rows: `32`.
-  - total mean `0.150 ms`, p50 `0.104 ms`, p90 `0.277 ms`, max
+    - rows: `32`.
+    - total mean `0.150 ms`, p50 `0.104 ms`, p90 `0.277 ms`, max
     `0.334 ms`.
 - SWA:
-  - clean rows: `56`.
-  - total mean `0.241 ms`, p50 `0.197 ms`, p90 `0.371 ms`, max
+    - clean rows: `56`.
+    - total mean `0.241 ms`, p50 `0.197 ms`, p90 `0.371 ms`, max
     `0.471 ms`.
-  - base mean `0.162 ms`; ragged conversion mean `0.078 ms`.
+    - base mean `0.162 ms`; ragged conversion mean `0.078 ms`.
 
 Conclusion:
 
@@ -5427,57 +5427,57 @@ Change:
 - Added a ROCm-only pure-decode metadata bypass in
   `DeepseekV4RocmAtomModelState`.
 - New flag:
-  - `VLLM_ROCM_DSV4_ATOM_SKIP_DECODE_METADATA`, default enabled.
+    - `VLLM_ROCM_DSV4_ATOM_SKIP_DECODE_METADATA`, default enabled.
 - The bypass only triggers when all of these are true:
-  - ROCm platform.
-  - `VLLM_ROCM_DSV4_ATOM_ATTENTION=1`.
-  - `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV=1`.
-  - one scheduled token per live request.
-  - no ATOM attention layer/ratio filtering.
-  - no native HCA index fallback.
-  - no probe/forced-native fallback flags.
+    - ROCm platform.
+    - `VLLM_ROCM_DSV4_ATOM_ATTENTION=1`.
+    - `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV=1`.
+    - one scheduled token per live request.
+    - no ATOM attention layer/ratio filtering.
+    - no native HCA index fallback.
+    - no probe/forced-native fallback flags.
 - It removes these backend groups from the generic metadata build for that
   scheduler step:
-  - `DEEPSEEK_SPARSE_SWA`
-  - `FLASHMLA_SPARSE_DSV4`
-  - `ROCM_FLASHMLA_SPARSE_DSV4`
+    - `DEEPSEEK_SPARSE_SWA`
+    - `FLASHMLA_SPARSE_DSV4`
+    - `ROCM_FLASHMLA_SPARSE_DSV4`
 - It then attaches lightweight metadata objects containing only the fields the
   ATOM decode path uses:
-  - SWA: block table, slot mapping, SWA block size, sequence lens, query start,
+    - SWA: block table, slot mapping, SWA block size, sequence lens, query start,
     decode counts.
-  - MLA: block table, slot mapping, compressed block size, query start,
+    - MLA: block table, slot mapping, compressed block size, query start,
     request id buffer, topk width.
 
 Validation run:
 
 - Server:
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - `GPU_MEMORY_UTILIZATION=0.9`
-  - `BLOCK_SIZE=128`
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - no `--enforce-eager`
-  - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-  - profiling:
-    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
-    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_START_AFTER=20`
-    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_EVERY=1`
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - `GPU_MEMORY_UTILIZATION=0.9`
+    - `BLOCK_SIZE=128`
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - no `--enforce-eager`
+    - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+    - profiling:
+        - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
+        - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_START_AFTER=20`
+        - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_EVERY=1`
 - Client:
-  - `RESULT_DIR=./bench-metadata-bypass-short`
-  - `RESULT_PREFIX=metadata-bypass-short`
-  - `CONCURRENCIES=4`
-  - `INPUT_LEN=128`
-  - `OUTPUT_LEN=32`
-  - `bash benchmarkvllm.sh`
+    - `RESULT_DIR=./bench-metadata-bypass-short`
+    - `RESULT_PREFIX=metadata-bypass-short`
+    - `CONCURRENCIES=4`
+    - `INPUT_LEN=128`
+    - `OUTPUT_LEN=32`
+    - `bash benchmarkvllm.sh`
 - Result:
-  - Successful requests: `40`.
-  - Failed requests: `0`.
-  - Output throughput: `109.37 tok/s`.
-  - Total throughput: `560.52 tok/s`.
-  - Mean TPOT: `30.72 ms`.
-  - Mean TTFT: `213.93 ms`.
-  - Result JSON:
+    - Successful requests: `40`.
+    - Failed requests: `0`.
+    - Output throughput: `109.37 tok/s`.
+    - Total throughput: `560.52 tok/s`.
+    - Mean TPOT: `30.72 ms`.
+    - Mean TTFT: `213.93 ms`.
+    - Result JSON:
     `bench-metadata-bypass-short/metadata-bypass-short-C4.json`.
 
 Important limitation:
@@ -5494,14 +5494,14 @@ Parsed metadata effect:
   `5888` rows to `48` rows because pure decode no longer builds those generic
   MLA metadata objects.
 - Likely decode (`tokens == reqs`) with bypass:
-  - `super().prepare_attn()` mean `0.257 ms`, p50 `0.252 ms`, p90 `0.265 ms`,
+    - `super().prepare_attn()` mean `0.257 ms`, p50 `0.252 ms`, p90 `0.265 ms`,
     p99 `0.383 ms`, max `0.642 ms`.
-  - total `prepare_attn()` mean `0.559 ms`, p50 `0.547 ms`, p90 `0.568 ms`,
+    - total `prepare_attn()` mean `0.559 ms`, p50 `0.547 ms`, p90 `0.568 ms`,
     p99 `0.881 ms`, max `1.221 ms`.
 - Previous likely decode without bypass:
-  - `super().prepare_attn()` mean `0.894 ms`, p50 `0.807 ms`, p90 `0.842 ms`,
+    - `super().prepare_attn()` mean `0.894 ms`, p50 `0.807 ms`, p90 `0.842 ms`,
     p99 `0.987 ms`, max `28.869 ms`.
-  - total `prepare_attn()` mean `1.163 ms`, p50 `1.073 ms`, p90 `1.116 ms`,
+    - total `prepare_attn()` mean `1.163 ms`, p50 `1.073 ms`, p90 `1.116 ms`,
     p99 `1.302 ms`, max `29.152 ms`.
 
 Interpretation:
@@ -5518,36 +5518,36 @@ Interpretation:
 No-profiling C32 benchmark:
 
 - Server:
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - `GPU_MEMORY_UTILIZATION=0.9`
-  - no metadata/compressor profiling
-  - no `--enforce-eager`
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - `GPU_MEMORY_UTILIZATION=0.9`
+    - no metadata/compressor profiling
+    - no `--enforce-eager`
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
 - Client:
-  - `RESULT_DIR=./bench-metadata-bypass-c32`
-  - `RESULT_PREFIX=metadata-bypass-c32`
-  - `CONCURRENCIES=32`
-  - `INPUT_LEN=1024`
-  - `OUTPUT_LEN=1024`
-  - `bash benchmarkvllm.sh`
+    - `RESULT_DIR=./bench-metadata-bypass-c32`
+    - `RESULT_PREFIX=metadata-bypass-c32`
+    - `CONCURRENCIES=32`
+    - `INPUT_LEN=1024`
+    - `OUTPUT_LEN=1024`
+    - `bash benchmarkvllm.sh`
 - Result:
-  - Successful requests: `320`.
-  - Failed requests: `0`.
-  - Output throughput: `865.20 tok/s`.
-  - Total throughput: `1733.78 tok/s`.
-  - Mean TPOT: `35.98 ms`.
-  - Mean TTFT: `1056.72 ms`.
-  - Result JSON:
+    - Successful requests: `320`.
+    - Failed requests: `0`.
+    - Output throughput: `865.20 tok/s`.
+    - Total throughput: `1733.78 tok/s`.
+    - Mean TPOT: `35.98 ms`.
+    - Mean TTFT: `1056.72 ms`.
+    - Result JSON:
     `bench-metadata-bypass-c32/metadata-bypass-c32-C32.json`.
 - Comparison:
-  - Previous clean current-branch C32 validation:
+    - Previous clean current-branch C32 validation:
     `862.84 tok/s`, total `1729.05 tok/s`, mean TPOT `36.18 ms`.
-  - Previous best nearby metadata run:
+    - Previous best nearby metadata run:
     `865.11 tok/s`, total `1733.60 tok/s`, mean TPOT `36.07 ms`.
-  - The bypass is runtime-safe in this benchmark and slightly improves or
+    - The bypass is runtime-safe in this benchmark and slightly improves or
     matches current clean throughput, but the gain is small at full C32 because
     GPU decode work dominates. The profiler still shows the CPU/metadata path
     is meaningfully reduced.
@@ -5555,144 +5555,144 @@ No-profiling C32 benchmark:
 Accuracy validation:
 
 - Server:
-  - `MAX_NUM_SEQS=256`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - `GPU_MEMORY_UTILIZATION=0.9`
-  - `BLOCK_SIZE=128`
-  - no metadata/compressor profiling
-  - no `--enforce-eager`
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+    - `MAX_NUM_SEQS=256`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - `GPU_MEMORY_UTILIZATION=0.9`
+    - `BLOCK_SIZE=128`
+    - no metadata/compressor profiling
+    - no `--enforce-eager`
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
 - Client:
-  - unchanged `bash lmeval.sh`
+    - unchanged `bash lmeval.sh`
 - Result:
-  - GSM8K flexible exact match: `0.9507 +/- 0.0060`.
-  - GSM8K strict exact match: `0.9515 +/- 0.0059`.
+    - GSM8K flexible exact match: `0.9507 +/- 0.0060`.
+    - GSM8K strict exact match: `0.9515 +/- 0.0059`.
 - Conclusion:
-  - The pure-decode metadata bypass remains inside the required GSM8K
+    - The pure-decode metadata bypass remains inside the required GSM8K
     `0.95 +/- 0.01` accuracy band.
 
 Follow-up: main compressor metadata bypass:
 
 - Date: 2026-06-19.
 - Change:
-  - Added `VLLM_ROCM_DSV4_ATOM_SKIP_COMPRESSOR_METADATA`, default enabled.
-  - This only applies to pure one-token decode when:
-    - ROCm platform.
-    - ATOM attention is enabled.
-    - ATOM unified KV is enabled.
-    - ATOM main compressor is enabled.
-    - native-after-main-compressor fallback is disabled.
-    - no ATOM layer/ratio filtering or probe/fallback flags are active.
-  - It removes only main compressor `CompressorBackend` groups from the
+    - Added `VLLM_ROCM_DSV4_ATOM_SKIP_COMPRESSOR_METADATA`, default enabled.
+    - This only applies to pure one-token decode when:
+        - ROCm platform.
+        - ATOM attention is enabled.
+        - ATOM unified KV is enabled.
+        - ATOM main compressor is enabled.
+        - native-after-main-compressor fallback is disabled.
+        - no ATOM layer/ratio filtering or probe/fallback flags are active.
+    - It removes only main compressor `CompressorBackend` groups from the
     generic metadata build. The discriminator is `kv_cache_spec.head_size >
     512`:
-    - main CSA state-cache: `2048`
-    - main HCA state-cache: `1024`
-    - indexer-inner compressor state-cache: `512`, not skipped
-  - Minimal `DeepseekV4RocmAtomCompressorDecodeMetadata` objects are attached
+        - main CSA state-cache: `2048`
+        - main HCA state-cache: `1024`
+        - indexer-inner compressor state-cache: `512`, not skipped
+    - Minimal `DeepseekV4RocmAtomCompressorDecodeMetadata` objects are attached
     for the skipped main compressor state-cache layer names, then annotated
     with `deepseek_v4_rocm_atom_state` like the other minimal metadata objects.
 
 - Reasoning:
-  - The ATOM main compressor path uses the compressor metadata object only as
+    - The ATOM main compressor path uses the compressor metadata object only as
     a carrier for `deepseek_v4_rocm_atom_state`.
-  - Generic `CompressorMetadata` fields are still required by the native
+    - Generic `CompressorMetadata` fields are still required by the native
     compressor fallback and by the indexer-inner compressor cache writer.
-  - This removes one more vLLM conversion/metadata-prep layer in front of the
+    - This removes one more vLLM conversion/metadata-prep layer in front of the
     ATOM decode path without changing the CUDA path.
 
 - Validation status:
-  - Syntax check passed with:
+    - Syntax check passed with:
     `python3 -m py_compile vllm/models/deepseek_v4/amd/model_state.py`.
-  - Short metadata-profile smoke:
-    - Server:
-      - `MAX_NUM_SEQS=32`
-      - `MAX_NUM_BATCHED_TOKENS=8192`
-      - `MAX_MODEL_LEN=8192`
-      - `GPU_MEMORY_UTILIZATION=0.9`
-      - metadata profiling enabled with start-after `20`, every `1`
-      - no `--enforce-eager`
-      - `VLLM_USE_V2_MODEL_RUNNER=1`
-      - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-    - Client:
-      - `RESULT_DIR=./bench-compressor-metadata-bypass-short`
-      - `RESULT_PREFIX=compressor-metadata-bypass-short`
-      - `CONCURRENCIES=4`
-      - `INPUT_LEN=128`
-      - `OUTPUT_LEN=32`
-      - `bash benchmarkvllm.sh`
-    - Result:
-      - Successful requests: `40`.
-      - Failed requests: `0`.
-      - Output throughput: `109.91 tok/s`.
-      - Total throughput: `563.28 tok/s`.
-      - Mean TPOT: `28.84 ms`.
-      - Result JSON:
+    - Short metadata-profile smoke:
+        - Server:
+            - `MAX_NUM_SEQS=32`
+            - `MAX_NUM_BATCHED_TOKENS=8192`
+            - `MAX_MODEL_LEN=8192`
+            - `GPU_MEMORY_UTILIZATION=0.9`
+            - metadata profiling enabled with start-after `20`, every `1`
+            - no `--enforce-eager`
+            - `VLLM_USE_V2_MODEL_RUNNER=1`
+            - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+        - Client:
+            - `RESULT_DIR=./bench-compressor-metadata-bypass-short`
+            - `RESULT_PREFIX=compressor-metadata-bypass-short`
+            - `CONCURRENCIES=4`
+            - `INPUT_LEN=128`
+            - `OUTPUT_LEN=32`
+            - `bash benchmarkvllm.sh`
+        - Result:
+            - Successful requests: `40`.
+            - Failed requests: `0`.
+            - Output throughput: `109.91 tok/s`.
+            - Total throughput: `563.28 tok/s`.
+            - Mean TPOT: `28.84 ms`.
+            - Result JSON:
         `bench-compressor-metadata-bypass-short/compressor-metadata-bypass-short-C4.json`.
-    - Parsed metadata rows:
-      - `skip_decode=True, skip_compressor=True`: `2784`.
-      - `skip_decode=True, skip_compressor=False`: `0`.
-      - `skip_decode=False`: `160`.
-    - Pure decode timing:
-      - `super().prepare_attn()` mean `0.199 ms`, min `0.183 ms`,
+        - Parsed metadata rows:
+            - `skip_decode=True, skip_compressor=True`: `2784`.
+            - `skip_decode=True, skip_compressor=False`: `0`.
+            - `skip_decode=False`: `160`.
+        - Pure decode timing:
+            - `super().prepare_attn()` mean `0.199 ms`, min `0.183 ms`,
         max `0.550 ms`.
-      - total `prepare_attn()` mean `0.505 ms`, min `0.470 ms`,
+            - total `prepare_attn()` mean `0.505 ms`, min `0.470 ms`,
         max `1.180 ms`.
-      - plan build mean `0.120 ms`.
-      - ATOM state build mean `0.137 ms`.
-      - indexer attach mean `0.039 ms`.
-  - Full accuracy validation:
-    - Server:
-      - `MAX_NUM_SEQS=256`
-      - `MAX_NUM_BATCHED_TOKENS=8192`
-      - `MAX_MODEL_LEN=8192`
-      - `GPU_MEMORY_UTILIZATION=0.9`
-      - no metadata/compressor profiling
-      - no `--enforce-eager`
-      - `VLLM_USE_V2_MODEL_RUNNER=1`
-      - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-    - Client:
-      - unchanged `bash lmeval.sh`
-    - Result:
-      - GSM8K flexible exact match: `0.9522 +/- 0.0059`.
-      - GSM8K strict exact match: `0.9530 +/- 0.0058`.
-    - Conclusion:
-      - The main compressor metadata bypass remains inside the required GSM8K
+            - plan build mean `0.120 ms`.
+            - ATOM state build mean `0.137 ms`.
+            - indexer attach mean `0.039 ms`.
+    - Full accuracy validation:
+        - Server:
+            - `MAX_NUM_SEQS=256`
+            - `MAX_NUM_BATCHED_TOKENS=8192`
+            - `MAX_MODEL_LEN=8192`
+            - `GPU_MEMORY_UTILIZATION=0.9`
+            - no metadata/compressor profiling
+            - no `--enforce-eager`
+            - `VLLM_USE_V2_MODEL_RUNNER=1`
+            - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+        - Client:
+            - unchanged `bash lmeval.sh`
+        - Result:
+            - GSM8K flexible exact match: `0.9522 +/- 0.0059`.
+            - GSM8K strict exact match: `0.9530 +/- 0.0058`.
+        - Conclusion:
+            - The main compressor metadata bypass remains inside the required GSM8K
         `0.95 +/- 0.01` accuracy band.
-  - No-profiling C32 benchmark after a fresh server restart:
-    - Server:
-      - `MAX_NUM_SEQS=32`
-      - `MAX_NUM_BATCHED_TOKENS=8192`
-      - `MAX_MODEL_LEN=8192`
-      - `GPU_MEMORY_UTILIZATION=0.9`
-      - no metadata/compressor profiling
-      - no `--enforce-eager`
-      - `VLLM_USE_V2_MODEL_RUNNER=1`
-      - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-    - Client:
-      - `RESULT_DIR=./bench-compressor-metadata-bypass-c32`
-      - `RESULT_PREFIX=compressor-metadata-bypass-c32`
-      - `CONCURRENCIES=32`
-      - `INPUT_LEN=1024`
-      - `OUTPUT_LEN=1024`
-      - `bash benchmarkvllm.sh`
-    - Result:
-      - Successful requests: `320`.
-      - Failed requests: `0`.
-      - Output throughput: `869.40 tok/s`.
-      - Total throughput: `1742.19 tok/s`.
-      - Mean TPOT: `36.00 ms`.
-      - Mean TTFT: `850.12 ms`.
-      - Result JSON:
+    - No-profiling C32 benchmark after a fresh server restart:
+        - Server:
+            - `MAX_NUM_SEQS=32`
+            - `MAX_NUM_BATCHED_TOKENS=8192`
+            - `MAX_MODEL_LEN=8192`
+            - `GPU_MEMORY_UTILIZATION=0.9`
+            - no metadata/compressor profiling
+            - no `--enforce-eager`
+            - `VLLM_USE_V2_MODEL_RUNNER=1`
+            - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+        - Client:
+            - `RESULT_DIR=./bench-compressor-metadata-bypass-c32`
+            - `RESULT_PREFIX=compressor-metadata-bypass-c32`
+            - `CONCURRENCIES=32`
+            - `INPUT_LEN=1024`
+            - `OUTPUT_LEN=1024`
+            - `bash benchmarkvllm.sh`
+        - Result:
+            - Successful requests: `320`.
+            - Failed requests: `0`.
+            - Output throughput: `869.40 tok/s`.
+            - Total throughput: `1742.19 tok/s`.
+            - Mean TPOT: `36.00 ms`.
+            - Mean TTFT: `850.12 ms`.
+            - Result JSON:
         `bench-compressor-metadata-bypass-c32/compressor-metadata-bypass-c32-C32.json`.
-    - Comparison:
-      - Sparse decode metadata bypass only:
+        - Comparison:
+            - Sparse decode metadata bypass only:
         `865.20 tok/s`, total `1733.78 tok/s`, mean TPOT `35.98 ms`.
-      - Current clean validation before these bypasses:
+            - Current clean validation before these bypasses:
         `862.84 tok/s`, total `1729.05 tok/s`, mean TPOT `36.18 ms`.
-      - The additional main-compressor metadata bypass produces a small
+            - The additional main-compressor metadata bypass produces a small
         end-to-end C32 throughput gain, but TPOT remains essentially flat. The
         profile improvement is real host-side work removal; it is not the main
         remaining gap to ATOM's documented C32 target.
@@ -5706,9 +5706,9 @@ Finding:
 - ATOM's DSV4 model binds `aiter.mhc_pre`, `aiter.mhc_post`, and, when
   available, `aiter.mhc_fused_post_pre`.
 - In this environment, `aiter==0.1.15.post1` exposes:
-  - `aiter.mhc_pre`: present.
-  - `aiter.mhc_post`: present.
-  - `aiter.mhc_fused_post_pre`: not present.
+    - `aiter.mhc_pre`: present.
+    - `aiter.mhc_post`: present.
+    - `aiter.mhc_fused_post_pre`: not present.
 - vLLM already had registered wrappers for the standalone aiter MHC kernels,
   but `vllm.model_executor.layers.mhc.HAS_AITER_MHC` was hardcoded to
   `False`. As a result, the AMD DSV4 layer selected the tilelang fused
@@ -5730,94 +5730,94 @@ Change:
 Validation:
 
 - Syntax:
-  - `python3 -m py_compile vllm/model_executor/layers/mhc.py
+    - `python3 -m py_compile vllm/model_executor/layers/mhc.py
     vllm/models/deepseek_v4/amd/model.py`
 - Import probe:
-  - default: `HAS_AITER_MHC=False`
-  - opt-in with `VLLM_ROCM_DSV4_USE_AITER_MHC=1`: `HAS_AITER_MHC=True`
-  - `HAS_TILELANG=True`
-  - `aiter.mhc_pre=True`
-  - `aiter.mhc_post=True`
-  - `aiter.mhc_fused_post_pre=False`
+    - default: `HAS_AITER_MHC=False`
+    - opt-in with `VLLM_ROCM_DSV4_USE_AITER_MHC=1`: `HAS_AITER_MHC=True`
+    - `HAS_TILELANG=True`
+    - `aiter.mhc_pre=True`
+    - `aiter.mhc_post=True`
+    - `aiter.mhc_fused_post_pre=False`
 - Direct DSV4-shaped kernel sanity check, `M=4`, `hc=4`, `hidden=7168`:
-  - `mhc_pre_aiter` versus torch reference:
-    - post max abs `7.22e-05`, mean abs `2.54e-05`
-    - comb max abs `4.54e-05`, mean abs `1.05e-05`
-    - layer input max abs `0.015625`, mean abs `7.07e-05`
-  - `mhc_post_aiter` versus torch reference:
-    - output max abs `0.015625`, mean abs `1.83e-05`
-  - A smaller hidden-size probe with `hidden=1024` aborted inside aiter with
+    - `mhc_pre_aiter` versus torch reference:
+        - post max abs `7.22e-05`, mean abs `2.54e-05`
+        - comb max abs `4.54e-05`, mean abs `1.05e-05`
+        - layer input max abs `0.015625`, mean abs `7.07e-05`
+    - `mhc_post_aiter` versus torch reference:
+        - output max abs `0.015625`, mean abs `1.83e-05`
+    - A smaller hidden-size probe with `hidden=1024` aborted inside aiter with
     `hidden_size must be >= residual_block * 2 stages prefetch`; that shape is
     not representative of DSV4.
 - Serving smoke:
-  - Server:
-    - `MAX_NUM_SEQS=4`
-    - `MAX_NUM_BATCHED_TOKENS=1024`
-    - `MAX_MODEL_LEN=2048`
-    - `GPU_MEMORY_UTILIZATION=0.6`
-    - no `--enforce-eager`
-    - `VLLM_USE_V2_MODEL_RUNNER=1`
-    - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-  - Graph capture completed.
-  - A short `/v1/completions` request completed successfully.
+    - Server:
+        - `MAX_NUM_SEQS=4`
+        - `MAX_NUM_BATCHED_TOKENS=1024`
+        - `MAX_MODEL_LEN=2048`
+        - `GPU_MEMORY_UTILIZATION=0.6`
+        - no `--enforce-eager`
+        - `VLLM_USE_V2_MODEL_RUNNER=1`
+        - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+    - Graph capture completed.
+    - A short `/v1/completions` request completed successfully.
 - Full GSM8K with standalone aiter MHC enabled:
-  - Server:
-    - `MAX_NUM_SEQS=256`
-    - `MAX_NUM_BATCHED_TOKENS=8192`
-    - `MAX_MODEL_LEN=8192`
-    - `GPU_MEMORY_UTILIZATION=0.9`
-    - no `--enforce-eager`
-    - `VLLM_USE_V2_MODEL_RUNNER=1`
-    - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-    - `VLLM_ROCM_DSV4_USE_AITER_MHC=1`
-  - Client:
-    - unchanged `bash lmeval.sh`
-  - Result:
-    - flexible exact match: `0.1296 +/- 0.0093`
-    - strict exact match: `0.1168 +/- 0.0088`
-  - Conclusion:
-    - Standalone aiter `mhc_pre`/`mhc_post` are not accuracy-safe in the
+    - Server:
+        - `MAX_NUM_SEQS=256`
+        - `MAX_NUM_BATCHED_TOKENS=8192`
+        - `MAX_MODEL_LEN=8192`
+        - `GPU_MEMORY_UTILIZATION=0.9`
+        - no `--enforce-eager`
+        - `VLLM_USE_V2_MODEL_RUNNER=1`
+        - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+        - `VLLM_ROCM_DSV4_USE_AITER_MHC=1`
+    - Client:
+        - unchanged `bash lmeval.sh`
+    - Result:
+        - flexible exact match: `0.1296 +/- 0.0093`
+        - strict exact match: `0.1168 +/- 0.0088`
+    - Conclusion:
+        - Standalone aiter `mhc_pre`/`mhc_post` are not accuracy-safe in the
       current vLLM AMD DSV4 MHC invocation path.
 - Full GSM8K after restoring the default-gated MHC path:
-  - Server:
-    - `MAX_NUM_SEQS=256`
-    - `MAX_NUM_BATCHED_TOKENS=8192`
-    - `MAX_MODEL_LEN=8192`
-    - `GPU_MEMORY_UTILIZATION=0.9`
-    - no `--enforce-eager`
-    - `VLLM_USE_V2_MODEL_RUNNER=1`
-    - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-    - default `VLLM_ROCM_DSV4_USE_AITER_MHC=0`
-  - Client:
-    - unchanged `bash lmeval.sh`
-  - Result:
-    - flexible exact match: `0.9530 +/- 0.0058`
-    - strict exact match: `0.9538 +/- 0.0058`
+    - Server:
+        - `MAX_NUM_SEQS=256`
+        - `MAX_NUM_BATCHED_TOKENS=8192`
+        - `MAX_MODEL_LEN=8192`
+        - `GPU_MEMORY_UTILIZATION=0.9`
+        - no `--enforce-eager`
+        - `VLLM_USE_V2_MODEL_RUNNER=1`
+        - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+        - default `VLLM_ROCM_DSV4_USE_AITER_MHC=0`
+    - Client:
+        - unchanged `bash lmeval.sh`
+    - Result:
+        - flexible exact match: `0.9530 +/- 0.0058`
+        - strict exact match: `0.9538 +/- 0.0058`
 - C32 deployment benchmark after restoring the default-gated MHC path:
-  - Server:
-    - `MAX_NUM_SEQS=32`
-    - `MAX_NUM_BATCHED_TOKENS=8192`
-    - `MAX_MODEL_LEN=8192`
-    - `GPU_MEMORY_UTILIZATION=0.9`
-    - no `--enforce-eager`
-    - `VLLM_USE_V2_MODEL_RUNNER=1`
-    - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-    - default `VLLM_ROCM_DSV4_USE_AITER_MHC=0`
-  - Client:
-    - `RESULT_DIR=./bench-mhc-default-c32`
-    - `RESULT_PREFIX=mhc-default-c32`
-    - `CONCURRENCIES=32`
-    - `INPUT_LEN=1024`
-    - `OUTPUT_LEN=1024`
-    - `bash benchmarkvllm.sh`
-  - Result:
-    - Successful requests: `320`.
-    - Failed requests: `0`.
-    - Output throughput: `869.70 tok/s`.
-    - Total throughput: `1742.79 tok/s`.
-    - Mean TPOT: `35.87 ms`.
-    - Mean TTFT: `978.97 ms`.
-    - Result JSON:
+    - Server:
+        - `MAX_NUM_SEQS=32`
+        - `MAX_NUM_BATCHED_TOKENS=8192`
+        - `MAX_MODEL_LEN=8192`
+        - `GPU_MEMORY_UTILIZATION=0.9`
+        - no `--enforce-eager`
+        - `VLLM_USE_V2_MODEL_RUNNER=1`
+        - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+        - default `VLLM_ROCM_DSV4_USE_AITER_MHC=0`
+    - Client:
+        - `RESULT_DIR=./bench-mhc-default-c32`
+        - `RESULT_PREFIX=mhc-default-c32`
+        - `CONCURRENCIES=32`
+        - `INPUT_LEN=1024`
+        - `OUTPUT_LEN=1024`
+        - `bash benchmarkvllm.sh`
+    - Result:
+        - Successful requests: `320`.
+        - Failed requests: `0`.
+        - Output throughput: `869.70 tok/s`.
+        - Total throughput: `1742.79 tok/s`.
+        - Mean TPOT: `35.87 ms`.
+        - Mean TTFT: `978.97 ms`.
+        - Result JSON:
       `bench-mhc-default-c32/mhc-default-c32-C32.json`.
 
 Status:
@@ -5841,119 +5841,119 @@ Question:
 Current instrumentation:
 
 - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
-  - Logs model-state preparation cost in `DeepseekV4RocmAtomModelState`.
-  - Splits the per-forward time into generic vLLM attention metadata
+    - Logs model-state preparation cost in `DeepseekV4RocmAtomModelState`.
+    - Splits the per-forward time into generic vLLM attention metadata
     construction, unified-KV allocation/binding, compress-plan construction,
     ATOM request-state metadata, minimal metadata attachment, and annotation.
-  - The detailed state-metadata log splits request mapping, position/committed
+    - The detailed state-metadata log splits request mapping, position/committed
     count preparation, padding, dataclass copies, and decode-indptr preparation.
 - `VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE=1`
-  - Logs selected-layer ATOM decode timing.
-  - Splits decode into index construction, CSA/HCA translation/packing, kernel
+    - Logs selected-layer ATOM decode timing.
+    - Splits decode into index construction, CSA/HCA translation/packing, kernel
     execution, and total time.
-  - The log now also includes per-forward index-cache counters:
+    - The log now also includes per-forward index-cache counters:
     `idx_hits`, `idx_writes`, `hca_hits`, and `hca_writes`.
 - `VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL=1`
-  - Logs selected-layer ATOM prefill timing.
-  - Splits prefill into indptr build, index construction, CSA packing,
+    - Logs selected-layer ATOM prefill timing.
+    - Splits prefill into indptr build, index construction, CSA packing,
     `kv_full.contiguous()`, attention kernel, output copy, SWA write, and total
     time.
-  - The log now also includes per-forward prefill reuse counters:
+    - The log now also includes per-forward prefill reuse counters:
     `indptr_hits`, `indptr_writes`, `idx_hits`, `idx_writes`, `hca_hits`, and
     `hca_writes`.
 
 Smoke validation:
 
 - Server:
-  - `MAX_NUM_SEQS=4`
-  - `MAX_NUM_BATCHED_TOKENS=1024`
-  - `MAX_MODEL_LEN=2048`
-  - `GPU_MEMORY_UTILIZATION=0.6`
-  - no `--enforce-eager`
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-  - profiling flags enabled for metadata, decode, and prefill.
+    - `MAX_NUM_SEQS=4`
+    - `MAX_NUM_BATCHED_TOKENS=1024`
+    - `MAX_MODEL_LEN=2048`
+    - `GPU_MEMORY_UTILIZATION=0.6`
+    - no `--enforce-eager`
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+    - profiling flags enabled for metadata, decode, and prefill.
 - Request:
-  - `/v1/completions`
-  - prompt: `Q: What is 2+2?\nA:`
-  - `max_tokens=8`
-  - `temperature=0`
+    - `/v1/completions`
+    - prompt: `Q: What is 2+2?\nA:`
+    - `max_tokens=8`
+    - `temperature=0`
 - Result:
-  - Request completed successfully.
-  - Example metadata profile after startup for one request:
+    - Request completed successfully.
+    - Example metadata profile after startup for one request:
     `super=5.468ms`, `plans=0.182ms`, `state=0.196ms`,
     `total=5.868ms`.
-  - Example prefill profile:
+    - Example prefill profile:
     `build_ms=0.192`, `index_ms=0.117`, `kv_contig_ms=0.009`,
     `kernel_ms=0.122`, `swa_write_ms=1.152`, `total_ms=1.620`,
     `indptr_writes=1`, `idx_writes=1`, `hca_writes=1`.
-  - Later decode-only metadata steps for the same request were about
+    - Later decode-only metadata steps for the same request were about
     `0.49-0.84ms` total in this small smoke.
-  - The smoke also showed runtime JIT warnings for shapes not covered by the
+    - The smoke also showed runtime JIT warnings for shapes not covered by the
     small warmup; ignore those timings for final performance conclusions.
 
 C32 short deployment probe:
 
 - Server:
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - `GPU_MEMORY_UTILIZATION=0.9`
-  - no `--enforce-eager`
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-  - profiling flags:
-    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
-    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_START_AFTER=64`
-    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_EVERY=128`
-    - `VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE=1`
-    - `VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL=1`
-    - `VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER=0`
-    - `VLLM_ROCM_DSV4_ATOM_PROFILE_EVERY=512`
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - `GPU_MEMORY_UTILIZATION=0.9`
+    - no `--enforce-eager`
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+    - profiling flags:
+        - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
+        - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_START_AFTER=64`
+        - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_EVERY=128`
+        - `VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE=1`
+        - `VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL=1`
+        - `VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER=0`
+        - `VLLM_ROCM_DSV4_ATOM_PROFILE_EVERY=512`
 - Client:
-  - direct `vllm bench serve`
-  - `--input-len 1024`
-  - `--output-len 1024`
-  - `--num-prompts 64`
-  - `--max-concurrency 32`
-  - `--num-warmups 32`
+    - direct `vllm bench serve`
+    - `--input-len 1024`
+    - `--output-len 1024`
+    - `--num-prompts 64`
+    - `--max-concurrency 32`
+    - `--num-warmups 32`
 - Result:
-  - Successful requests: `64`.
-  - Failed requests: `0`.
-  - Output throughput: `865.53 tok/s`.
-  - Total throughput: `1734.44 tok/s`.
-  - Mean TPOT: `35.75 ms`.
-  - Result JSON:
+    - Successful requests: `64`.
+    - Failed requests: `0`.
+    - Output throughput: `865.53 tok/s`.
+    - Total throughput: `1734.44 tok/s`.
+    - Mean TPOT: `35.75 ms`.
+    - Result JSON:
     `bench-profile-c32-short/profile-c32-short-C32.json`.
 - Parsed profile log:
-  - Model-state metadata, sampled after startup:
-    - `super`: avg `0.193ms`, max `0.222ms`.
-    - `plans`: avg `0.118ms`, max `0.140ms`.
-    - ATOM state metadata: avg `0.177ms`, max `0.262ms`.
-    - total: avg `0.538ms`, max `0.654ms`.
-  - State metadata detail:
-    - request/batch mapping: avg `0.021ms`.
-    - position/committed-count prep: avg `0.035ms`.
-    - decode indptr prep: avg `0.039ms`.
-    - total: avg `0.110ms`.
-  - Backend metadata sampled in the same run:
-    - `mla:128`: avg `2.522ms`, max `5.422ms`.
-    - `mla:4`: avg `0.131ms`, max `0.159ms`.
-    - `swa`: avg `3.612ms`, max `17.569ms`.
-  - Layer-0 ATOM prefill samples:
-    - `build_ms`: avg `0.253ms`.
-    - `index_ms`: avg `1.213ms`.
-    - `kernel_ms`: avg `1.693ms`.
-    - `swa_write_ms`: avg `1.058ms`.
-    - total: avg `4.283ms`.
-    - `indptr_writes=1`, `idx_writes=1`, `hca_writes=1`, and no reuse hits
+    - Model-state metadata, sampled after startup:
+        - `super`: avg `0.193ms`, max `0.222ms`.
+        - `plans`: avg `0.118ms`, max `0.140ms`.
+        - ATOM state metadata: avg `0.177ms`, max `0.262ms`.
+        - total: avg `0.538ms`, max `0.654ms`.
+    - State metadata detail:
+        - request/batch mapping: avg `0.021ms`.
+        - position/committed-count prep: avg `0.035ms`.
+        - decode indptr prep: avg `0.039ms`.
+        - total: avg `0.110ms`.
+    - Backend metadata sampled in the same run:
+        - `mla:128`: avg `2.522ms`, max `5.422ms`.
+        - `mla:4`: avg `0.131ms`, max `0.159ms`.
+        - `swa`: avg `3.612ms`, max `17.569ms`.
+    - Layer-0 ATOM prefill samples:
+        - `build_ms`: avg `0.253ms`.
+        - `index_ms`: avg `1.213ms`.
+        - `kernel_ms`: avg `1.693ms`.
+        - `swa_write_ms`: avg `1.058ms`.
+        - total: avg `4.283ms`.
+        - `indptr_writes=1`, `idx_writes=1`, `hca_writes=1`, and no reuse hits
       in the sampled records.
-  - Layer-0 ATOM decode split samples were emitted during graph capture, not
+    - Layer-0 ATOM decode split samples were emitted during graph capture, not
     during graph replay:
-    - `index_ms`: avg `1.276ms`.
-    - `kernel_ms`: avg `1.022ms`.
-    - total: avg `2.304ms`.
-    - This is still useful for shape-level cost comparison, but it should not
+        - `index_ms`: avg `1.276ms`.
+        - `kernel_ms`: avg `1.022ms`.
+        - total: avg `2.304ms`.
+        - This is still useful for shape-level cost comparison, but it should not
       be treated as a direct runtime decode measurement under CUDAGraph replay.
 
 Caveat:
@@ -5969,13 +5969,13 @@ Caveat:
 Recommended deployment probe:
 
 - Start the server with the same deployment configuration as C32 benchmark plus:
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_START_AFTER=16`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_EVERY=64`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER=0`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_EVERY=256`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_START_AFTER=16`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_EVERY=64`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER=0`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_EVERY=256`
 - Run a short C32 random benchmark first, then a full C32 run if the log volume
   is manageable.
 
@@ -6033,15 +6033,15 @@ Immediate validation needed after the indexer-inner compressor patch:
 - To test the gated indexer-inner path, set
   `VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=1`.
 - If the gated path fails, isolate with:
-  - `VLLM_ROCM_DSV4_ATOM_SKIP_FUSED_COMPRESS=1`
-  - a temporary gate for `head_dim=128` only, if added
-  - compressor profile logs on one CSA layer to verify indexer cache writes.
+    - `VLLM_ROCM_DSV4_ATOM_SKIP_FUSED_COMPRESS=1`
+    - a temporary gate for `head_dim=128` only, if added
+    - compressor profile logs on one CSA layer to verify indexer cache writes.
 
 Local sanity completed for the indexer-inner compressor patch:
 
 - `python3 -m py_compile` passed for:
-  - `vllm/models/deepseek_v4/amd/v4_kernels/fused_compress.py`
-  - `vllm/models/deepseek_v4/compressor.py`
+    - `vllm/models/deepseek_v4/amd/v4_kernels/fused_compress.py`
+    - `vllm/models/deepseek_v4/compressor.py`
 - Synthetic ROCm launch passed for the new `head_dim=128`, `quant=True`,
   direct `kv_slot_mapping` scatter path.
 - Synthetic ROCm launch passed for the existing `head_dim=512`, `quant=False`,
@@ -6051,74 +6051,74 @@ Local sanity completed for the indexer-inner compressor patch:
 Runtime lmeval attempt with indexer-inner ATOM compressor enabled:
 
 - Server:
-  - `MAX_NUM_SEQS=256`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - `GPU_MEMORY_UTILIZATION=0.9`
-  - no `--enforce-eager`
-  - `VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=1` by code state before the gate
+    - `MAX_NUM_SEQS=256`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - `GPU_MEMORY_UTILIZATION=0.9`
+    - no `--enforce-eager`
+    - `VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=1` by code state before the gate
     was added.
 - Smoke request:
-  - `/v1/completions`
-  - prompt `Q: What is 2+2?\nA:`
-  - `max_tokens=8`, `temperature=0`
-  - succeeded and returned `4`.
+    - `/v1/completions`
+    - prompt `Q: What is 2+2?\nA:`
+    - `max_tokens=8`, `temperature=0`
+    - succeeded and returned `4`.
 - Full unchanged `lmeval.sh`:
-  - failed before producing GSM8K metrics.
-  - First lmeval batch returned HTTP 500s, then the server stopped accepting
+    - failed before producing GSM8K metrics.
+    - First lmeval batch returned HTTP 500s, then the server stopped accepting
     connections.
-  - Server log showed inference-time Triton JIT for several metadata/indexer
+    - Server log showed inference-time Triton JIT for several metadata/indexer
     kernels, then ROCm reported
     `HSA_STATUS_ERROR_OUT_OF_RESOURCES` with `Available Free mem : 0 MB`.
-  - Later stack traces surfaced as `hipErrorUnknown` in unrelated downstream
+    - Later stack traces surfaced as `hipErrorUnknown` in unrelated downstream
     calls, which is consistent with an earlier asynchronous ROCm failure.
 - Interpretation:
-  - The new indexer compressor is compile/runnable for small requests, but not
+    - The new indexer compressor is compile/runnable for small requests, but not
     default-valid for the high-concurrency accuracy run.
-  - Keep it gated until we either pre-warm the exact large-batch shapes, reduce
+    - Keep it gated until we either pre-warm the exact large-batch shapes, reduce
     memory pressure, or replace the Triton path with an aiter/flydsl indexer
     compressor path that does not trigger large inference-time JIT pressure.
 
 Constrained graph-mode retry after the block-table/indexer fastpath work:
 
 - Server:
-  - `MAX_NUM_SEQS=16`
-  - `MAX_NUM_BATCHED_TOKENS=4096`
-  - `MAX_MODEL_LEN=4096`
-  - `VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=1`
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - no `--enforce-eager`
-  - graph capture completed
-  - ATOM unified KV views were bound from vLLM-owned KV storage
+    - `MAX_NUM_SEQS=16`
+    - `MAX_NUM_BATCHED_TOKENS=4096`
+    - `MAX_MODEL_LEN=4096`
+    - `VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=1`
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - no `--enforce-eager`
+    - graph capture completed
+    - ATOM unified KV views were bound from vLLM-owned KV storage
 - Server log:
-  - `runlogs/indexer-compressor-smoke-server.log`
-  - no `ERROR`, `Traceback`, illegal-memory, `RuntimeError`, or `EngineDead`
+    - `runlogs/indexer-compressor-smoke-server.log`
+    - no `ERROR`, `Traceback`, illegal-memory, `RuntimeError`, or `EngineDead`
     marker was present before the controlled shutdown
 - C4 smoke:
-  - command shape: `CONCURRENCIES=4 INPUT_LEN=256 OUTPUT_LEN=64`
-  - result file: `bench-sparsemla/indexer-compressor-smoke-C4.json`
-  - successful requests: `40`
-  - failed requests: `0`
-  - output throughput: `125.18 tok/s`
-  - total token throughput: `633.70 tok/s`
-  - mean TTFT: `259.30 ms`
-  - mean TPOT: `28.32 ms`
+    - command shape: `CONCURRENCIES=4 INPUT_LEN=256 OUTPUT_LEN=64`
+    - result file: `bench-sparsemla/indexer-compressor-smoke-C4.json`
+    - successful requests: `40`
+    - failed requests: `0`
+    - output throughput: `125.18 tok/s`
+    - total token throughput: `633.70 tok/s`
+    - mean TTFT: `259.30 ms`
+    - mean TPOT: `28.32 ms`
 - C16 smoke:
-  - command shape: `CONCURRENCIES=16 INPUT_LEN=512 OUTPUT_LEN=256`
-  - result file: `bench-sparsemla/indexer-compressor-smoke512-C16.json`
-  - successful requests: `160`
-  - failed requests: `0`
-  - output throughput: `483.66 tok/s`
-  - total token throughput: `1458.52 tok/s`
-  - mean TTFT: `437.93 ms`
-  - mean TPOT: `31.48 ms`
+    - command shape: `CONCURRENCIES=16 INPUT_LEN=512 OUTPUT_LEN=256`
+    - result file: `bench-sparsemla/indexer-compressor-smoke512-C16.json`
+    - successful requests: `160`
+    - failed requests: `0`
+    - output throughput: `483.66 tok/s`
+    - total token throughput: `1458.52 tok/s`
+    - mean TTFT: `437.93 ms`
+    - mean TPOT: `31.48 ms`
 - Interpretation:
-  - The indexer-inner compressor is now stronger than a one-request smoke: it
+    - The indexer-inner compressor is now stronger than a one-request smoke: it
     can run graph mode at reduced deployment shape and survive multi-request
     decode/prefill smoke workloads.
-  - This still does not promote it to default. It has not passed the unchanged
+    - This still does not promote it to default. It has not passed the unchanged
     `lmeval.sh` gate or the full C32 1024/1024 benchmark shape.
-  - The smoke logs prove the path is runnable under the flag, but they do not
+    - The smoke logs prove the path is runnable under the flag, but they do not
     by themselves prove which `fused_compress_attn` dispatcher was selected.
     Use `VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR=1` or a ROCm profile before
     making performance claims about the flydsl/aiter indexer-compressor path.
@@ -6126,74 +6126,74 @@ Constrained graph-mode retry after the block-table/indexer fastpath work:
 Follow-up indexer-inner compressor block-table path:
 
 - Change:
-  - `DeepseekV4RocmAtomIndexerKCacheMetadata` now carries:
-    - compressed `slot_mapping`
-    - compressed `block_table`
-    - compressed `block_size`
-  - The indexer-inner compressor prefers `block_table + block_size` when the
+    - `DeepseekV4RocmAtomIndexerKCacheMetadata` now carries:
+        - compressed `slot_mapping`
+        - compressed `block_table`
+        - compressed `block_size`
+    - The indexer-inner compressor prefers `block_table + block_size` when the
     metadata block size matches the actual FP8 indexer cache storage block.
-  - This avoids the direct-slot scatter path for pure decode, making
+    - This avoids the direct-slot scatter path for pure decode, making
     `fused_compress_attn(..., quant=True)` eligible for the aiter/flydsl fused
     compressor wrapper, whose public API only accepts block-table scatter.
-  - If metadata is missing, non-contiguous, or mismatched, the code falls back
+    - If metadata is missing, non-contiguous, or mismatched, the code falls back
     to the existing direct `kv_slot_mapping` scatter path.
 - Validation:
-  - `python3 -m py_compile` passed for:
-    - `vllm/models/deepseek_v4/amd/model_state.py`
-    - `vllm/models/deepseek_v4/compressor.py`
-    - `vllm/models/deepseek_v4/amd/v4_kernels/fused_compress.py`
-  - Small smoke server:
-    - `MAX_NUM_SEQS=4`
-    - `MAX_NUM_BATCHED_TOKENS=1024`
-    - `MAX_MODEL_LEN=2048`
-    - `GPU_MEMORY_UTILIZATION=0.85`
-    - `VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=1`
-    - `ATOM_FUSED_COMPRESS_USE_FLYDSL=auto`
-    - no `--enforce-eager`
-  - Smoke request:
-    - `/v1/completions`
-    - prompt `Q: What is 2+2?\nA:`
-    - `max_tokens=16`, `temperature=0`
-    - returned HTTP 200 and text beginning with `4`.
-  - First request still showed inference-time JIT for metadata/indexer reader
+    - `python3 -m py_compile` passed for:
+        - `vllm/models/deepseek_v4/amd/model_state.py`
+        - `vllm/models/deepseek_v4/compressor.py`
+        - `vllm/models/deepseek_v4/amd/v4_kernels/fused_compress.py`
+    - Small smoke server:
+        - `MAX_NUM_SEQS=4`
+        - `MAX_NUM_BATCHED_TOKENS=1024`
+        - `MAX_MODEL_LEN=2048`
+        - `GPU_MEMORY_UTILIZATION=0.85`
+        - `VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=1`
+        - `ATOM_FUSED_COMPRESS_USE_FLYDSL=auto`
+        - no `--enforce-eager`
+    - Smoke request:
+        - `/v1/completions`
+        - prompt `Q: What is 2+2?\nA:`
+        - `max_tokens=16`, `temperature=0`
+        - returned HTTP 200 and text beginning with `4`.
+    - First request still showed inference-time JIT for metadata/indexer reader
     kernels such as `_cp_gather_indexer_quant_cache_kernel` and
     `_gluon_fp8_mqa_logits_kernel`; no `_fused_compress_attn_kernel` JIT warning
     appeared in the request log.
 - Interpretation:
-  - This is a useful step toward ATOM's block-table compressor contract for the
+    - This is a useful step toward ATOM's block-table compressor contract for the
     pure-decode indexer path.
-  - It does not yet prove full GSM8K accuracy or high-concurrency stability with
+    - It does not yet prove full GSM8K accuracy or high-concurrency stability with
     `VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=1`; that remains gated off until a
     full lmeval run passes.
 
 Default-gated validation after adding `VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR`:
 
 - Launch default:
-  - `VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=0`
-  - `MAX_NUM_SEQS=256`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - `GPU_MEMORY_UTILIZATION=0.9`
-  - no `--enforce-eager`
+    - `VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=0`
+    - `MAX_NUM_SEQS=256`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - `GPU_MEMORY_UTILIZATION=0.9`
+    - no `--enforce-eager`
 - Unchanged `lmeval.sh` passed GSM8K:
-  - flexible exact match: `0.9507 +/- 0.0060`
-  - strict exact match: `0.9515 +/- 0.0059`
+    - flexible exact match: `0.9507 +/- 0.0060`
+    - strict exact match: `0.9515 +/- 0.0059`
 - Fresh C32 benchmark server:
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - `GPU_MEMORY_UTILIZATION=0.9`
-  - no `--enforce-eager`
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - `GPU_MEMORY_UTILIZATION=0.9`
+    - no `--enforce-eager`
 - `benchmarkvllm.sh` result:
-  - JSON:
+    - JSON:
     `/app/atomdsv4/bench-indexer-gate-default-c32/indexer-gate-default-c32-C32.json`
-  - successful requests: `320`
-  - failed requests: `0`
-  - benchmark duration: `376.48 s`
-  - output throughput: `870.39 tok/s`
-  - total throughput: `1744.18 tok/s`
-  - mean TPOT: `35.80 ms`
-  - mean TTFT: `1013.67 ms`
+    - successful requests: `320`
+    - failed requests: `0`
+    - benchmark duration: `376.48 s`
+    - output throughput: `870.39 tok/s`
+    - total throughput: `1744.18 tok/s`
+    - mean TPOT: `35.80 ms`
+    - mean TTFT: `1013.67 ms`
 
 Conversion and metadata-preparation interpretation:
 
@@ -6203,11 +6203,11 @@ Conversion and metadata-preparation interpretation:
   longer. Instead, they add time before or after the kernel, may add extra
   temporary buffers/copies, and may reduce overlap or graph replay efficiency.
 - In this tree, the likely costs are:
-  - vLLM ragged/block metadata to ATOM-style compact index conversion.
-  - CSA/HCA translate/pack work before ATOM attention.
-  - generic sparse MLA/SWA/indexer metadata construction still required by some
+    - vLLM ragged/block metadata to ATOM-style compact index conversion.
+    - CSA/HCA translate/pack work before ATOM attention.
+    - generic sparse MLA/SWA/indexer metadata construction still required by some
     fallback paths.
-  - first-inference JIT for conversion/index kernels if a benchmark shape was
+    - first-inference JIT for conversion/index kernels if a benchmark shape was
     not warmed.
 - The measured metadata-only probes so far show host metadata is real but not
   large enough by itself to explain the full C32 gap to ATOM's published
@@ -6249,9 +6249,9 @@ Paged decode wrapper parity:
 
 - The local `sparse_attn_v4_paged_decode(...)` is vendored from ATOM but has
   vLLM-specific additions:
-  - bounds-safe slot address formation;
-  - optional split SWA/compressed KV wrapper;
-  - workspace-manager use for partial split-K buffers.
+    - bounds-safe slot address formation;
+    - optional split SWA/compressed KV wrapper;
+    - workspace-manager use for partial split-K buffers.
 - The ATOM-equivalent default is the generic unified-KV paged decode wrapper.
   The direct CSA/HCA decode experiments are no longer present. The split-KV
   path remains an experiment, not a required ATOM op.
@@ -6273,10 +6273,10 @@ Paged decode wrapper parity:
 Compressor wrapper parity:
 
 - `fused_compress.py` is vendored from ATOM but has vLLM-specific changes:
-  - local imports instead of `atom` package imports;
-  - optional direct slot-mapping scatter for the vLLM indexer-inner path;
-  - a guard to avoid aiter/flydsl HCA when vLLM flattens HCA blocks;
-  - looser RoPE cache stride validation needed by vLLM tensor views.
+    - local imports instead of `atom` package imports;
+    - optional direct slot-mapping scatter for the vLLM indexer-inner path;
+    - a guard to avoid aiter/flydsl HCA when vLLM flattens HCA blocks;
+    - looser RoPE cache stride validation needed by vLLM tensor views.
 - Main CSA/HCA compressor ordering now matches ATOM inside the enabled ATOM
   compressor path: fused compression reads previous request-ring state and
   writes compressed KV, then `update_compressor_states` writes current state.
@@ -6348,9 +6348,9 @@ Observed decode shape decisions:
 - `kv_splits_source=heuristic` for all rows.
 - `split_workspace=torch_empty` for all split rows.
 - Shape distribution:
-  - `T=16`: `kv_splits=32`
-  - `T=24`: `kv_splits=16`
-  - `T=32`: `kv_splits=16`
+    - `T=16`: `kv_splits=32`
+    - `T=24`: `kv_splits=16`
+    - `T=32`: `kv_splits=16`
 
 Trimmed per-layer decode timing (`kernel_ms < 10`, so first JIT/capture outliers
 are excluded):
@@ -6396,10 +6396,10 @@ Change:
   `VLLM_ROCM_DSV4_ATOM_SKIP_INDEXER_METADATA=1`.
 - The Python path already had the guard. It only skips generic
   `DEEPSEEK_V4_INDEXER` metadata when all of these are true:
-  - ROCm;
-  - ATOM indexer fastpath enabled;
-  - no FP4 indexer cache;
-  - pure decode, one scheduled token per request.
+    - ROCm;
+    - ATOM indexer fastpath enabled;
+    - no FP4 indexer cache;
+    - pure decode, one scheduled token per request.
 - Prefill/mixed/spec paths still build the generic indexer metadata and can
   fall back to the normal indexer path.
 
@@ -6445,9 +6445,9 @@ Full validation:
   `runlogs/skip-indexer-accuracy-server.log`,
   `runlogs/skip-indexer-lmeval.log`.
 - Result:
-  - GSM8K flexible exact match: `0.9530 ± 0.0058`
-  - GSM8K strict exact match: `0.9538 ± 0.0058`
-  - This is within the required `0.95 ± 0.01` band.
+    - GSM8K flexible exact match: `0.9530 ± 0.0058`
+    - GSM8K strict exact match: `0.9538 ± 0.0058`
+    - This is within the required `0.95 ± 0.01` band.
 
 Fresh C32 benchmark after restarting the server:
 
@@ -6461,12 +6461,12 @@ Fresh C32 benchmark after restarting the server:
   `runlogs/skip-indexer-benchmark-c32.log`,
   `bench-sparsemla/skip-indexer-current-default-C32.json`.
 - Result:
-  - completed requests: `320/320`
-  - output throughput: `884.5629 tok/s`
-  - total throughput: `1772.5811 tok/s`
-  - mean TPOT: `35.1764 ms`
-  - median TPOT: `35.1532 ms`
-  - mean TTFT: `1051.1898 ms`
+    - completed requests: `320/320`
+    - output throughput: `884.5629 tok/s`
+    - total throughput: `1772.5811 tok/s`
+    - mean TPOT: `35.1764 ms`
+    - median TPOT: `35.1532 ms`
+    - mean TTFT: `1051.1898 ms`
 
 Comparison:
 
@@ -6535,10 +6535,10 @@ Interpretation:
   `VLLM_ROCM_DSV4_USE_AITER_HC_HEAD` in the launch defaults.
 
 - A fresh import probe of the installed package in this environment showed:
-  - top-level `aiter.mhc_pre`: present.
-  - top-level `aiter.mhc_post`: present.
-  - top-level `aiter.mhc_fused_post_pre`: absent.
-  - `aiter.ops.triton.fusions.mhc.mhc_post_pre`: absent from the installed
+    - top-level `aiter.mhc_pre`: present.
+    - top-level `aiter.mhc_post`: present.
+    - top-level `aiter.mhc_fused_post_pre`: absent.
+    - `aiter.ops.triton.fusions.mhc.mhc_post_pre`: absent from the installed
     package.
 - Therefore vLLM cannot currently call a true installed AITER fused
   post/pre MHC op. The only available AITER MHC/HC experiments are standalone
@@ -6555,14 +6555,14 @@ Evidence from current vLLM code:
 
 - `vllm/v1/kv_cache_interface.py` defines
   `DeepseekV4AtomMLAAttentionSpec`, a ROCm DSV4 opt-in MLA spec that adds:
-  - `atom_swa_prefix_bytes`
-  - `atom_swa_pages`
-  - `atom_swa_dtype`
+    - `atom_swa_prefix_bytes`
+    - `atom_swa_pages`
+    - `atom_swa_dtype`
 - `vllm/v1/core/kv_cache_utils.py::_get_kv_cache_config_deepseek_v4`
   recognizes that spec and emits one `KVCacheTensor` per ATOM layer with:
-  - a fixed SWA prefix;
-  - the normal compressed tail sized by `spec.page_size_bytes * num_blocks`;
-  - `fixed_prefix_size=spec.atom_swa_prefix_bytes`.
+    - a fixed SWA prefix;
+    - the normal compressed tail sized by `spec.page_size_bytes * num_blocks`;
+    - `fixed_prefix_size=spec.atom_swa_prefix_bytes`.
 - `vllm/v1/worker/gpu/attn_utils.py` slices the fixed prefix off before
   constructing the backend `kv_cache` view, so the normal backend still sees
   the compressed tail while the raw storage contains `[SWA prefix | compressed
@@ -6616,12 +6616,12 @@ Next integration target:
 Change:
 
 - Removed the current runtime wiring for:
-  - `VLLM_ROCM_DSV4_ATOM_CSA_DIRECT_DECODE`
-  - `VLLM_ROCM_DSV4_ATOM_HCA_DIRECT_DECODE`
+    - `VLLM_ROCM_DSV4_ATOM_CSA_DIRECT_DECODE`
+    - `VLLM_ROCM_DSV4_ATOM_HCA_DIRECT_DECODE`
 - Removed the corresponding vLLM-only direct decode wrappers from the current
   exported kernel surface:
-  - `sparse_attn_v4_csa_topk_paged_decode`
-  - `sparse_attn_v4_hca_state_paged_decode`
+    - `sparse_attn_v4_csa_topk_paged_decode`
+    - `sparse_attn_v4_hca_state_paged_decode`
 - Removed the private Triton kernels backing those wrappers from
   `vllm/models/deepseek_v4/amd/v4_kernels/paged_decode.py`.
 
@@ -6656,14 +6656,14 @@ Question:
 Synthetic smoke:
 
 - Shape:
-  - `head_dim=128`
-  - `rope_head_dim=64`
-  - `ratio=4`
-  - `overlap=True`
-  - one request, four scheduled tokens, one compression boundary
-  - FP8 KV cache shape `[1, 64, 128]`
-  - FP32 scale cache shape `[1, 64]`
-  - block-table scatter path, not direct slot mapping
+    - `head_dim=128`
+    - `rope_head_dim=64`
+    - `ratio=4`
+    - `overlap=True`
+    - one request, four scheduled tokens, one compression boundary
+    - FP8 KV cache shape `[1, 64, 128]`
+    - FP32 scale cache shape `[1, 64]`
+    - block-table scatter path, not direct slot mapping
 - First run with BF16 `kv_state` / `score_state` reached the AITER flydsl
   wrapper and failed with:
   `TypeError: kv_state/score_state must be fp32`.
@@ -6671,9 +6671,9 @@ Synthetic smoke:
   `DeepseekV4RocmAtomModelState._allocate_atom_state_buffers` allocates
   `csa_idx_kv_state` and `csa_idx_score_state` with `state_dtype=torch.float32`.
 - Rerun with FP32 state tensors succeeded:
-  - output cache dtype: `torch.float8_e4m3fnuz`
-  - `cache_scale` finite
-  - example scale value: `0.0078125`
+    - output cache dtype: `torch.float8_e4m3fnuz`
+    - `cache_scale` finite
+    - example scale value: `0.0078125`
 
 Interpretation:
 
@@ -6697,26 +6697,26 @@ Follow-up server smoke:
 - The server completed model load and graph capture, bound ATOM unified KV views
   from vLLM-owned KV storage, and served a small random benchmark.
 - Benchmark:
-  - `num_prompts=16`
-  - `random_input_len=128`
-  - `random_output_len=16`
-  - `max_concurrency=4`
-  - completed `16/16`, failed `0`
-  - mean TPOT `34.74 ms`
-  - output throughput `79.44 tok/s`
+    - `num_prompts=16`
+    - `random_input_len=128`
+    - `random_output_len=16`
+    - `max_concurrency=4`
+    - completed `16/16`, failed `0`
+    - mean TPOT `34.74 ms`
+    - output throughput `79.44 tok/s`
 - The server log showed first-inference JIT for metadata/conversion/staging
   kernels including:
-  - `_build_prefill_chunk_metadata_kernel`
-  - `_compute_prefill_metadata_kernel`
-  - `_update_compressor_states_kernel`
-  - `_swa_write_kernel`
-  - `_cp_gather_indexer_quant_cache_kernel`
-  - `_gluon_fp8_mqa_logits_kernel`
-  - `_build_c128a_topk_metadata_kernel`
-  - `_pack_dense_prefix_to_ragged_kernel`
-  - `_compute_swa_indices_and_lens_kernel`
-  - `_v4_paged_prefill_indices_kernel`
-  - `_csa_translate_pack_kernel`
+    - `_build_prefill_chunk_metadata_kernel`
+    - `_compute_prefill_metadata_kernel`
+    - `_update_compressor_states_kernel`
+    - `_swa_write_kernel`
+    - `_cp_gather_indexer_quant_cache_kernel`
+    - `_gluon_fp8_mqa_logits_kernel`
+    - `_build_c128a_topk_metadata_kernel`
+    - `_pack_dense_prefix_to_ragged_kernel`
+    - `_compute_swa_indices_and_lens_kernel`
+    - `_v4_paged_prefill_indices_kernel`
+    - `_csa_translate_pack_kernel`
 
 Interpretation:
 
@@ -6727,11 +6727,11 @@ Interpretation:
 - The logs support the hypothesis that conversion and metadata preparation can
   dominate end-to-end step time even when the ATOM paged attention kernel is
   faster in isolation. Future profiling should break out:
-  - vLLM scheduler/block-table to ATOM request metadata construction
-  - host-to-device metadata copies
-  - `csa_translate_pack`
-  - paged prefill/decode index writes
-  - the final sparse paged attention kernel
+    - vLLM scheduler/block-table to ATOM request metadata construction
+    - host-to-device metadata copies
+    - `csa_translate_pack`
+    - paged prefill/decode index writes
+    - the final sparse paged attention kernel
 
 ## 2026-06-19 Metadata and Compressor Plan Profiling
 
@@ -6743,19 +6743,19 @@ Question:
 Profile run:
 
 - Server shape:
-  - model runner v2
-  - breakable CUDA graph
-  - no `--enforce-eager`
-  - `MAX_NUM_SEQS=16`
-  - `MAX_NUM_BATCHED_TOKENS=4096`
-  - `MAX_MODEL_LEN=4096`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE=1`
+    - model runner v2
+    - breakable CUDA graph
+    - no `--enforce-eager`
+    - `MAX_NUM_SEQS=16`
+    - `MAX_NUM_BATCHED_TOKENS=4096`
+    - `MAX_MODEL_LEN=4096`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE=1`
 - Client:
-  - `num_prompts=16`
-  - `random_input_len=128`
-  - `random_output_len=16`
-  - `max_concurrency=4`
+    - `num_prompts=16`
+    - `random_input_len=128`
+    - `random_output_len=16`
+    - `max_concurrency=4`
 
 Findings:
 
@@ -6765,19 +6765,19 @@ Findings:
   current hooks.
 - Mixed/prefill metadata is still heavy. Examples from
   `runlogs/profile-overhead-server.log`:
-  - `reqs=16 tokens=32`: total metadata around `42-50 ms` across ranks.
-  - `reqs=2 tokens=133`: total metadata ranged around `9-38 ms`.
-  - `reqs=4 tokens=266`: total metadata around `4.2-4.7 ms`.
+    - `reqs=16 tokens=32`: total metadata around `42-50 ms` across ranks.
+    - `reqs=2 tokens=133`: total metadata ranged around `9-38 ms`.
+    - `reqs=4 tokens=266`: total metadata around `4.2-4.7 ms`.
 - Pure decode uses the ROCm ATOM skip path for generic indexer/decode/main
   compressor metadata:
-  - `skip_indexer=True`
-  - `skip_decode=True`
-  - `skip_compressor=True`
-  - total metadata around `0.72-1.03 ms` for 4-16 live requests.
+    - `skip_indexer=True`
+    - `skip_decode=True`
+    - `skip_compressor=True`
+    - total metadata around `0.72-1.03 ms` for 4-16 live requests.
 - In pure decode, the remaining model-state cost is mostly:
-  - compressor plan construction/copy: around `0.17-0.20 ms`
-  - state metadata and decode indptr construction: around `0.12-0.28 ms`
-  - minimal indexer attachment: around `0.11-0.14 ms`
+    - compressor plan construction/copy: around `0.17-0.20 ms`
+    - state metadata and decode indptr construction: around `0.12-0.28 ms`
+    - minimal indexer attachment: around `0.11-0.14 ms`
 
 Interpretation:
 
@@ -6794,15 +6794,15 @@ Interpretation:
 Follow-up change:
 
 - Tightened pure-decode compressor plan capacity:
-  - Before: decode-like forwards used prefill-sized `compress_plan_gpu`
+    - Before: decode-like forwards used prefill-sized `compress_plan_gpu`
     capacity from `max_num_batched_tokens`.
-  - After: decode-like forwards use
+    - After: decode-like forwards use
     `max_num_reqs * ceil((1 + num_spec_tokens) / ratio)` for both compress and
     write plan views, while keeping the same persistent backing buffers.
-  - Prefill behavior remains unchanged.
+    - Prefill behavior remains unchanged.
 - Rationale:
-  - This reduces host sentinel fill/copy surface.
-  - More importantly, it reduces captured compressor-kernel plan capacity for
+    - This reduces host sentinel fill/copy surface.
+    - More importantly, it reduces captured compressor-kernel plan capacity for
     pure decode, so fused-compress kernels do not have to launch over a
     prefill-sized sentinel tail.
 
@@ -6811,20 +6811,20 @@ Validation:
 - Syntax:
   `python3 -m py_compile vllm/models/deepseek_v4/amd/v4_kernels/compress_plan.py vllm/models/deepseek_v4/amd/model_state.py`
 - Plan-builder invariant smoke:
-  - ratio 4 decode cap/write cap shape `[4, 4]`
-  - ratio 128 decode cap/write cap shape `[4, 4]`
-  - expected boundary counts passed
+    - ratio 4 decode cap/write cap shape `[4, 4]`
+    - ratio 128 decode cap/write cap shape `[4, 4]`
+    - expected boundary counts passed
 - Microbench with pinned host buffers and GPU copies:
-  - full `8192` capacity: mean `0.0820 ms`
-  - tight `256` capacity: mean `0.0769 ms`
-  - host-side staging improvement is small, so the more meaningful expected
+    - full `8192` capacity: mean `0.0820 ms`
+    - tight `256` capacity: mean `0.0769 ms`
+    - host-side staging improvement is small, so the more meaningful expected
     benefit is reduced captured kernel grid work.
 - Serving smoke after the change:
-  - graph mode, no `--enforce-eager`
-  - completed graph capture
-  - random serving benchmark completed `16/16`, failed `0`
-  - mean TPOT `31.28 ms`
-  - output throughput `89.22 tok/s`
+    - graph mode, no `--enforce-eager`
+    - completed graph capture
+    - random serving benchmark completed `16/16`, failed `0`
+    - mean TPOT `31.28 ms`
+    - output throughput `89.22 tok/s`
 
 Open caveat:
 
@@ -6838,74 +6838,74 @@ Open caveat:
 Accuracy gate:
 
 - Server:
-  - default `launchdeepseekgraph.sh`
-  - model runner v2
-  - breakable CUDA graph
-  - no `--enforce-eager`
-  - `MAX_NUM_SEQS=256`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - block size `128`
+    - default `launchdeepseekgraph.sh`
+    - model runner v2
+    - breakable CUDA graph
+    - no `--enforce-eager`
+    - `MAX_NUM_SEQS=256`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - block size `128`
 - Command:
-  - unchanged `/app/atomdsv4/lmeval.sh`
+    - unchanged `/app/atomdsv4/lmeval.sh`
 - Logs:
-  - `runlogs/decode-plan-tight-accuracy-server.log`
-  - `runlogs/decode-plan-tight-lmeval.log`
+    - `runlogs/decode-plan-tight-accuracy-server.log`
+    - `runlogs/decode-plan-tight-lmeval.log`
 - Result:
-  - GSM8K flexible exact match: `0.9545 +/- 0.0057`
-  - GSM8K strict exact match: `0.9553 +/- 0.0057`
-  - target `0.95 +/- 0.01` passed
+    - GSM8K flexible exact match: `0.9545 +/- 0.0057`
+    - GSM8K strict exact match: `0.9553 +/- 0.0057`
+    - target `0.95 +/- 0.01` passed
 
 Fresh C32 benchmark:
 
 - The accuracy server was stopped before benchmarking.
 - Server:
-  - `MAX_NUM_SEQS=32 bash launchdeepseekgraph.sh`
-  - model runner v2
-  - breakable CUDA graph
-  - no `--enforce-eager`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - block size `128`
-  - graph capture completed
-  - bound ATOM unified KV views from vLLM-owned KV storage
+    - `MAX_NUM_SEQS=32 bash launchdeepseekgraph.sh`
+    - model runner v2
+    - breakable CUDA graph
+    - no `--enforce-eager`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - block size `128`
+    - graph capture completed
+    - bound ATOM unified KV views from vLLM-owned KV storage
 - Command:
-  - `RESULT_PREFIX=decode-plan-tight-C32-run CONCURRENCIES=32 bash benchmarkvllm.sh`
+    - `RESULT_PREFIX=decode-plan-tight-C32-run CONCURRENCIES=32 bash benchmarkvllm.sh`
 - Logs/results:
-  - `runlogs/decode-plan-tight-bench-server.log`
-  - `runlogs/decode-plan-tight-benchmark.log`
-  - `bench-sparsemla/decode-plan-tight-C32-run-C32.json`
+    - `runlogs/decode-plan-tight-bench-server.log`
+    - `runlogs/decode-plan-tight-benchmark.log`
+    - `bench-sparsemla/decode-plan-tight-C32-run-C32.json`
 - Result:
-  - successful requests: `320`
-  - failed requests: `0`
-  - output throughput: `887.95 tok/s`
-  - peak output throughput: `998.00 tok/s`
-  - total token throughput: `1779.37 tok/s`
-  - mean TTFT: `848.09 ms`
-  - median TTFT: `866.76 ms`
-  - mean TPOT: `35.23 ms`
-  - median TPOT: `35.24 ms`
-  - p90 TPOT: `35.67 ms`
-  - p99 TPOT: `35.76 ms`
+    - successful requests: `320`
+    - failed requests: `0`
+    - output throughput: `887.95 tok/s`
+    - peak output throughput: `998.00 tok/s`
+    - total token throughput: `1779.37 tok/s`
+    - mean TTFT: `848.09 ms`
+    - median TTFT: `866.76 ms`
+    - mean TPOT: `35.23 ms`
+    - median TPOT: `35.24 ms`
+    - p90 TPOT: `35.67 ms`
+    - p99 TPOT: `35.76 ms`
 
 Comparison:
 
 - Immediate previous skip-indexer default C32:
-  - `bench-sparsemla/skip-indexer-current-default-C32.json`
-  - output throughput `884.56 tok/s`
-  - total throughput `1772.58 tok/s`
-  - mean TPOT `35.18 ms`
+    - `bench-sparsemla/skip-indexer-current-default-C32.json`
+    - output throughput `884.56 tok/s`
+    - total throughput `1772.58 tok/s`
+    - mean TPOT `35.18 ms`
 - Tight decode plan is a very small throughput improvement over that immediate
   baseline, but TPOT is essentially unchanged.
 - It is not the best saved C32 result in the workspace. The fastest saved
   historical run remains:
-  - `bench-sparsemla/revert-compressor-aux-nomtp-C32.json`
-  - output throughput `926.06 tok/s`
-  - total throughput `1855.74 tok/s`
-  - mean TPOT `33.50 ms`
+    - `bench-sparsemla/revert-compressor-aux-nomtp-C32.json`
+    - output throughput `926.06 tok/s`
+    - total throughput `1855.74 tok/s`
+    - mean TPOT `33.50 ms`
 - It remains below ATOM's documented FP8 TP8 C32 target:
-  - output throughput `1145.71 tok/s`
-  - mean TPOT `26.90 ms`
+    - output throughput `1145.71 tok/s`
+    - mean TPOT `26.90 ms`
 
 Interpretation:
 
@@ -6929,10 +6929,10 @@ Follow-up cleanup:
 - A standalone equivalence check over random valid and padded `batch_id=-1`
   inputs matched the previous formulas.
 - Isolated CPU timing for the arithmetic portion:
-  - `T=32`: old `12.37 us`, scratch `11.09 us`, `1.12x`
-  - `T=64`: old `12.68 us`, scratch `11.35 us`, `1.12x`
-  - `T=256`: old `13.89 us`, scratch `12.22 us`, `1.14x`
-  - `T=1024`: old `18.42 us`, scratch `15.42 us`, `1.19x`
+    - `T=32`: old `12.37 us`, scratch `11.09 us`, `1.12x`
+    - `T=64`: old `12.68 us`, scratch `11.35 us`, `1.12x`
+    - `T=256`: old `13.89 us`, scratch `12.22 us`, `1.14x`
+    - `T=1024`: old `18.42 us`, scratch `15.42 us`, `1.19x`
 - This removes avoidable Python/NumPy allocator churn, but the expected
   deployment impact is small because prior C32 profiles put the whole
   decode-indptr slice in the sub-millisecond range.
@@ -6945,9 +6945,9 @@ Additional metadata-gating cleanup:
 - The predicate is now computed once per `prepare_attn` call and passed through
   those helpers.
 - Isolated timing for a representative NumPy predicate:
-  - `n=32`: repeated `6.18 us`, cached `1.60 us`
-  - `n=64`: repeated `6.10 us`, cached `1.58 us`
-  - `n=256`: repeated `6.15 us`, cached `1.60 us`
+    - `n=32`: repeated `6.18 us`, cached `1.60 us`
+    - `n=64`: repeated `6.10 us`, cached `1.58 us`
+    - `n=256`: repeated `6.15 us`, cached `1.60 us`
 - This is not expected to visibly move C32 throughput by itself, but it removes
   another unnecessary adapter cost from the vLLM-to-ATOM metadata path.
 
@@ -7013,13 +7013,13 @@ Additional conversion cleanup:
 - The pure one-token decode predicate now reads the same scratch scheduled view
   instead of scanning the original scheduler array separately.
 - Standalone equivalence/timing for the request-length conversion:
-  - `n=32`: old `1.103 us`, scratch `0.946 us`, `1.17x`
-  - `n=64`: old `1.112 us`, scratch `0.954 us`, `1.17x`
-  - `n=256`: old `1.193 us`, scratch `0.991 us`, `1.20x`
-  - `n=1024`: old `1.507 us`, scratch `1.306 us`, `1.15x`
+    - `n=32`: old `1.103 us`, scratch `0.946 us`, `1.17x`
+    - `n=64`: old `1.112 us`, scratch `0.954 us`, `1.17x`
+    - `n=256`: old `1.193 us`, scratch `0.991 us`, `1.20x`
+    - `n=1024`: old `1.507 us`, scratch `1.306 us`, `1.15x`
 - Validation after the edit:
-  - `python3 -m py_compile vllm/models/deepseek_v4/amd/model_state.py`
-  - `git diff --check`
+    - `python3 -m py_compile vllm/models/deepseek_v4/amd/model_state.py`
+    - `git diff --check`
 
 Environment flag caching audit:
 
@@ -7035,58 +7035,58 @@ Environment flag caching audit:
 Accuracy and C32 validation after the request-length scratch change:
 
 - Accuracy server:
-  - default `bash launchdeepseekgraph.sh`
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - breakable CUDA graph
-  - no `--enforce-eager`
-  - `MAX_NUM_SEQS=256`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - block size `128`
-  - graph capture completed
-  - ATOM unified KV views were bound from vLLM-owned KV storage
+    - default `bash launchdeepseekgraph.sh`
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - breakable CUDA graph
+    - no `--enforce-eager`
+    - `MAX_NUM_SEQS=256`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - block size `128`
+    - graph capture completed
+    - ATOM unified KV views were bound from vLLM-owned KV storage
 - Accuracy command:
-  - unchanged `/app/atomdsv4/lmeval.sh`
+    - unchanged `/app/atomdsv4/lmeval.sh`
 - Accuracy logs:
-  - `runlogs/metadata-scratch-accuracy-server.log`
-  - `runlogs/metadata-scratch-lmeval.log`
+    - `runlogs/metadata-scratch-accuracy-server.log`
+    - `runlogs/metadata-scratch-lmeval.log`
 - Accuracy result:
-  - GSM8K flexible exact match: `0.9462 +/- 0.0062`
-  - GSM8K strict exact match: `0.9469 +/- 0.0062`
-  - target `0.95 +/- 0.01` passed
+    - GSM8K flexible exact match: `0.9462 +/- 0.0062`
+    - GSM8K strict exact match: `0.9469 +/- 0.0062`
+    - target `0.95 +/- 0.01` passed
 - Fresh C32 benchmark server:
-  - the accuracy server was stopped first
-  - `MAX_NUM_SEQS=32 bash launchdeepseekgraph.sh`
-  - graph capture completed
-  - ATOM unified KV views were rebound from vLLM-owned KV storage
+    - the accuracy server was stopped first
+    - `MAX_NUM_SEQS=32 bash launchdeepseekgraph.sh`
+    - graph capture completed
+    - ATOM unified KV views were rebound from vLLM-owned KV storage
 - Benchmark command:
-  - `RESULT_PREFIX=metadata-scratch-C32-run CONCURRENCIES=32 bash benchmarkvllm.sh`
+    - `RESULT_PREFIX=metadata-scratch-C32-run CONCURRENCIES=32 bash benchmarkvllm.sh`
 - Benchmark files:
-  - `runlogs/metadata-scratch-bench-server.log`
-  - `bench-sparsemla/metadata-scratch-C32-run-C32.json`
+    - `runlogs/metadata-scratch-bench-server.log`
+    - `bench-sparsemla/metadata-scratch-C32-run-C32.json`
 - C32 result:
-  - successful requests: `320`
-  - failed requests: `0`
-  - output throughput: `887.52 tok/s`
-  - peak output throughput: `992.00 tok/s`
-  - total token throughput: `1778.50 tok/s`
-  - mean TTFT: `974.85 ms`
-  - median TTFT: `941.04 ms`
-  - mean TPOT: `35.13 ms`
-  - median TPOT: `35.11 ms`
-  - p90 TPOT: `35.70 ms`
-  - p99 TPOT: `35.89 ms`
+    - successful requests: `320`
+    - failed requests: `0`
+    - output throughput: `887.52 tok/s`
+    - peak output throughput: `992.00 tok/s`
+    - total token throughput: `1778.50 tok/s`
+    - mean TTFT: `974.85 ms`
+    - median TTFT: `941.04 ms`
+    - mean TPOT: `35.13 ms`
+    - median TPOT: `35.11 ms`
+    - p90 TPOT: `35.70 ms`
+    - p99 TPOT: `35.89 ms`
 - Comparison:
-  - immediate previous validated C32
+    - immediate previous validated C32
     `bench-sparsemla/decode-plan-tight-C32-run-C32.json`:
     output `887.95 tok/s`, mean TPOT `35.23 ms`
-  - new run is effectively flat: output `-0.05%`, mean TPOT slightly better
-  - historical best saved run
+    - new run is effectively flat: output `-0.05%`, mean TPOT slightly better
+    - historical best saved run
     `bench-sparsemla/revert-compressor-aux-nomtp-C32.json`:
     output `926.06 tok/s`, mean TPOT `33.50 ms`
-  - new run is `4.16%` below that historical best output throughput
-  - ATOM C32 target remains output `1145.71 tok/s`, mean TPOT `26.90 ms`
-  - new run is `22.54%` below ATOM C32 output throughput, a gap of
+    - new run is `4.16%` below that historical best output throughput
+    - ATOM C32 target remains output `1145.71 tok/s`, mean TPOT `26.90 ms`
+    - new run is `22.54%` below ATOM C32 output throughput, a gap of
     `258.19 tok/s`
 
 Interpretation:
@@ -7119,92 +7119,92 @@ Configuration:
 Default server-concurrency check:
 
 - Server:
-  - default `bash launchdeepseekgraph.sh`
-  - `MAX_NUM_SEQS=256`
-  - `MAX_MODEL_LEN=8192`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - block size `128`
+    - default `bash launchdeepseekgraph.sh`
+    - `MAX_NUM_SEQS=256`
+    - `MAX_MODEL_LEN=8192`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - block size `128`
 - Smoke:
-  - `RESULT_PREFIX=indexer-compressor-default-C1-smoke CONCURRENCIES=1`
-  - `INPUT_LEN=1024 OUTPUT_LEN=1024 bash benchmarkvllm.sh`
-  - file:
+    - `RESULT_PREFIX=indexer-compressor-default-C1-smoke CONCURRENCIES=1`
+    - `INPUT_LEN=1024 OUTPUT_LEN=1024 bash benchmarkvllm.sh`
+    - file:
     `bench-sparsemla/indexer-compressor-default-C1-smoke-C1.json`
-  - completed `10`, failed `0`
-  - output throughput `37.26 tok/s`
-  - total throughput `74.67 tok/s`
-  - mean TTFT `160.22 ms`
-  - mean TPOT `26.71 ms`
+    - completed `10`, failed `0`
+    - output throughput `37.26 tok/s`
+    - total throughput `74.67 tok/s`
+    - mean TTFT `160.22 ms`
+    - mean TPOT `26.71 ms`
 - Single direct completion also succeeded:
-  - `runlogs/indexer-compressor-default-smoke-completion.json`
+    - `runlogs/indexer-compressor-default-smoke-completion.json`
 - Unchanged `bash lmeval.sh` on this default server failed before an accuracy
   result:
-  - `runlogs/indexer-compressor-default-lmeval-fail-server.log`
-  - the visible stack lands in
+    - `runlogs/indexer-compressor-default-lmeval-fail-server.log`
+    - the visible stack lands in
     `vllm/models/deepseek_v4/amd/v4_kernels/state_writes.py`
     `update_compressor_states`
-  - client observed HTTP 500 / connection refusal after the worker failure
-  - this is a high-concurrency resource/stability failure, not a small-request
+    - client observed HTTP 500 / connection refusal after the worker failure
+    - this is a high-concurrency resource/stability failure, not a small-request
     functional failure
 
 Lower server-concurrency accuracy check:
 
 - Server:
-  - `MAX_NUM_SEQS=64 VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=1`
+    - `MAX_NUM_SEQS=64 VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=1`
     `bash launchdeepseekgraph.sh`
-  - graph capture completed
-  - vLLM-owned unified KV views were bound with `swa_pages=8192`
+    - graph capture completed
+    - vLLM-owned unified KV views were bound with `swa_pages=8192`
 - Accuracy command:
-  - unchanged `bash lmeval.sh`
+    - unchanged `bash lmeval.sh`
 - Logs:
-  - `runlogs/indexer-compressor-maxseq64-lmeval.log`
-  - `runlogs/indexer-compressor-maxseq64-accuracy-server.log`
+    - `runlogs/indexer-compressor-maxseq64-lmeval.log`
+    - `runlogs/indexer-compressor-maxseq64-accuracy-server.log`
 - GSM8K result:
-  - flexible exact match: `0.9492 +/- 0.006`
-  - strict exact match: `0.9500 +/- 0.006`
-  - target `0.95 +/- 0.01` passed
+    - flexible exact match: `0.9492 +/- 0.006`
+    - strict exact match: `0.9500 +/- 0.006`
+    - target `0.95 +/- 0.01` passed
 
 Fresh C32 benchmark:
 
 - Server:
-  - `MAX_NUM_SEQS=32 VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=1`
+    - `MAX_NUM_SEQS=32 VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=1`
     `bash launchdeepseekgraph.sh`
-  - graph capture completed
-  - vLLM-owned unified KV views were bound with `swa_pages=4096`
+    - graph capture completed
+    - vLLM-owned unified KV views were bound with `swa_pages=4096`
 - Benchmark command:
-  - `RESULT_PREFIX=indexer-compressor-accuracypass-C32-run CONCURRENCIES=32`
+    - `RESULT_PREFIX=indexer-compressor-accuracypass-C32-run CONCURRENCIES=32`
     `bash benchmarkvllm.sh`
 - Files:
-  - `bench-sparsemla/indexer-compressor-accuracypass-C32-run-C32.json`
-  - `runlogs/indexer-compressor-accuracypass-C32-server.log`
+    - `bench-sparsemla/indexer-compressor-accuracypass-C32-run-C32.json`
+    - `runlogs/indexer-compressor-accuracypass-C32-server.log`
 - C32 result:
-  - completed `320`
-  - failed `0`
-  - output throughput `880.49 tok/s`
-  - total token throughput `1764.41 tok/s`
-  - mean TTFT `853.48 ms`
-  - median TTFT `869.19 ms`
-  - mean TPOT `35.53 ms`
-  - median TPOT `35.56 ms`
+    - completed `320`
+    - failed `0`
+    - output throughput `880.49 tok/s`
+    - total token throughput `1764.41 tok/s`
+    - mean TTFT `853.48 ms`
+    - median TTFT `869.19 ms`
+    - mean TPOT `35.53 ms`
+    - median TPOT `35.56 ms`
 
 Comparison:
 
 - Default-off immediate baseline:
-  - `bench-sparsemla/metadata-scratch-C32-run-C32.json`
-  - output `887.52 tok/s`
-  - total `1778.50 tok/s`
-  - mean TPOT `35.13 ms`
+    - `bench-sparsemla/metadata-scratch-C32-run-C32.json`
+    - output `887.52 tok/s`
+    - total `1778.50 tok/s`
+    - mean TPOT `35.13 ms`
 - Indexer compressor on is slower than that baseline:
-  - output throughput: `-0.79%`
-  - mean TPOT: `+1.14%` slower
+    - output throughput: `-0.79%`
+    - mean TPOT: `+1.14%` slower
 - Historical fastest saved C32 run:
-  - `bench-sparsemla/revert-compressor-aux-nomtp-C32.json`
-  - output `926.06 tok/s`
-  - mean TPOT `33.50 ms`
+    - `bench-sparsemla/revert-compressor-aux-nomtp-C32.json`
+    - output `926.06 tok/s`
+    - mean TPOT `33.50 ms`
 - Indexer compressor on is `4.92%` below that historical best output
   throughput.
 - ATOM recipe C32 target remains:
-  - output `1145.71 tok/s`
-  - mean TPOT `26.90 ms`
+    - output `1145.71 tok/s`
+    - mean TPOT `26.90 ms`
 - Indexer compressor on is `23.15%` below the ATOM C32 output target.
 
 Interpretation:
@@ -7213,9 +7213,9 @@ Interpretation:
   the unchanged GSM8K lmeval command when server concurrency is reduced to
   `MAX_NUM_SEQS=64`.
 - It is not ready as a default path:
-  - default `MAX_NUM_SEQS=256` lmeval still fails from worker/resource pressure;
-  - C32 deployment throughput is lower than the default-off path;
-  - the logs do not yet prove that the aiter/flydsl fused-compressor dispatcher
+    - default `MAX_NUM_SEQS=256` lmeval still fails from worker/resource pressure;
+    - C32 deployment throughput is lower than the default-off path;
+    - the logs do not yet prove that the aiter/flydsl fused-compressor dispatcher
     is the selected implementation in the hot path.
 - Keep `VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=0` as the default until a
   compressor profile or ROCm profiler trace proves the selected kernel path and
@@ -7231,28 +7231,28 @@ Question:
 Run configuration:
 
 - Default indexer compressor off:
-  - `VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=0`
+    - `VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR=0`
 - Server:
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - v2 model runner
-  - graph mode / breakable CUDA graph
-  - no `--enforce-eager`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_START_AFTER=64`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_EVERY=128`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL=1`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER=0`
-  - `VLLM_ROCM_DSV4_ATOM_PROFILE_EVERY=256`
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - v2 model runner
+    - graph mode / breakable CUDA graph
+    - no `--enforce-eager`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_START_AFTER=64`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_EVERY=128`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL=1`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER=0`
+    - `VLLM_ROCM_DSV4_ATOM_PROFILE_EVERY=256`
 - Benchmark:
-  - `RESULT_PREFIX=profile-default-C32-run`
-  - `RESULT_DIR=./bench-profile-default-c32`
-  - `CONCURRENCIES=32 bash benchmarkvllm.sh`
+    - `RESULT_PREFIX=profile-default-C32-run`
+    - `RESULT_DIR=./bench-profile-default-c32`
+    - `CONCURRENCIES=32 bash benchmarkvllm.sh`
 - Files:
-  - `bench-profile-default-c32/profile-default-C32-run-C32.json`
-  - `runlogs/profile-default-C32-run-server.log`
+    - `bench-profile-default-c32/profile-default-C32-run-C32.json`
+    - `runlogs/profile-default-C32-run-server.log`
 
 Benchmark result:
 
@@ -7298,33 +7298,33 @@ rank rows:
 Large prefill samples during the C32 benchmark:
 
 - `T=1028`, averaged across 8 rank rows:
-  - build `0.270 ms`
-  - index `0.130 ms`
-  - ATOM kernel `0.201 ms`
-  - SWA write `1.219 ms`
-  - total `1.861 ms`
+    - build `0.270 ms`
+    - index `0.130 ms`
+    - ATOM kernel `0.201 ms`
+    - SWA write `1.219 ms`
+    - total `1.861 ms`
 - `T=4112`, averaged across 8 rank rows:
-  - build `0.257 ms`
-  - index `1.188 ms`
-  - ATOM kernel `0.369 ms`
-  - SWA write `0.060 ms`
-  - total `1.933 ms`
+    - build `0.257 ms`
+    - index `1.188 ms`
+    - ATOM kernel `0.369 ms`
+    - SWA write `0.060 ms`
+    - total `1.933 ms`
 
 Backend metadata samples:
 
 - MLA metadata, ratio 128, `tokens=64`:
-  - average total `3.294 ms`
+    - average total `3.294 ms`
 - MLA metadata, ratio 4, `tokens=64`:
-  - average total `0.360 ms`
+    - average total `0.360 ms`
 - SWA metadata, `tokens=64`:
-  - average total across both SWA metadata objects `8.712 ms`
-  - the first SWA object was around `16-18 ms` in the graph/warmup profile
+    - average total across both SWA metadata objects `8.712 ms`
+    - the first SWA object was around `16-18 ms` in the graph/warmup profile
     rows, while the second was around `0.25-0.30 ms`
 - Model-state metadata detail during steady decode:
-  - average total `0.088 ms`
-  - p50 total `0.087 ms`
-  - max total `0.142 ms`
-  - decode indptr construction averaged `0.038 ms`
+    - average total `0.088 ms`
+    - p50 total `0.087 ms`
+    - max total `0.142 ms`
+    - decode indptr construction averaged `0.038 ms`
 
 First-inference JIT warnings hit exactly the helper path under discussion:
 
@@ -7349,12 +7349,12 @@ Interpretation:
 - Steady pure-decode model-state metadata is already small at C32
   (`~0.09 ms` sampled), so the remaining decode overhead is mostly GPU helper
   work and compatibility indexing:
-  - HCA decode index/index-write averages `2.875 ms` for layer 0, compared with
+    - HCA decode index/index-write averages `2.875 ms` for layer 0, compared with
     `5.486 ms` in the sampled ATOM paged-decode kernel.
 - Prefill attribution is more severe:
-  - For `T=4112`, index construction is `1.188 ms` while the sampled ATOM
+    - For `T=4112`, index construction is `1.188 ms` while the sampled ATOM
     paged-prefill kernel is only `0.369 ms`.
-  - For `T=1028`, SWA write is `1.219 ms` while the sampled ATOM paged-prefill
+    - For `T=1028`, SWA write is `1.219 ms` while the sampled ATOM paged-prefill
     kernel is only `0.201 ms`.
 - This supports the structural plan: after the current vLLM-owned unified KV
   binding, the next useful performance work is not another small CPU conversion
@@ -7379,37 +7379,37 @@ Candidate fix:
 
 - `vllm/models/deepseek_v4/amd/v4_kernels/csa_translate_pack.py`
 - Kernel write base is now:
-  - decode / `INLINE_SKIP_FROM_POS=True`: `indptr`
-  - prefill / `INLINE_SKIP_FROM_POS=False`: `indptr + skip`
+    - decode / `INLINE_SKIP_FROM_POS=True`: `indptr`
+    - prefill / `INLINE_SKIP_FROM_POS=False`: `indptr + skip`
 - The torch reference path mirrors the same layout.
 
 Validation performed:
 
 - CPU reference sanity for one token with `skip=2`:
-  - prefill preserves the two SWA-prefix cells and writes CSA topk after them.
-  - decode writes CSA topk at the head and leaves the tail untouched.
+    - prefill preserves the two SWA-prefix cells and writes CSA topk after them.
+    - decode writes CSA topk at the head and leaves the tail untouched.
 - Reduced graph-mode server:
-  - `MAX_NUM_SEQS=4`
-  - `MAX_NUM_BATCHED_TOKENS=2048`
-  - `MAX_MODEL_LEN=4096`
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - no `--enforce-eager`
+    - `MAX_NUM_SEQS=4`
+    - `MAX_NUM_BATCHED_TOKENS=2048`
+    - `MAX_MODEL_LEN=4096`
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - no `--enforce-eager`
 - Smoke workload:
-  - `RESULT_DIR=./bench-csa-prefill-layout-smoke`
-  - `RESULT_PREFIX=csa-prefill-layout-smoke`
-  - `CONCURRENCIES=4`
-  - `INPUT_LEN=2048`
-  - `OUTPUT_LEN=64`
-  - `bash benchmarkvllm.sh`
+    - `RESULT_DIR=./bench-csa-prefill-layout-smoke`
+    - `RESULT_PREFIX=csa-prefill-layout-smoke`
+    - `CONCURRENCIES=4`
+    - `INPUT_LEN=2048`
+    - `OUTPUT_LEN=64`
+    - `bash benchmarkvllm.sh`
 - Result:
-  - `bench-csa-prefill-layout-smoke/csa-prefill-layout-smoke-C4.json`
-  - completed `40`, failed `0`
-  - output throughput `103.016 tok/s`
-  - total throughput `3405.968 tok/s`
-  - mean TTFT `518.624 ms`
-  - mean TPOT `31.147 ms`
+    - `bench-csa-prefill-layout-smoke/csa-prefill-layout-smoke-C4.json`
+    - completed `40`, failed `0`
+    - output throughput `103.016 tok/s`
+    - total throughput `3405.968 tok/s`
+    - mean TTFT `518.624 ms`
+    - mean TPOT `31.147 ms`
 - Server log:
-  - `runlogs/csa-prefill-layout-smoke-server.log`
+    - `runlogs/csa-prefill-layout-smoke-server.log`
 
 This is only a reduced shape check. It does not replace the required unchanged
 `lmeval.sh` GSM8K run and the fresh C32 `benchmarkvllm.sh` run.
@@ -7417,39 +7417,39 @@ This is only a reduced shape check. It does not replace the required unchanged
 Full validation after the CSA prefill layout change:
 
 - Accuracy server:
-  - default `launchdeepseekgraph.sh`
-  - `MAX_NUM_SEQS=256`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - no `--enforce-eager`
+    - default `launchdeepseekgraph.sh`
+    - `MAX_NUM_SEQS=256`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - no `--enforce-eager`
 - Accuracy command:
-  - unchanged `bash lmeval.sh`
+    - unchanged `bash lmeval.sh`
 - Accuracy result:
-  - GSM8K flexible-extract exact match: `0.9500 ± 0.006`
-  - GSM8K strict-match exact match: `0.9507 ± 0.006`
-  - samples file:
+    - GSM8K flexible-extract exact match: `0.9500 ± 0.006`
+    - GSM8K strict-match exact match: `0.9507 ± 0.006`
+    - samples file:
     `results_deepseekprographmtp_aitermhc_nobreakablecudagraph/deepseek-ai__DeepSeek-V4-Pro/samples_gsm8k_2026-06-19T16-36-38.932353.jsonl`
-  - server log: `runlogs/csa-prefill-layout-lmeval-server.log`
+    - server log: `runlogs/csa-prefill-layout-lmeval-server.log`
 - Fresh performance server:
-  - restarted after accuracy to clear KV/prefix state
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - no `--enforce-eager`
+    - restarted after accuracy to clear KV/prefix state
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - no `--enforce-eager`
 - Performance command:
-  - `RESULT_DIR=./bench-csa-prefill-layout-c32`
-  - `RESULT_PREFIX=csa-prefill-layout`
-  - `CONCURRENCIES=32`
-  - `bash benchmarkvllm.sh`
+    - `RESULT_DIR=./bench-csa-prefill-layout-c32`
+    - `RESULT_PREFIX=csa-prefill-layout`
+    - `CONCURRENCIES=32`
+    - `bash benchmarkvllm.sh`
 - Performance result:
-  - `bench-csa-prefill-layout-c32/csa-prefill-layout-C32.json`
-  - completed `320`, failed `0`
-  - output throughput `885.850 tok/s`
-  - total throughput `1775.160 tok/s`
-  - mean TTFT `983.358 ms`
-  - mean TPOT `35.189 ms`
-  - server log: `runlogs/csa-prefill-layout-c32-server.log`
+    - `bench-csa-prefill-layout-c32/csa-prefill-layout-C32.json`
+    - completed `320`, failed `0`
+    - output throughput `885.850 tok/s`
+    - total throughput `1775.160 tok/s`
+    - mean TTFT `983.358 ms`
+    - mean TPOT `35.189 ms`
+    - server log: `runlogs/csa-prefill-layout-c32-server.log`
 
 Comparison with nearby prior runs:
 
@@ -7473,11 +7473,11 @@ Follow-up helper cleanup:
 - Removed the CSA prefill `prefix_csa_indices[:prefix_csa_total].fill_(-1)`
   launch from `DeepseekV4ROCMAiterMLAAttention._maybe_forward_prefill_atom`.
 - Reason:
-  - `write_v4_paged_prefill_indices` writes the SWA prefix part of every
+    - `write_v4_paged_prefill_indices` writes the SWA prefix part of every
     consumed CSA prefill slice.
-  - `csa_translate_pack` writes the CSA topk part of every consumed CSA
+    - `csa_translate_pack` writes the CSA topk part of every consumed CSA
     prefill slice.
-  - The attention kernel reads exactly the indptr-declared consumed slice, so
+    - The attention kernel reads exactly the indptr-declared consumed slice, so
     no sentinel-filled hole remains after the layout fix.
 - This should remove one GPU fill/memory-write launch from CSA prefill index
   construction. It is expected to be a small helper-path win, not a numerical
@@ -7489,84 +7489,84 @@ Additional decode helper cleanup:
   `topk_indices_buffer` with `-1` when the default all-layer/all-ratio ATOM
   attention path is active.
 - Reason:
-  - The ATOM CSA decode packer derives `valid_k` from `csa_indptr` and only
+    - The ATOM CSA decode packer derives `valid_k` from `csa_indptr` and only
     reads `topk_local[t, :valid_k]`.
-  - aiter `top_k_per_row_decode` only needs to write the valid head of each
+    - aiter `top_k_per_row_decode` only needs to write the valid head of each
     row for that consumer.
-  - Native vLLM ragged conversion still treats `-1` as the tail sentinel, so
+    - Native vLLM ragged conversion still treats `-1` as the tail sentinel, so
     the fill remains enabled whenever ATOM attention is disabled, layer/ratio
     filtered, or not using the ATOM unified-KV path.
 - This removes a per-indexer GPU fill from the default ATOM decode fastpath
   without changing native fallback semantics.
 - Validation:
-  - `python3 -m py_compile vllm/models/deepseek_v4/attention.py` passed.
-  - `git diff --check` passed for the changed files.
-  - Import probe with default ATOM attention env:
+    - `python3 -m py_compile vllm/models/deepseek_v4/attention.py` passed.
+    - `git diff --check` passed for the changed files.
+    - Import probe with default ATOM attention env:
     `VLLM_ROCM_DSV4_ATOM_ATTENTION=1`
     `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1`
     produced `_ATOM_INDEXER_FASTPATH_NEEDS_SENTINEL_FILL=False`.
-  - Import probe with ATOM attention disabled produced
+    - Import probe with ATOM attention disabled produced
     `_ATOM_INDEXER_FASTPATH_NEEDS_SENTINEL_FILL=True`.
-  - Import probe with `VLLM_ROCM_DSV4_ATOM_ATTENTION_LAYERS=0` produced
+    - Import probe with `VLLM_ROCM_DSV4_ATOM_ATTENTION_LAYERS=0` produced
     `_ATOM_INDEXER_FASTPATH_NEEDS_SENTINEL_FILL=True`.
-  - Full unchanged accuracy gate passed:
-    - server: default `launchdeepseekgraph.sh`, `MAX_NUM_SEQS=256`,
+    - Full unchanged accuracy gate passed:
+        - server: default `launchdeepseekgraph.sh`, `MAX_NUM_SEQS=256`,
       `MAX_NUM_BATCHED_TOKENS=8192`, `MAX_MODEL_LEN=8192`, no
       `--enforce-eager`.
-    - command: unchanged `bash lmeval.sh`.
-    - GSM8K flexible-extract exact match: `0.9538 ± 0.0058`.
-    - GSM8K strict-match exact match: `0.9545 ± 0.0057`.
-    - samples file:
+        - command: unchanged `bash lmeval.sh`.
+        - GSM8K flexible-extract exact match: `0.9538 ± 0.0058`.
+        - GSM8K strict-match exact match: `0.9545 ± 0.0057`.
+        - samples file:
       `results_deepseekprographmtp_aitermhc_nobreakablecudagraph/deepseek-ai__DeepSeek-V4-Pro/samples_gsm8k_2026-06-19T17-18-04.498685.jsonl`.
-    - logs:
+        - logs:
       `runlogs/indexer-fill-skip-lmeval.log`,
       `runlogs/indexer-fill-skip-lmeval-server.log`.
-  - Fresh C32 performance benchmark after restarting the server:
-    - server: `MAX_NUM_SEQS=32`, `MAX_NUM_BATCHED_TOKENS=8192`,
+    - Fresh C32 performance benchmark after restarting the server:
+        - server: `MAX_NUM_SEQS=32`, `MAX_NUM_BATCHED_TOKENS=8192`,
       `MAX_MODEL_LEN=8192`, no `--enforce-eager`.
-    - command:
+        - command:
       `RESULT_DIR=./bench-indexer-fill-skip-c32`
       `RESULT_PREFIX=indexer-fill-skip`
       `CONCURRENCIES=32`
       `bash benchmarkvllm.sh`.
-    - result file:
+        - result file:
       `bench-indexer-fill-skip-c32/indexer-fill-skip-C32.json`.
-    - completed `320`, failed `0`.
-    - output throughput `887.220 tok/s`.
-    - total throughput `1777.906 tok/s`.
-    - mean TTFT `1024.548 ms`.
-    - mean TPOT `35.094 ms`.
-    - logs:
+        - completed `320`, failed `0`.
+        - output throughput `887.220 tok/s`.
+        - total throughput `1777.906 tok/s`.
+        - mean TTFT `1024.548 ms`.
+        - mean TPOT `35.094 ms`.
+        - logs:
       `runlogs/indexer-fill-skip-c32-benchmark.log`,
       `runlogs/indexer-fill-skip-c32-server.log`.
 
 Validation for the helper cleanup:
 
 - Static/reference checks:
-  - `python3 -m py_compile` passed for `rocm.py`,
+    - `python3 -m py_compile` passed for `rocm.py`,
     `paged_prefill_indices.py`, and `csa_translate_pack.py`.
-  - Reference sanity verified that a CSA prefill slice initially filled with a
+    - Reference sanity verified that a CSA prefill slice initially filled with a
     stale sentinel is fully overwritten by `write_v4_paged_prefill_indices`
     plus `csa_translate_pack`.
 - Fresh C32 performance server:
-  - restarted after the prior benchmark
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - no `--enforce-eager`
+    - restarted after the prior benchmark
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - no `--enforce-eager`
 - Performance command:
-  - `RESULT_DIR=./bench-csa-prefill-nofill-c32`
-  - `RESULT_PREFIX=csa-prefill-nofill`
-  - `CONCURRENCIES=32`
-  - `bash benchmarkvllm.sh`
+    - `RESULT_DIR=./bench-csa-prefill-nofill-c32`
+    - `RESULT_PREFIX=csa-prefill-nofill`
+    - `CONCURRENCIES=32`
+    - `bash benchmarkvllm.sh`
 - Performance result:
-  - `bench-csa-prefill-nofill-c32/csa-prefill-nofill-C32.json`
-  - completed `320`, failed `0`
-  - output throughput `887.922 tok/s`
-  - total throughput `1779.313 tok/s`
-  - mean TTFT `1010.334 ms`
-  - mean TPOT `35.080 ms`
-  - server log: `runlogs/csa-prefill-nofill-c32-server.log`
+    - `bench-csa-prefill-nofill-c32/csa-prefill-nofill-C32.json`
+    - completed `320`, failed `0`
+    - output throughput `887.922 tok/s`
+    - total throughput `1779.313 tok/s`
+    - mean TTFT `1010.334 ms`
+    - mean TPOT `35.080 ms`
+    - server log: `runlogs/csa-prefill-nofill-c32-server.log`
 
 Updated C32 comparison:
 
@@ -7605,10 +7605,10 @@ Guarded CSA direct decode prototype:
 - The direct path removes the per-CSA-layer decode `csa_translate_pack`
   launch. Instead, paged decode resolves CSA compressed-head slots in-kernel
   from:
-  - the indexer's seq-local `topk_indices_buffer`;
-  - vLLM's compressed block table;
-  - per-token positions and batch ids;
-  - existing `csa_indptr` lengths.
+    - the indexer's seq-local `topk_indices_buffer`;
+    - vLLM's compressed block table;
+    - per-token positions and batch ids;
+    - existing `csa_indptr` lengths.
 - The existing `write_v4_paged_decode_indices` launch remains in place and
   still writes the SWA tail into `csa_indices`. Direct CSA decode reads that
   tail from `csa_indices` and only computes the CSA head inline.
@@ -7617,46 +7617,46 @@ Guarded CSA direct decode prototype:
   validation passed. It can still be disabled with
   `VLLM_ROCM_DSV4_ATOM_CSA_DIRECT_DECODE=0`.
 - Validation so far:
-  - `python3 -m py_compile` passed for `paged_decode.py`,
+    - `python3 -m py_compile` passed for `paged_decode.py`,
     `v4_kernels/__init__.py`, and `rocm.py`.
-  - `git diff --check` passed.
-  - Import check for `sparse_attn_v4_paged_decode_csa_direct` passed.
-  - CPU reference slot construction sanity passed.
-  - HIP/Triton parity check against the translated-index decode path passed
+    - `git diff --check` passed.
+    - Import check for `sparse_attn_v4_paged_decode_csa_direct` passed.
+    - CPU reference slot construction sanity passed.
+    - HIP/Triton parity check against the translated-index decode path passed
     for the split-K path with `max_diff=0.0`.
-  - HIP/Triton parity check against the translated-index decode path passed
+    - HIP/Triton parity check against the translated-index decode path passed
     for the fused `kv_splits=1` path with `max_diff=0.0`.
-  - Full unchanged accuracy gate passed:
-    - server: `launchdeepseekgraph.sh` with
+    - Full unchanged accuracy gate passed:
+        - server: `launchdeepseekgraph.sh` with
       `VLLM_ROCM_DSV4_ATOM_CSA_DIRECT_DECODE=1`, `MAX_NUM_SEQS=256`,
       `MAX_NUM_BATCHED_TOKENS=8192`, `MAX_MODEL_LEN=8192`, no
       `--enforce-eager`.
-    - command: unchanged `bash lmeval.sh`.
-    - GSM8K flexible-extract exact match: `0.9545 ± 0.0057`.
-    - GSM8K strict-match exact match: `0.9553 ± 0.0057`.
-    - result file:
+        - command: unchanged `bash lmeval.sh`.
+        - GSM8K flexible-extract exact match: `0.9545 ± 0.0057`.
+        - GSM8K strict-match exact match: `0.9553 ± 0.0057`.
+        - result file:
       `results_deepseekprographmtp_aitermhc_nobreakablecudagraph/deepseek-ai__DeepSeek-V4-Pro/results_2026-06-19T17-48-07.259107.json`.
-    - log: `runlogs/csa-direct-lmeval.log`.
-  - Fresh C32 performance benchmark after restarting the server:
-    - server: `MAX_NUM_SEQS=32`, `MAX_NUM_BATCHED_TOKENS=8192`,
+        - log: `runlogs/csa-direct-lmeval.log`.
+    - Fresh C32 performance benchmark after restarting the server:
+        - server: `MAX_NUM_SEQS=32`, `MAX_NUM_BATCHED_TOKENS=8192`,
       `MAX_MODEL_LEN=8192`, `VLLM_ROCM_DSV4_ATOM_CSA_DIRECT_DECODE=1`, no
       `--enforce-eager`.
-    - command:
+        - command:
       `RESULT_DIR=./bench-csa-direct-c32`
       `RESULT_PREFIX=csa-direct`
       `CONCURRENCIES=32`
       `bash benchmarkvllm.sh`.
-    - result file:
+        - result file:
       `bench-csa-direct-c32/csa-direct-C32.json`.
-    - completed `320`, failed `0`.
-    - output throughput `891.152 tok/s`.
-    - total throughput `1785.784 tok/s`.
-    - mean TTFT `1015.014 ms`.
-    - mean TPOT `34.945 ms`.
-    - median TPOT `34.805 ms`.
-    - p90 TPOT `35.486 ms`.
-    - p99 TPOT `35.711 ms`.
-    - log: `runlogs/csa-direct-c32-benchmark.log`.
+        - completed `320`, failed `0`.
+        - output throughput `891.152 tok/s`.
+        - total throughput `1785.784 tok/s`.
+        - mean TTFT `1015.014 ms`.
+        - mean TPOT `34.945 ms`.
+        - median TPOT `34.805 ms`.
+        - p90 TPOT `35.486 ms`.
+        - p99 TPOT `35.711 ms`.
+        - log: `runlogs/csa-direct-c32-benchmark.log`.
 
 Guarded CSA direct prefill prototype:
 
@@ -7666,14 +7666,14 @@ Guarded CSA direct prefill prototype:
   `csa_translate_pack` launch. It keeps using
   `write_v4_paged_prefill_indices` for the SWA prefix segment, then resolves
   the CSA top-k segment inside the prefill attention kernel from:
-  - the indexer's seq-local `topk_indices_buffer`;
-  - vLLM's compressed block table;
-  - per-token batch ids;
-  - per-token `skip_prefix_len_csa`;
-  - existing `prefix_csa_indptr` lengths.
+    - the indexer's seq-local `topk_indices_buffer`;
+    - vLLM's compressed block table;
+    - per-token batch ids;
+    - per-token `skip_prefix_len_csa`;
+    - existing `prefix_csa_indptr` lengths.
 - Prefill layout differs from decode:
-  - decode: CSA top-k segment is at the slice head and SWA is the tail.
-  - prefill: SWA prefix is at the slice head and CSA top-k follows it.
+    - decode: CSA top-k segment is at the slice head and SWA is the tail.
+    - prefill: SWA prefix is at the slice head and CSA top-k follows it.
   The direct path mirrors `csa_translate_pack` exactly by deriving
   `valid_k = indptr[t + 1] - indptr[t] - skip[t]` and never reading the
   uninitialized tail of the indexer top-k buffer.
@@ -7681,54 +7681,54 @@ Guarded CSA direct prefill prototype:
   OPUS currently consumes materialized prefix slot ids, so using direct CSA
   prefill bypasses OPUS for CSA prefill attention.
 - Validation:
-  - `python3 -m py_compile` passed for `paged_prefill.py`,
+    - `python3 -m py_compile` passed for `paged_prefill.py`,
     `v4_kernels/__init__.py`, and `rocm.py`.
-  - `git diff --check` passed.
-  - CPU reference comparison against `csa_translate_pack_reference` passed:
+    - `git diff --check` passed.
+    - CPU reference comparison against `csa_translate_pack_reference` passed:
     materialized indices matched and attention output `max_diff=0.0`.
-  - HIP/Triton parity against the materialized translated-index prefill path
+    - HIP/Triton parity against the materialized translated-index prefill path
     passed with `max_diff=0.0`.
-  - Full unchanged accuracy gate passed:
-    - server: `launchdeepseekgraph.sh` with
+    - Full unchanged accuracy gate passed:
+        - server: `launchdeepseekgraph.sh` with
       `VLLM_ROCM_DSV4_ATOM_CSA_DIRECT_PREFILL=1`,
       `VLLM_ROCM_DSV4_ATOM_CSA_DIRECT_DECODE=1`, `MAX_NUM_SEQS=256`,
       `MAX_NUM_BATCHED_TOKENS=8192`, `MAX_MODEL_LEN=8192`, no
       `--enforce-eager`.
-    - command: unchanged `bash lmeval.sh`.
-    - GSM8K flexible-extract exact match: `0.9545 ± 0.0057`.
-    - GSM8K strict-match exact match: `0.9560 ± 0.0056`.
-    - result file:
+        - command: unchanged `bash lmeval.sh`.
+        - GSM8K flexible-extract exact match: `0.9545 ± 0.0057`.
+        - GSM8K strict-match exact match: `0.9560 ± 0.0056`.
+        - result file:
       `results_deepseekprographmtp_aitermhc_nobreakablecudagraph/deepseek-ai__DeepSeek-V4-Pro/results_2026-06-19T18-15-51.661787.json`.
-    - log: `runlogs/csa-direct-prefill-lmeval.log`.
-  - Fresh C32 performance benchmark after restarting the server:
-    - server: `MAX_NUM_SEQS=32`, `MAX_NUM_BATCHED_TOKENS=8192`,
+        - log: `runlogs/csa-direct-prefill-lmeval.log`.
+    - Fresh C32 performance benchmark after restarting the server:
+        - server: `MAX_NUM_SEQS=32`, `MAX_NUM_BATCHED_TOKENS=8192`,
       `MAX_MODEL_LEN=8192`,
       `VLLM_ROCM_DSV4_ATOM_CSA_DIRECT_PREFILL=1`, no `--enforce-eager`.
-    - command:
+        - command:
       `RESULT_DIR=./bench-csa-direct-prefill-c32`
       `RESULT_PREFIX=csa-direct-prefill`
       `CONCURRENCIES=32`
       `bash benchmarkvllm.sh`.
-    - result file:
+        - result file:
       `bench-csa-direct-prefill-c32/csa-direct-prefill-C32.json`.
-    - completed `320`, failed `0`.
-    - output throughput `890.041 tok/s`.
-    - total throughput `1783.559 tok/s`.
-    - mean TTFT `991.613 ms`.
-    - mean TPOT `35.013 ms`.
-    - median TPOT `34.927 ms`.
-    - p90 TPOT `35.573 ms`.
-    - p99 TPOT `35.823 ms`.
-    - log: `runlogs/csa-direct-prefill-c32-benchmark.log`.
+        - completed `320`, failed `0`.
+        - output throughput `890.041 tok/s`.
+        - total throughput `1783.559 tok/s`.
+        - mean TTFT `991.613 ms`.
+        - mean TPOT `35.013 ms`.
+        - median TPOT `34.927 ms`.
+        - p90 TPOT `35.573 ms`.
+        - p99 TPOT `35.823 ms`.
+        - log: `runlogs/csa-direct-prefill-c32-benchmark.log`.
 - Interpretation:
-  - Correctness is good and the path runs without `--enforce-eager`.
-  - It is not a C32 performance win versus decode-only direct CSA:
+    - Correctness is good and the path runs without `--enforce-eager`.
+    - It is not a C32 performance win versus decode-only direct CSA:
     `890.041` output tok/s versus `891.152`, and `35.013` ms mean TPOT versus
     `34.945`.
-  - The likely reason is that prefill direct CSA removes `csa_translate_pack`
+    - The likely reason is that prefill direct CSA removes `csa_translate_pack`
     but bypasses OPUS for CSA prefill attention. The launch saved is smaller
     than the OPUS-to-Triton attention cost for this workload.
-  - Keep the flag as an experimental probe. Do not enable it by default unless
+    - Keep the flag as an experimental probe. Do not enable it by default unless
     there is an OPUS direct-index variant or a faster direct-prefill kernel.
 
 ATOM compress-first decode ordering probe:
@@ -7736,50 +7736,50 @@ ATOM compress-first decode ordering probe:
 - Tested `VLLM_ROCM_DSV4_ATOM_COMPRESS_FIRST=1` as a flag-only experiment.
 - This path is intentionally limited to pure decode in
   `DeepseekV4ROCMAiterMLAAttention.attention_impl`:
-  - mixed/prefill batches still use the existing validated path;
-  - pure decode calls the main compressor before the Q/KV attention path,
+    - mixed/prefill batches still use the existing validated path;
+    - pure decode calls the main compressor before the Q/KV attention path,
     matching the order used by ATOM's modeling file more closely;
-  - the path requires ATOM QK/RoPE, ATOM main compressor, ATOM attention, no
+    - the path requires ATOM QK/RoPE, ATOM main compressor, ATOM attention, no
     aux streams, and an ATOM-enabled layer/ratio.
 - Accuracy validation:
-  - server: `MAX_NUM_SEQS=256`, `MAX_NUM_BATCHED_TOKENS=8192`,
+    - server: `MAX_NUM_SEQS=256`, `MAX_NUM_BATCHED_TOKENS=8192`,
     `MAX_MODEL_LEN=8192`, `ENFORCE_EAGER=0`,
     `VLLM_ROCM_DSV4_ATOM_COMPRESS_FIRST=1`, no `--enforce-eager`.
-  - command: unchanged `bash lmeval.sh`.
-  - result file:
+    - command: unchanged `bash lmeval.sh`.
+    - result file:
     `results_deepseekprographmtp_aitermhc_nobreakablecudagraph/deepseek-ai__DeepSeek-V4-Pro/results_2026-06-19T18-38-39.854574.json`.
-  - log: `runlogs/compress-first-lmeval.log`.
-  - GSM8K flexible-extract exact match: `0.9545 ± 0.0057`.
-  - GSM8K strict-match exact match: `0.9553 ± 0.0057`.
+    - log: `runlogs/compress-first-lmeval.log`.
+    - GSM8K flexible-extract exact match: `0.9545 ± 0.0057`.
+    - GSM8K strict-match exact match: `0.9553 ± 0.0057`.
 - Fresh C32 deployment benchmark after restarting the server:
-  - server: `MAX_NUM_SEQS=32`, `MAX_NUM_BATCHED_TOKENS=8192`,
+    - server: `MAX_NUM_SEQS=32`, `MAX_NUM_BATCHED_TOKENS=8192`,
     `MAX_MODEL_LEN=8192`, `ENFORCE_EAGER=0`,
     `VLLM_ROCM_DSV4_ATOM_COMPRESS_FIRST=1`, no `--enforce-eager`.
-  - command:
+    - command:
     `RESULT_DIR=./bench-compress-first-c32`
     `RESULT_PREFIX=compress-first`
     `CONCURRENCIES=32`
     `bash benchmarkvllm.sh`.
-  - result file: `bench-compress-first-c32/compress-first-C32.json`.
-  - completed `320`, failed `0`.
-  - output throughput `889.928 tok/s`.
-  - total throughput `1783.332 tok/s`.
-  - mean TTFT `1037.166 ms`.
-  - mean TPOT `34.972 ms`.
-  - median TPOT `34.943 ms`.
-  - p90 TPOT `35.439 ms`.
-  - p99 TPOT `35.804 ms`.
-  - log: `runlogs/compress-first-c32-benchmark.log`.
+    - result file: `bench-compress-first-c32/compress-first-C32.json`.
+    - completed `320`, failed `0`.
+    - output throughput `889.928 tok/s`.
+    - total throughput `1783.332 tok/s`.
+    - mean TTFT `1037.166 ms`.
+    - mean TPOT `34.972 ms`.
+    - median TPOT `34.943 ms`.
+    - p90 TPOT `35.439 ms`.
+    - p99 TPOT `35.804 ms`.
+    - log: `runlogs/compress-first-c32-benchmark.log`.
 - Interpretation:
-  - Compress-first decode ordering is accuracy-safe and graph-compatible in
+    - Compress-first decode ordering is accuracy-safe and graph-compatible in
     this configuration.
-  - It is not a throughput win versus the current decode-direct default:
+    - It is not a throughput win versus the current decode-direct default:
     `889.928` output tok/s versus `891.152` for
     `bench-csa-direct-c32/csa-direct-C32.json`.
-  - It is also below the historical best saved C32 run
+    - It is also below the historical best saved C32 run
     `bench-sparsemla/revert-compressor-aux-nomtp-C32.json`
     (`926.061` output tok/s, `33.503 ms` mean TPOT).
-  - Keep `VLLM_ROCM_DSV4_ATOM_COMPRESS_FIRST` default-off for now. The result
+    - Keep `VLLM_ROCM_DSV4_ATOM_COMPRESS_FIRST` default-off for now. The result
     says ordering alone is not the missing performance lever; larger gains
     likely require reducing metadata/conversion overhead and/or introducing a
     true ROCm DSV4 unified cache/backend contract instead of reordering the
@@ -7790,336 +7790,336 @@ Scheduler visibility for ROCm ATOM unified KV prefix:
 - Added a small scheduler-config preservation fix for the vLLM-owned ATOM
   unified-KV path.
 - Background:
-  - ROCm DSV4 ATOM unified mode emits `DeepseekV4AtomMLAAttentionSpec` for
+    - ROCm DSV4 ATOM unified mode emits `DeepseekV4AtomMLAAttentionSpec` for
     compressed attention layers when
     `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1`.
-  - That spec models the vLLM-owned tensor as:
+    - That spec models the vLLM-owned tensor as:
     `[fixed SWA prefix][paged compressed tail]`.
-  - Worker allocation and reshape already account for the fixed prefix through
+    - Worker allocation and reshape already account for the fixed prefix through
     `KVCacheTensor.fixed_prefix_size` and by skipping the prefix before
     reshaping the paged tail.
-  - `generate_scheduler_kv_cache_config()` still collapsed
+    - `generate_scheduler_kv_cache_config()` still collapsed
     `UniformTypeKVCacheSpecs` by taking an arbitrary first per-layer spec.
     If that first spec was a regular `MLAAttentionSpec`, the scheduler-facing
     config forgot the ATOM fixed-prefix metadata.
 - Change:
-  - Register `DeepseekV4AtomMLAAttentionSpec` with the same KV-cache manager
+    - Register `DeepseekV4AtomMLAAttentionSpec` with the same KV-cache manager
     and uniform base as regular `MLAAttentionSpec`.
-  - Add `_representative_scheduler_spec()` so collapsed scheduler specs prefer
+    - Add `_representative_scheduler_spec()` so collapsed scheduler specs prefer
     an ATOM spec when one exists in the per-layer group.
 - Validation:
-  - `python3 -m py_compile` passed for:
-    - `vllm/v1/core/kv_cache_utils.py`
-    - `vllm/v1/core/single_type_kv_cache_manager.py`
-    - `vllm/v1/kv_cache_interface.py`
-    - `vllm/v1/worker/gpu/attn_utils.py`
-    - `vllm/v1/worker/utils.py`
-  - Registry smoke:
-    - regular `MLAAttentionSpec` and `DeepseekV4AtomMLAAttentionSpec` both
+    - `python3 -m py_compile` passed for:
+        - `vllm/v1/core/kv_cache_utils.py`
+        - `vllm/v1/core/single_type_kv_cache_manager.py`
+        - `vllm/v1/kv_cache_interface.py`
+        - `vllm/v1/worker/gpu/attn_utils.py`
+        - `vllm/v1/worker/utils.py`
+    - Registry smoke:
+        - regular `MLAAttentionSpec` and `DeepseekV4AtomMLAAttentionSpec` both
       resolve to uniform base `FullAttentionSpec`;
-    - a collection containing one regular MLA spec and one ATOM MLA spec is
+        - a collection containing one regular MLA spec and one ATOM MLA spec is
       accepted as uniform.
-  - Scheduler smoke:
-    - a synthetic `KVCacheConfig` with a mixed `UniformTypeKVCacheSpecs` group
+    - Scheduler smoke:
+        - a synthetic `KVCacheConfig` with a mixed `UniformTypeKVCacheSpecs` group
       now collapses to `DeepseekV4AtomMLAAttentionSpec` and preserves
       `atom_swa_prefix_bytes`.
-  - Real startup smoke:
-    - server command: `MAX_NUM_SEQS=32`, `MAX_NUM_BATCHED_TOKENS=8192`,
+    - Real startup smoke:
+        - server command: `MAX_NUM_SEQS=32`, `MAX_NUM_BATCHED_TOKENS=8192`,
       `MAX_MODEL_LEN=8192`, `ENFORCE_EAGER=0`, default
       `launchdeepseekgraph.sh` ATOM flags.
-    - log: `runlogs/scheduler-atom-prefix-smoke-server.log`.
-    - scheduler reported KV cache size `45,496` tokens and max concurrency
+        - log: `runlogs/scheduler-atom-prefix-smoke-server.log`.
+        - scheduler reported KV cache size `45,496` tokens and max concurrency
       `5.55x` for `8192` tokens/request.
-    - ATOM state allocation completed on all TP ranks.
-    - vLLM-owned unified KV views bound with `active_layers=61`,
+        - ATOM state allocation completed on all TP ranks.
+        - vLLM-owned unified KV views bound with `active_layers=61`,
       `ratio_counts={128: 31, 4: 30}`, `num_blocks=57732`,
       `swa_pages=4096`, `win_with_spec=128`, `head_dim=512`, and
       `dtype=torch.bfloat16`.
-    - graph capture finished and `/health` returned healthy.
+        - graph capture finished and `/health` returned healthy.
 - Interpretation:
-  - This does not change the worker allocation that the successful accuracy and
+    - This does not change the worker allocation that the successful accuracy and
     C32 benchmark already used.
-  - It closes a correctness gap in the vLLM scheduler-facing cache metadata,
+    - It closes a correctness gap in the vLLM scheduler-facing cache metadata,
     moving the integration closer to a real ROCm DSV4 unified KV cache spec
     rather than a purely side-band model-state view.
-  - CUDA remains unaffected because the ATOM spec is only emitted by the
+    - CUDA remains unaffected because the ATOM spec is only emitted by the
     DeepSeek-V4 attention layer under ROCm plus the ATOM unified-KV flag.
 
 Post scheduler-prefix fix accuracy and C32 benchmark:
 
 - Accuracy command: unchanged `/app/atomdsv4/lmeval.sh`.
 - Server command:
-  - `MAX_NUM_SEQS=256`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - `ENFORCE_EAGER=0`
-  - default `/app/atomdsv4/launchdeepseekgraph.sh` ATOM flags.
+    - `MAX_NUM_SEQS=256`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - `ENFORCE_EAGER=0`
+    - default `/app/atomdsv4/launchdeepseekgraph.sh` ATOM flags.
 - Accuracy log:
-  - `runlogs/post-scheduler-prefix-lmeval.log`.
-  - result file:
+    - `runlogs/post-scheduler-prefix-lmeval.log`.
+    - result file:
     `results_deepseekprographmtp_aitermhc_nobreakablecudagraph/deepseek-ai__DeepSeek-V4-Pro/results_2026-06-19T19-04-45.509823.json`.
 - Accuracy result:
-  - GSM8K flexible-extract exact_match: `0.9545 +/- 0.0057`.
-  - GSM8K strict-match exact_match: `0.9553 +/- 0.0057`.
+    - GSM8K flexible-extract exact_match: `0.9545 +/- 0.0057`.
+    - GSM8K strict-match exact_match: `0.9553 +/- 0.0057`.
 - Fresh benchmark server command:
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - `ENFORCE_EAGER=0`
-  - default `/app/atomdsv4/launchdeepseekgraph.sh` ATOM flags.
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - `ENFORCE_EAGER=0`
+    - default `/app/atomdsv4/launchdeepseekgraph.sh` ATOM flags.
 - Benchmark command:
-  - `RESULT_DIR=./bench-post-scheduler-prefix-c32`
-  - `RESULT_PREFIX=post-scheduler-prefix`
-  - `CONCURRENCIES=32`
-  - `/app/atomdsv4/benchmarkvllm.sh`.
+    - `RESULT_DIR=./bench-post-scheduler-prefix-c32`
+    - `RESULT_PREFIX=post-scheduler-prefix`
+    - `CONCURRENCIES=32`
+    - `/app/atomdsv4/benchmarkvllm.sh`.
 - Benchmark files:
-  - server log: `runlogs/post-scheduler-prefix-c32-server.log`.
-  - benchmark log: `runlogs/post-scheduler-prefix-c32-benchmark.log`.
-  - result file:
+    - server log: `runlogs/post-scheduler-prefix-c32-server.log`.
+    - benchmark log: `runlogs/post-scheduler-prefix-c32-benchmark.log`.
+    - result file:
     `bench-post-scheduler-prefix-c32/post-scheduler-prefix-C32.json`.
 - Benchmark result:
-  - completed `320`, failed `0`.
-  - output throughput `890.326 tok/s`.
-  - total throughput `1784.129 tok/s`.
-  - mean TTFT `992.152 ms`.
-  - mean TPOT `35.001 ms`.
-  - median TPOT `34.904 ms`.
-  - p90 TPOT `35.481 ms`.
-  - p99 TPOT `35.623 ms`.
+    - completed `320`, failed `0`.
+    - output throughput `890.326 tok/s`.
+    - total throughput `1784.129 tok/s`.
+    - mean TTFT `992.152 ms`.
+    - mean TPOT `35.001 ms`.
+    - median TPOT `34.904 ms`.
+    - p90 TPOT `35.481 ms`.
+    - p99 TPOT `35.623 ms`.
 - Interpretation:
-  - Accuracy remains inside the target range after preserving ATOM fixed-prefix
+    - Accuracy remains inside the target range after preserving ATOM fixed-prefix
     metadata in the scheduler-facing KV-cache config.
-  - C32 throughput is effectively flat against the previous CSA-direct decode
+    - C32 throughput is effectively flat against the previous CSA-direct decode
     default run (`891.152` output tok/s, `34.945 ms` mean TPOT), which is
     expected because this fix mainly corrects scheduler metadata visibility
     rather than changing the hot attention/compressor kernels.
-  - The historical best saved C32 run remains
+    - The historical best saved C32 run remains
     `bench-sparsemla/revert-compressor-aux-nomtp-C32.json`
     (`926.061` output tok/s, `33.503 ms` mean TPOT).
 
 Worker kernel-block-size propagation for ROCm ATOM unified KV:
 
 - Follow-up gap:
-  - `generate_scheduler_kv_cache_config()` now preserves the ATOM fixed-prefix
+    - `generate_scheduler_kv_cache_config()` now preserves the ATOM fixed-prefix
     metadata when collapsing a `UniformTypeKVCacheSpecs` group.
-  - `prepare_kernel_block_sizes()` in the worker still picked an arbitrary
+    - `prepare_kernel_block_sizes()` in the worker still picked an arbitrary
     layer spec from `UniformTypeKVCacheSpecs` to decide how to dispatch block
     splitting. If that arbitrary spec was a regular `MLAAttentionSpec`, the
     worker-side setup did not explicitly see the prefix-aware
     `DeepseekV4AtomMLAAttentionSpec`.
 - Change:
-  - Add `_representative_worker_spec()` in `vllm/v1/worker/utils.py`.
-  - When a uniform group contains any `DeepseekV4AtomMLAAttentionSpec`, worker
+    - Add `_representative_worker_spec()` in `vllm/v1/worker/utils.py`.
+    - When a uniform group contains any `DeepseekV4AtomMLAAttentionSpec`, worker
     block-size preparation now uses that spec as the representative instead of
     relying on insertion order.
 - Validation:
-  - `python3 -m py_compile vllm/v1/worker/utils.py` passed.
-  - Direct helper smoke forced a regular MLA spec to appear before an ATOM MLA
+    - `python3 -m py_compile vllm/v1/worker/utils.py` passed.
+    - Direct helper smoke forced a regular MLA spec to appear before an ATOM MLA
     spec and confirmed `_representative_worker_spec()` returned
     `DeepseekV4AtomMLAAttentionSpec` with the expected
     `atom_swa_prefix_bytes`.
-  - `prepare_kernel_block_sizes()` smoke with the same mixed uniform group and
+    - `prepare_kernel_block_sizes()` smoke with the same mixed uniform group and
     a dummy backend returned `[128]`, proving the real worker helper executes
     correctly with the ATOM representative.
 - Interpretation:
-  - This is another integration hardening change for the vLLM-owned ATOM
+    - This is another integration hardening change for the vLLM-owned ATOM
     unified KV path.
-  - It is not expected to move C32 throughput by itself; it prevents a metadata
+    - It is not expected to move C32 throughput by itself; it prevents a metadata
     visibility mismatch as the custom ROCm DSV4 KV-cache spec is used in more
     worker/backend code.
 
 Order-independent mixed ATOM/non-ATOM MLA grouping:
 
 - Follow-up gap:
-  - `DeepseekV4AtomMLAAttentionSpec` is a subclass of `MLAAttentionSpec`, and
+    - `DeepseekV4AtomMLAAttentionSpec` is a subclass of `MLAAttentionSpec`, and
     the registry intentionally lets it participate in full-attention uniform
     type grouping.
-  - `is_kv_cache_spec_uniform()` probes concrete uniformity by calling
+    - `is_kv_cache_spec_uniform()` probes concrete uniformity by calling
     `values[0].merge(values)`.
-  - With a regular `MLAAttentionSpec` first and an ATOM spec second,
+    - With a regular `MLAAttentionSpec` first and an ATOM spec second,
     `MLAAttentionSpec.merge()` accepted the mixed set and returned a regular
     MLA spec. That incorrectly classified the whole group as one concrete KV
     spec and could drop the per-layer ATOM SWA prefix metadata.
-  - With the ATOM spec first, `DeepseekV4AtomMLAAttentionSpec.merge()` rejected
+    - With the ATOM spec first, `DeepseekV4AtomMLAAttentionSpec.merge()` rejected
     the mixed set, so behavior was insertion-order dependent.
 - Change:
-  - `is_kv_cache_spec_uniform()` now returns `False` when a set mixes
+    - `is_kv_cache_spec_uniform()` now returns `False` when a set mixes
     `DeepseekV4AtomMLAAttentionSpec` with non-ATOM specs.
-  - Pure ATOM groups are still allowed to use the concrete uniform path.
-  - Mixed regular/ATOM MLA groups now consistently fall through to
+    - Pure ATOM groups are still allowed to use the concrete uniform path.
+    - Mixed regular/ATOM MLA groups now consistently fall through to
     `UniformTypeKVCacheSpecs`, where the per-layer ATOM spec and prefix fields
     are preserved.
 - Validation:
-  - Synthetic smoke before the fix:
-    - regular-first mixed group: `is_kv_cache_spec_uniform(...) == True`;
-    - atom-first mixed group: `False`.
-  - Synthetic smoke after the fix:
-    - regular-first mixed group: `False`;
-    - atom-first mixed group: `False`;
-    - `get_kv_cache_groups()` returns one `UniformTypeKVCacheSpecs` group and
+    - Synthetic smoke before the fix:
+        - regular-first mixed group: `is_kv_cache_spec_uniform(...) == True`;
+        - atom-first mixed group: `False`.
+    - Synthetic smoke after the fix:
+        - regular-first mixed group: `False`;
+        - atom-first mixed group: `False`;
+        - `get_kv_cache_groups()` returns one `UniformTypeKVCacheSpecs` group and
       preserves `DeepseekV4AtomMLAAttentionSpec` for the ATOM layer.
-  - All-ATOM control remains concrete-uniform: `True`.
+    - All-ATOM control remains concrete-uniform: `True`.
 - Interpretation:
-  - This closes an order-dependent correctness hole in the ROCm unified-KV spec
+    - This closes an order-dependent correctness hole in the ROCm unified-KV spec
     path.
-  - CUDA remains unaffected unless the ROCm-only ATOM spec is present.
+    - CUDA remains unaffected unless the ROCm-only ATOM spec is present.
 
 Fixed-prefix memory sizing for ATOM unified KV:
 
 - Follow-up gap:
-  - The ATOM unified-KV allocation has two parts:
+    - The ATOM unified-KV allocation has two parts:
     `[fixed SWA prefix][paged compressed tail]`.
-  - The allocator path handled this layout for the main validated multi-group
+    - The allocator path handled this layout for the main validated multi-group
     DeepSeek-V4 case, but related sizing paths still reasoned mostly in terms
     of scalable page bytes.
-  - A single `UniformTypeKVCacheSpecs` group containing an ATOM spec could take
+    - A single `UniformTypeKVCacheSpecs` group containing an ATOM spec could take
     the legacy single-group allocation path and allocate only
     `page_size * num_blocks`, dropping `atom_swa_prefix_bytes`.
-  - `num_gpu_blocks_override` also adjusted effective memory using only
+    - `num_gpu_blocks_override` also adjusted effective memory using only
     `override * bytes_per_block`, which is incomplete when fixed prefixes are
     present.
 - Change:
-  - Add `_split_deepseek_v4_atom_layers()` and
+    - Add `_split_deepseek_v4_atom_layers()` and
     `_deepseek_v4_atom_layout_bytes()` so allocation, bytes-per-block, and
     max-memory estimation share the same ATOM-aware layout split.
-  - Route any `UniformTypeKVCacheSpecs` group containing
+    - Route any `UniformTypeKVCacheSpecs` group containing
     `DeepseekV4AtomMLAAttentionSpec` through the ATOM-aware allocator, including
     the single-group case.
-  - `_max_memory_usage_bytes_from_groups()` now computes:
+    - `_max_memory_usage_bytes_from_groups()` now computes:
     `fixed_prefix_bytes + max_tail_pages * bytes_per_block`.
-  - `num_gpu_blocks_override` effective memory now includes the fixed prefix:
+    - `num_gpu_blocks_override` effective memory now includes the fixed prefix:
     `fixed_prefix_bytes + override * bytes_per_block`.
 - Validation:
-  - Synthetic single-group mixed regular MLA + ATOM MLA config:
-    - bytes per block: `128`;
-    - max memory for `max_model_len=16`: `612`
+    - Synthetic single-group mixed regular MLA + ATOM MLA config:
+        - bytes per block: `128`;
+        - max memory for `max_model_len=16`: `612`
       (`100 + 4 * 128`);
-    - allocated `num_blocks=7` from `available_memory=1000`;
-    - regular tensor: `448` bytes, fixed prefix `0`;
-    - ATOM tensor: `548` bytes, fixed prefix `100`.
-  - Synthetic `num_gpu_blocks_override=4` through `get_kv_cache_configs()`:
-    - override log reports old block count as `77`, i.e.
+        - allocated `num_blocks=7` from `available_memory=1000`;
+        - regular tensor: `448` bytes, fixed prefix `0`;
+        - ATOM tensor: `548` bytes, fixed prefix `100`.
+    - Synthetic `num_gpu_blocks_override=4` through `get_kv_cache_configs()`:
+        - override log reports old block count as `77`, i.e.
       `(10000 - 100) // 128`, after subtracting the fixed prefix;
-    - generated `num_blocks=4`;
-    - regular tensor: `256` bytes;
-    - ATOM tensor: `356` bytes, fixed prefix `100`.
+        - generated `num_blocks=4`;
+        - regular tensor: `256` bytes;
+        - ATOM tensor: `356` bytes, fixed prefix `100`.
 - Interpretation:
-  - This makes fixed-prefix SWA storage part of the KV cache sizing contract,
+    - This makes fixed-prefix SWA storage part of the KV cache sizing contract,
     not only a post-allocation model-state binding detail.
-  - It is another prerequisite for a real ROCm DSV4 unified KV allocation while
+    - It is another prerequisite for a real ROCm DSV4 unified KV allocation while
     still leaving CUDA untouched unless the ATOM spec is emitted.
 
 Capacity reporting for ATOM fixed-prefix KV cache:
 
 - Follow-up gap:
-  - `get_max_concurrency_for_kv_cache_config()` used a generic memory formula:
+    - `get_max_concurrency_for_kv_cache_config()` used a generic memory formula:
     `num_layer_per_group * max_memory_usage_bytes(...)`.
-  - For ATOM unified KV this double-counted mixed per-layer uniform specs and
+    - For ATOM unified KV this double-counted mixed per-layer uniform specs and
     treated fixed SWA prefix bytes as if they scaled with scheduler blocks.
-  - Synthetic example before the fix:
-    - `num_blocks=4`, semantic `block_size=4`, `max_model_len=16`;
-    - one request needs four scheduler blocks;
-    - old capacity reported `10` tokens and `0.67x` concurrency.
+    - Synthetic example before the fix:
+        - `num_blocks=4`, semantic `block_size=4`, `max_model_len=16`;
+        - one request needs four scheduler blocks;
+        - old capacity reported `10` tokens and `0.67x` concurrency.
 - Change:
-  - Add an ATOM-only capacity path selected when a
+    - Add an ATOM-only capacity path selected when a
     `DeepseekV4AtomMLAAttentionSpec` is present.
-  - Capacity now computes required scheduler blocks per request from each KV
+    - Capacity now computes required scheduler blocks per request from each KV
     group's scalable tail pages, subtracting `atom_swa_prefix_bytes` from ATOM
     specs.
-  - Max concurrency is limited by the largest per-group scalable block demand.
-  - Non-ATOM configs keep the existing generic capacity formula.
+    - Max concurrency is limited by the largest per-group scalable block demand.
+    - Non-ATOM configs keep the existing generic capacity formula.
 - Validation:
-  - Synthetic mixed regular MLA + ATOM MLA config with
+    - Synthetic mixed regular MLA + ATOM MLA config with
     `num_gpu_blocks_override=4` now logs:
-    - GPU KV cache size `16` tokens;
-    - maximum concurrency for `16` tokens/request: `1.00x`.
-  - Synthetic two-group config with an ATOM-containing group plus a smaller
+        - GPU KV cache size `16` tokens;
+        - maximum concurrency for `16` tokens/request: `1.00x`.
+    - Synthetic two-group config with an ATOM-containing group plus a smaller
     block-size regular group also reports `16` tokens and `1.00x`, confirming
     the limiter is the max scalable block demand across groups.
 - Interpretation:
-  - This makes startup capacity reporting consistent with vLLM's scheduler
+    - This makes startup capacity reporting consistent with vLLM's scheduler
     block-table lifetime while excluding ATOM's fixed SWA prefix from scalable
     block accounting.
-  - It does not affect CUDA or non-ATOM KV cache configs.
+    - It does not affect CUDA or non-ATOM KV cache configs.
 
 Real startup smoke after fixed-prefix sizing/capacity changes:
 
 - Server command:
-  - `MAX_NUM_SEQS=32`
-  - `MAX_NUM_BATCHED_TOKENS=8192`
-  - `MAX_MODEL_LEN=8192`
-  - `ENFORCE_EAGER=0`
-  - default `/app/atomdsv4/launchdeepseekgraph.sh` ATOM flags.
+    - `MAX_NUM_SEQS=32`
+    - `MAX_NUM_BATCHED_TOKENS=8192`
+    - `MAX_MODEL_LEN=8192`
+    - `ENFORCE_EAGER=0`
+    - default `/app/atomdsv4/launchdeepseekgraph.sh` ATOM flags.
 - Log:
-  - `runlogs/post-kv-capacity-smoke-server.log`.
+    - `runlogs/post-kv-capacity-smoke-server.log`.
 - Observed:
-  - ATOM request-state buffers allocated on all TP ranks:
+    - ATOM request-state buffers allocated on all TP ranks:
     `active_layers=61`, `csa_layers=30`, `hca_layers=31`,
     `win_with_spec=128`.
-  - Engine reported KV capacity:
-    - GPU KV cache size `115,435` tokens;
-    - max concurrency for `8,192` tokens/request: `14.09x`.
-  - vLLM-owned unified KV views bound on all TP ranks:
+    - Engine reported KV capacity:
+        - GPU KV cache size `115,435` tokens;
+        - max concurrency for `8,192` tokens/request: `14.09x`.
+    - vLLM-owned unified KV views bound on all TP ranks:
     `active_layers=61`, `ratio_counts={128: 31, 4: 30}`,
     `num_blocks=57732`, `swa_pages=4096`, `win_with_spec=128`,
     `head_dim=512`, `dtype=torch.bfloat16`.
-  - Piecewise and full graph capture completed.
-  - `/health` returned HTTP `200`.
+    - Piecewise and full graph capture completed.
+    - `/health` returned HTTP `200`.
 - Interpretation:
-  - The fixed-prefix KV sizing and ATOM capacity path are compatible with the
+    - The fixed-prefix KV sizing and ATOM capacity path are compatible with the
     real DSV4 C32 startup path, graph capture, and ModelState binding.
-  - No `--enforce-eager` was used.
+    - No `--enforce-eager` was used.
 
 Projected empty-group robustness for ATOM capacity:
 
 - Follow-up gap:
-  - Pipeline-parallel projection can preserve KV cache groups whose layer list
+    - Pipeline-parallel projection can preserve KV cache groups whose layer list
     is empty on a particular worker.
-  - The ATOM-specific capacity path originally used `max(...)` over each
+    - The ATOM-specific capacity path originally used `max(...)` over each
     group's per-layer specs and would fail if an empty projected group was
     present before or beside an ATOM-containing group.
 - Change:
-  - Skip empty `KVCacheGroupSpec.layer_names` entries in the ATOM capacity
+    - Skip empty `KVCacheGroupSpec.layer_names` entries in the ATOM capacity
     helper.
 - Validation:
-  - Synthetic KV config with one empty `UniformTypeKVCacheSpecs` group and one
+    - Synthetic KV config with one empty `UniformTypeKVCacheSpecs` group and one
     ATOM-containing group reports capacity `(16, 1.0)` for
     `num_blocks=4`, `block_size=4`, `max_model_len=16`.
 - Interpretation:
-  - This keeps the ATOM capacity path compatible with vLLM's existing PP group
+    - This keeps the ATOM capacity path compatible with vLLM's existing PP group
     projection behavior.
 
 Unit coverage for ATOM fixed-prefix KV cache contract:
 
 - Added focused CPU tests in `tests/v1/core/test_kv_cache_utils.py`.
 - Coverage:
-  - mixed regular MLA + ATOM MLA uniformity is insertion-order independent;
-  - pure ATOM groups still remain concrete-uniform;
-  - ATOM capacity excludes fixed SWA prefix bytes from scalable scheduler-block
+    - mixed regular MLA + ATOM MLA uniformity is insertion-order independent;
+    - pure ATOM groups still remain concrete-uniform;
+    - ATOM capacity excludes fixed SWA prefix bytes from scalable scheduler-block
     accounting;
-  - ATOM capacity skips empty projected KV groups;
-  - single `UniformTypeKVCacheSpecs` groups containing an ATOM spec allocate
+    - ATOM capacity skips empty projected KV groups;
+    - single `UniformTypeKVCacheSpecs` groups containing an ATOM spec allocate
     `KVCacheTensor.fixed_prefix_size`;
-  - `num_gpu_blocks_override` keeps the fixed prefix and clamps only the
+    - `num_gpu_blocks_override` keeps the fixed prefix and clamps only the
     scalable paged tail;
-  - scheduler KV-cache config generation preserves the ATOM MLA spec instead
+    - scheduler KV-cache config generation preserves the ATOM MLA spec instead
     of collapsing mixed regular/ATOM MLA groups to regular MLA;
-  - worker kernel-block-size dispatch uses the ATOM MLA spec as the
+    - worker kernel-block-size dispatch uses the ATOM MLA spec as the
     representative for mixed regular/ATOM MLA `UniformTypeKVCacheSpecs`.
 - Validation:
-  - `pytest -q tests/v1/core/test_kv_cache_utils.py -k 'atom_mla or scheduler_kv_cache_config_preserves_atom_spec'`:
+    - `pytest -q tests/v1/core/test_kv_cache_utils.py -k 'atom_mla or scheduler_kv_cache_config_preserves_atom_spec'`:
     `6 passed`.
-  - `pytest -q tests/v1/worker/test_utils.py -k 'representative_worker_spec or bind_kv_cache'`:
+    - `pytest -q tests/v1/worker/test_utils.py -k 'representative_worker_spec or bind_kv_cache'`:
     `4 passed`.
-  - `pytest -q tests/v1/core/test_kv_cache_utils.py`:
+    - `pytest -q tests/v1/core/test_kv_cache_utils.py`:
     `64 passed`.
-  - `python3 -m py_compile vllm/v1/core/kv_cache_utils.py vllm/v1/core/single_type_kv_cache_manager.py vllm/v1/kv_cache_interface.py vllm/v1/worker/gpu/attn_utils.py vllm/v1/worker/utils.py tests/v1/core/test_kv_cache_utils.py tests/v1/worker/test_utils.py`:
+    - `python3 -m py_compile vllm/v1/core/kv_cache_utils.py vllm/v1/core/single_type_kv_cache_manager.py vllm/v1/kv_cache_interface.py vllm/v1/worker/gpu/attn_utils.py vllm/v1/worker/utils.py tests/v1/core/test_kv_cache_utils.py tests/v1/worker/test_utils.py`:
     passed.
-  - `git diff --check`: passed.
+    - `git diff --check`: passed.
 - Interpretation:
-  - The fixed-prefix KV cache behavior is now covered by durable unit tests,
+    - The fixed-prefix KV cache behavior is now covered by durable unit tests,
     not just ad hoc smoke scripts.
-  - The ATOM spec now survives the scheduler and worker representative-spec
+    - The ATOM spec now survives the scheduler and worker representative-spec
     collapse points that previously could erase ROCm-only fixed-prefix layout
     metadata when a group also contained regular MLA.
 
@@ -8128,26 +8128,26 @@ Unit coverage for ATOM fixed-prefix KV cache contract:
 Runtime configuration:
 
 - Server command:
-  - `MAX_NUM_SEQS=256 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192 ENFORCE_EAGER=0 bash ./launchdeepseekgraph.sh`
-  - log: `/app/atomdsv4/runlogs/current-no-eager-server.log`
+    - `MAX_NUM_SEQS=256 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192 ENFORCE_EAGER=0 bash ./launchdeepseekgraph.sh`
+    - log: `/app/atomdsv4/runlogs/current-no-eager-server.log`
 - Relevant launch defaults:
-  - `VLLM_USE_V2_MODEL_RUNNER=1`
-  - `VLLM_ROCM_DSV4_ATOM_STATE=1`
-  - `VLLM_ROCM_DSV4_ATOM_STATE_ALLOC=1`
-  - `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV=1`
-  - `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1`
-  - `VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR=1`
-  - `VLLM_ROCM_DSV4_ATOM_ATTENTION=1`
-  - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-  - no `--enforce-eager`.
+    - `VLLM_USE_V2_MODEL_RUNNER=1`
+    - `VLLM_ROCM_DSV4_ATOM_STATE=1`
+    - `VLLM_ROCM_DSV4_ATOM_STATE_ALLOC=1`
+    - `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV=1`
+    - `VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1`
+    - `VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR=1`
+    - `VLLM_ROCM_DSV4_ATOM_ATTENTION=1`
+    - `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+    - no `--enforce-eager`.
 - Startup evidence:
-  - `enforce_eager=False`
-  - `GPU KV cache size: 114,218 tokens`
-  - `Maximum concurrency for 8,192 tokens per request: 13.94x`
-  - `Bound ROCm DSV4 ATOM unified KV views from vLLM-owned KV storage`
+    - `enforce_eager=False`
+    - `GPU KV cache size: 114,218 tokens`
+    - `Maximum concurrency for 8,192 tokens per request: 13.94x`
+    - `Bound ROCm DSV4 ATOM unified KV views from vLLM-owned KV storage`
     with `ratio_counts={128: 31, 4: 30}`, `num_blocks=57123`,
     `swa_pages=32768`, `head_dim=512`, `dtype=torch.bfloat16`.
-  - graph capture finished for all TP workers.
+    - graph capture finished for all TP workers.
 
 Accuracy validation:
 
@@ -8156,12 +8156,12 @@ Accuracy validation:
 - Result file prefix:
   `/app/atomdsv4/results_deepseekprographmtp_aitermhc_nobreakablecudagraph/deepseek-ai__DeepSeek-V4-Pro/`.
 - GSM8K result:
-  - flexible-extract exact match: `0.9507 +/- 0.0060`.
-  - strict-match exact match: `0.9515 +/- 0.0059`.
+    - flexible-extract exact match: `0.9507 +/- 0.0060`.
+    - strict-match exact match: `0.9515 +/- 0.0059`.
 - Interpretation:
-  - This passes the requested `0.95 +/- 0.01` GSM8K accuracy band while
+    - This passes the requested `0.95 +/- 0.01` GSM8K accuracy band while
     running without `--enforce-eager`.
-  - First-inference JIT warnings show the current path exercised ATOM-related
+    - First-inference JIT warnings show the current path exercised ATOM-related
     metadata/compressor/prefill kernels including
     `_update_compressor_states_kernel`, `_v4_paged_prefill_indices_kernel`,
     and `_csa_translate_pack_kernel`.
@@ -8171,29 +8171,29 @@ Fresh C32 benchmark after server restart:
 - The lmeval server was stopped first; `/health` went down before launching the
   benchmark server.
 - Benchmark server command:
-  - `MAX_NUM_SEQS=32 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192 ENFORCE_EAGER=0 bash ./launchdeepseekgraph.sh`
-  - log: `/app/atomdsv4/runlogs/current-c32-benchmark-server.log`
+    - `MAX_NUM_SEQS=32 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192 ENFORCE_EAGER=0 bash ./launchdeepseekgraph.sh`
+    - log: `/app/atomdsv4/runlogs/current-c32-benchmark-server.log`
 - Startup evidence:
-  - `GPU KV cache size: 115,435 tokens`.
-  - `Maximum concurrency for 8,192 tokens per request: 14.09x`.
-  - `Bound ROCm DSV4 ATOM unified KV views from vLLM-owned KV storage`
+    - `GPU KV cache size: 115,435 tokens`.
+    - `Maximum concurrency for 8,192 tokens per request: 14.09x`.
+    - `Bound ROCm DSV4 ATOM unified KV views from vLLM-owned KV storage`
     with `ratio_counts={128: 31, 4: 30}`, `num_blocks=57732`,
     `swa_pages=4096`, `head_dim=512`, `dtype=torch.bfloat16`.
-  - graph capture finished for all TP workers.
+    - graph capture finished for all TP workers.
 - Benchmark command:
-  - `RESULT_PREFIX=ds-v4-pro-current-noeager-atomkv CONCURRENCIES=32 bash ./benchmarkvllm.sh`
-  - log: `/app/atomdsv4/runlogs/current-c32-benchmark.log`
-  - result:
+    - `RESULT_PREFIX=ds-v4-pro-current-noeager-atomkv CONCURRENCIES=32 bash ./benchmarkvllm.sh`
+    - log: `/app/atomdsv4/runlogs/current-c32-benchmark.log`
+    - result:
     `/app/atomdsv4/bench-sparsemla/ds-v4-pro-current-noeager-atomkv-C32.json`
 - C32 result:
-  - successful requests: `320`
-  - failed requests: `0`
-  - output throughput: `890.587 tok/s`
-  - total token throughput: `1784.653 tok/s`
-  - mean TPOT: `34.982 ms`
-  - median TPOT: `34.922 ms`
-  - p99 TPOT: `35.797 ms`
-  - mean TTFT: `998.798 ms`
+    - successful requests: `320`
+    - failed requests: `0`
+    - output throughput: `890.587 tok/s`
+    - total token throughput: `1784.653 tok/s`
+    - mean TPOT: `34.982 ms`
+    - median TPOT: `34.922 ms`
+    - p99 TPOT: `35.797 ms`
+    - mean TTFT: `998.798 ms`
 
 Comparison with saved C32 runs:
 
@@ -8238,8 +8238,8 @@ Follow-up gap:
 Experiment:
 
 - Temporarily defaulted `/app/atomdsv4/launchdeepseekgraph.sh` to:
-  - `VLLM_ROCM_DSV4_USE_AITER_MHC=${VLLM_ROCM_DSV4_USE_AITER_MHC:-1}`
-  - `VLLM_ROCM_DSV4_USE_AITER_HC_HEAD=${VLLM_ROCM_DSV4_USE_AITER_HC_HEAD:-1}`
+    - `VLLM_ROCM_DSV4_USE_AITER_MHC=${VLLM_ROCM_DSV4_USE_AITER_MHC:-1}`
+    - `VLLM_ROCM_DSV4_USE_AITER_HC_HEAD=${VLLM_ROCM_DSV4_USE_AITER_HC_HEAD:-1}`
 - vLLM already selects `_forward_unfused_post_pre` when `HAS_AITER_MHC=True`,
   so enabling the flag switches the ROCm block path to separate aiter
   `MHCPreOp` and `MHCPostOp`, which is the closest ATOM-compatible path
@@ -8248,73 +8248,73 @@ Experiment:
 Validation:
 
 - Import check with both flags set:
-  - `HAS_AITER_MHC=True`
-  - `HAS_AITER_HC_HEAD=True`
-  - `HAS_TILELANG=True`
+    - `HAS_AITER_MHC=True`
+    - `HAS_AITER_HC_HEAD=True`
+    - `HAS_TILELANG=True`
 - `python3 -m py_compile vllm/model_executor/layers/mhc.py vllm/models/deepseek_v4/amd/model.py` passed.
 - Direct DSV4-shaped torch-op smoke on GPU passed:
-  - `torch.ops.vllm.mhc_pre_aiter` on `(1, 4, 7168)` bf16 residual and
+    - `torch.ops.vllm.mhc_pre_aiter` on `(1, 4, 7168)` bf16 residual and
     `(24, 28672)` fp32 `hc_fn`.
-  - `torch.ops.vllm.mhc_post_aiter` on the returned `post/comb`.
-  - `torch.ops.vllm.hc_head_aiter` on the resulting `(1, 4, 7168)` bf16 HC
+    - `torch.ops.vllm.mhc_post_aiter` on the returned `post/comb`.
+    - `torch.ops.vllm.hc_head_aiter` on the resulting `(1, 4, 7168)` bf16 HC
     residual and `(4, 28672)` fp32 final-head `hc_fn`.
-  - Outputs:
-    - `post`: `(1, 4, 1)`, fp32.
-    - `comb`: `(1, 4, 4)`, fp32.
-    - pre output: `(1, 7168)`, bf16.
-    - post output: `(1, 4, 7168)`, bf16.
-    - HC-head output: `(1, 7168)`, bf16.
+    - Outputs:
+        - `post`: `(1, 4, 1)`, fp32.
+        - `comb`: `(1, 4, 4)`, fp32.
+        - pre output: `(1, 7168)`, bf16.
+        - post output: `(1, 4, 7168)`, bf16.
+        - HC-head output: `(1, 7168)`, bf16.
 - No-eager server startup with the aiter MHC/HC-head defaults passed:
-  - command:
+    - command:
     `MAX_NUM_SEQS=256 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192 ENFORCE_EAGER=0 bash ./launchdeepseekgraph.sh`
-  - log: `/app/atomdsv4/runlogs/aiter-mhc-noeager-server.log`
-  - `enforce_eager=False`
-  - V2 model runner
-  - ATOM state buffers allocated
-  - ATOM unified KV views bound from vLLM-owned storage:
+    - log: `/app/atomdsv4/runlogs/aiter-mhc-noeager-server.log`
+    - `enforce_eager=False`
+    - V2 model runner
+    - ATOM state buffers allocated
+    - ATOM unified KV views bound from vLLM-owned storage:
     `num_blocks=57180`, `swa_pages=32768`,
     `ratio_counts={128: 31, 4: 30}`.
-  - graph capture completed and `/health` returned `200`.
+    - graph capture completed and `/health` returned `200`.
 - Accuracy with unchanged `/app/atomdsv4/lmeval.sh` failed:
-  - log: `/app/atomdsv4/runlogs/aiter-mhc-noeager-lmeval.log`
-  - result:
+    - log: `/app/atomdsv4/runlogs/aiter-mhc-noeager-lmeval.log`
+    - result:
     `/app/atomdsv4/results_deepseekprographmtp_aitermhc_nobreakablecudagraph/deepseek-ai__DeepSeek-V4-Pro/results_2026-06-19T20-22-53.418611.json`
-  - GSM8K flexible-extract exact match: `0.1357 +/- 0.0094`.
-  - GSM8K strict-match exact match: `0.1228 +/- 0.0090`.
+    - GSM8K flexible-extract exact match: `0.1357 +/- 0.0094`.
+    - GSM8K strict-match exact match: `0.1228 +/- 0.0090`.
 - Reference comparison:
-  - `torch.ops.vllm.mhc_pre_tilelang` and `mhc_post_tilelang` match the
+    - `torch.ops.vllm.mhc_pre_tilelang` and `mhc_post_tilelang` match the
     vLLM torch reference closely on random `(8, 4, 7168)` DSV4-shaped inputs:
     `tile_y` max abs diff `0.0078125`, mean `3.57e-06`;
     `tile_out` max abs diff `0.03125`, mean `7.44e-06`.
-  - `torch.ops.vllm.mhc_pre_aiter` and `mhc_post_aiter` differ materially on
+    - `torch.ops.vllm.mhc_pre_aiter` and `mhc_post_aiter` differ materially on
     the same shape:
     `pre_y` max abs diff `0.453125`, mean `0.03897`;
     `post_out` max abs diff `0.9375`, mean `0.06889`.
 - HC-head-only isolation:
-  - Server command:
+    - Server command:
     `MAX_NUM_SEQS=256 MAX_NUM_BATCHED_TOKENS=8192 MAX_MODEL_LEN=8192 ENFORCE_EAGER=0 VLLM_ROCM_DSV4_USE_AITER_MHC=0 VLLM_ROCM_DSV4_USE_AITER_HC_HEAD=1 bash ./launchdeepseekgraph.sh`
-  - Server log:
+    - Server log:
     `/app/atomdsv4/runlogs/aiter-hchead-only-noeager-server.log`
-  - Startup passed with no `--enforce-eager`, V2 runner, breakable CUDA graph,
+    - Startup passed with no `--enforce-eager`, V2 runner, breakable CUDA graph,
     ATOM state allocation, vLLM-owned unified KV binding, and graph capture.
-  - Accuracy command: unchanged `/app/atomdsv4/lmeval.sh`.
-  - Accuracy log:
+    - Accuracy command: unchanged `/app/atomdsv4/lmeval.sh`.
+    - Accuracy log:
     `/app/atomdsv4/runlogs/aiter-hchead-only-noeager-lmeval.log`
-  - Result:
+    - Result:
     `/app/atomdsv4/results_deepseekprographmtp_aitermhc_nobreakablecudagraph/deepseek-ai__DeepSeek-V4-Pro/results_2026-06-19T20-38-12.415293.json`
-  - GSM8K flexible-extract exact match: `0.9348 +/- 0.0068`.
-  - GSM8K strict-match exact match: `0.9356 +/- 0.0068`.
-  - Interpretation:
+    - GSM8K flexible-extract exact match: `0.9348 +/- 0.0068`.
+    - GSM8K strict-match exact match: `0.9356 +/- 0.0068`.
+    - Interpretation:
     final HC-head aiter alone is much less destructive than full aiter MHC,
     but still misses the requested `0.95 +/- 0.01` accuracy band.
 - HC-head standalone observations:
-  - `torch.ops.vllm.hc_head_aiter` with real final-head scale shape `[1]`
+    - `torch.ops.vllm.hc_head_aiter` with real final-head scale shape `[1]`
     runs in isolated calls for tested batch sizes `M=1,2,4,8,16,32,64`.
-  - In a mixed-process comparison that calls tilelang HC-head and then aiter
+    - In a mixed-process comparison that calls tilelang HC-head and then aiter
     HC-head, the process hit a floating point exception. This suggests the
     compact aiter HC-head path is not safe to mix with the current tilelang
     HC-head test path without more isolation.
-  - In an aiter-only comparison against the scalar PyTorch HC-head formula on
+    - In an aiter-only comparison against the scalar PyTorch HC-head formula on
     `(16, 4, 7168)`, `hc_head_aiter` differed materially:
     max abs diff `0.4453125`, mean `0.02690`, relative max `0.0963`.
 
@@ -8323,8 +8323,8 @@ Interpretation:
 - AITER MHC/HC-head is runnable, but it is not accuracy-safe in the current
   vLLM integration.
 - The launch defaults were restored to:
-  - `VLLM_ROCM_DSV4_USE_AITER_MHC=${VLLM_ROCM_DSV4_USE_AITER_MHC:-0}`
-  - `VLLM_ROCM_DSV4_USE_AITER_HC_HEAD=${VLLM_ROCM_DSV4_USE_AITER_HC_HEAD:-0}`
+    - `VLLM_ROCM_DSV4_USE_AITER_MHC=${VLLM_ROCM_DSV4_USE_AITER_MHC:-0}`
+    - `VLLM_ROCM_DSV4_USE_AITER_HC_HEAD=${VLLM_ROCM_DSV4_USE_AITER_HC_HEAD:-0}`
 - The flags remain available for explicit experiments, but the validated
   no-eager accuracy/performance path should keep using tilelang MHC until the
   AITER-vs-reference mismatch is understood.

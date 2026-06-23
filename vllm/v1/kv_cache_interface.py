@@ -492,9 +492,7 @@ class DeepseekV4AtomMLAAttentionSpec(MLAAttentionSpec):
         atom_compressed_kv_dtype_set = set(
             spec.atom_compressed_kv_dtype for spec in specs
         )
-        atom_compressed_layout_set = set(
-            spec.atom_compressed_layout for spec in specs
-        )
+        atom_compressed_layout_set = set(spec.atom_compressed_layout for spec in specs)
         atom_compressed_scale_dtype_set = set(
             spec.atom_compressed_scale_dtype for spec in specs
         )

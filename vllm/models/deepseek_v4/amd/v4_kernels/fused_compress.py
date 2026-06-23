@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -52,7 +54,6 @@ return).
 """
 
 import os
-from typing import Optional
 
 import torch
 import triton
@@ -342,8 +343,7 @@ def _fused_compress_attn_kernel(
             TOKEN_DATA_SIZE: tl.constexpr = 576
             TOKEN_SCALE_DIM: tl.constexpr = 8
             token_data_base = (
-                physical_block * kv_cache_block_stride
-                + slot_in_block * TOKEN_DATA_SIZE
+                physical_block * kv_cache_block_stride + slot_in_block * TOKEN_DATA_SIZE
             )
             token_scale_base = (
                 physical_block * kv_cache_block_stride
@@ -530,10 +530,9 @@ def fused_compress_attn(
     cos_cache: torch.Tensor,  # [max_seq, ..., rope_head_dim/2] bf16/fp16
     sin_cache: torch.Tensor,  # same shape
     # KV cache scatter
-    kv_cache: Optional[
-        torch.Tensor
-    ],  # bf16: [NB, k_per_block, head_dim] / fp8: same shape, fp8
-    block_tables: Optional[torch.Tensor],  # [bs, max_blocks_per_seq] int32
+    kv_cache: torch.Tensor
+    | None,  # bf16: [NB, k_per_block, head_dim] / fp8: same shape, fp8
+    block_tables: torch.Tensor | None,  # [bs, max_blocks_per_seq] int32
     k_per_block: int,
     # Geometry
     overlap: bool,
@@ -542,14 +541,13 @@ def fused_compress_attn(
     rope_head_dim: int,
     # FP8 quant fusion (Indexer-inner Compressor path)
     quant: bool = False,
-    cache_scale: Optional[
-        torch.Tensor
-    ] = None,  # fp32 [NB, k_per_block]; required when quant=True
+    cache_scale: torch.Tensor
+    | None = None,  # fp32 [NB, k_per_block]; required when quant=True
     use_ue8m0: bool = True,  # round scale to power-of-2 (UE8M0); only when quant=True
-    quant_group_size: Optional[int] = None,
+    quant_group_size: int | None = None,
     preshuffle: bool = True,  # MFMA 16x16 preshuffled FP8 layout; only when quant=True
-    fp8_max: Optional[float] = None,  # E4M3 max; required when quant=True
-    kv_slot_mapping: Optional[torch.Tensor] = None,  # direct scatter slots
+    fp8_max: float | None = None,  # E4M3 max; required when quant=True
+    kv_slot_mapping: torch.Tensor | None = None,  # direct scatter slots
     packed_fp8_ds_mla: bool = False,
 ) -> None:
     """Batched fused per-source-position pool + RMSNorm + RoPE + cache scatter,
@@ -587,17 +585,14 @@ def fused_compress_attn(
     # launcher (less per-call Python overhead at the boundary).
     # ------------------------------------------------------------------
     _shape_key = (head_dim, rope_head_dim, ratio, overlap)
-    _effective_quant_group_size = head_dim if quant_group_size is None else int(
-        quant_group_size
+    _effective_quant_group_size = (
+        head_dim if quant_group_size is None else int(quant_group_size)
     )
     _flydsl_shape_ok = _shape_key in _FLYDSL_SUPPORTED
     # Keep V4-Pro HCA on the Triton path by default. The aiter/FlyDSL HCA
     # branch was graph-stable in deployment config, but measured slightly
     # slower at C32/O1024 than the existing stable ATOM path.
-    _hca_flat_layout = (
-        _shape_key == (512, 64, 128, False)
-        and k_per_block == 1
-    )
+    _hca_flat_layout = _shape_key == (512, 64, 128, False) and k_per_block == 1
     _flydsl_use = (
         flydsl_fused_compress_attn is not None
         and _ATOM_FUSED_COMPRESS_FLYDSL_MODE in ("auto", "always")
@@ -675,13 +670,13 @@ def fused_compress_attn(
     state_size = kv_state.shape[
         1
     ]  # ring buffer modulo (≥ K_pool; V4-Pro: K_pool + max_spec_steps spec / K_pool non-spec)
-    assert (
-        kv_in.dim() == 2 and kv_in.shape[1] == dim_full
-    ), f"kv_in {kv_in.shape}, expected [*, {dim_full}]"
+    assert kv_in.dim() == 2 and kv_in.shape[1] == dim_full, (
+        f"kv_in {kv_in.shape}, expected [*, {dim_full}]"
+    )
     assert score_in.shape == kv_in.shape
-    assert (
-        state_size >= K_pool and kv_state.shape[2] == dim_full
-    ), f"kv_state {kv_state.shape}, expected [*, ≥{K_pool}, {dim_full}]"
+    assert state_size >= K_pool and kv_state.shape[2] == dim_full, (
+        f"kv_state {kv_state.shape}, expected [*, ≥{K_pool}, {dim_full}]"
+    )
     assert score_state.shape == kv_state.shape
     assert ape.shape == (ratio, dim_full)
     assert rms_weight.shape == (head_dim,)
@@ -712,8 +707,7 @@ def fused_compress_attn(
     has_bt = block_tables is not None
     has_slot_mapping = kv_slot_mapping is not None
     assert not (has_bt and has_slot_mapping), (
-        "fused_compress_attn expects either block_tables or kv_slot_mapping, "
-        "not both."
+        "fused_compress_attn expects either block_tables or kv_slot_mapping, not both."
     )
     if packed_fp8_ds_mla:
         _validate_packed_fp8_ds_mla_fused_compress_args(
@@ -742,12 +736,12 @@ def fused_compress_attn(
         assert has_bt or has_slot_mapping, (
             "quant=True requires block_tables or kv_slot_mapping for slot resolution"
         )
-        assert (
-            kv_cache.dtype != torch.bfloat16
-        ), f"quant=True expects an FP8/uint8 kv_cache; got {kv_cache.dtype}"
-        assert (
-            cache_scale is not None and cache_scale.dtype == torch.float32
-        ), "quant=True requires `cache_scale` (fp32 scale view)"
+        assert kv_cache.dtype != torch.bfloat16, (
+            f"quant=True expects an FP8/uint8 kv_cache; got {kv_cache.dtype}"
+        )
+        assert cache_scale is not None and cache_scale.dtype == torch.float32, (
+            "quant=True requires `cache_scale` (fp32 scale view)"
+        )
         if quant_group_size is None:
             quant_group_size = head_dim
         assert head_dim % quant_group_size == 0, (
@@ -769,12 +763,12 @@ def fused_compress_attn(
                 assert cache_scale.shape[2] >= scale_groups
         assert fp8_max is not None and fp8_max > 0
         if preshuffle:
-            assert (
-                head_dim % 16 == 0
-            ), f"preshuffle requires head_dim%16==0, got {head_dim}"
-            assert (
-                k_per_block % 16 == 0
-            ), f"preshuffle requires k_per_block%16==0, got {k_per_block}"
+            assert head_dim % 16 == 0, (
+                f"preshuffle requires head_dim%16==0, got {head_dim}"
+            )
+            assert k_per_block % 16 == 0, (
+                f"preshuffle requires k_per_block%16==0, got {k_per_block}"
+            )
 
     BLOCK_D = triton.next_power_of_2(head_dim)
     HALF_ROPE = rope_head_dim // 2
@@ -873,15 +867,15 @@ def fused_compress_attn_reference(
     rms_eps: float,
     cos_cache: torch.Tensor,
     sin_cache: torch.Tensor,
-    kv_cache: Optional[torch.Tensor],
-    block_tables: Optional[torch.Tensor],
+    kv_cache: torch.Tensor | None,
+    block_tables: torch.Tensor | None,
     k_per_block: int,
     overlap: bool,
     ratio: int,
     head_dim: int,
     rope_head_dim: int,
     out_dtype: torch.dtype = torch.bfloat16,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """Pure-PyTorch reference equivalent of `fused_compress_attn` (plan path).
 
     Returns `[num_compress, head_dim]` BF16 in plan order. None if num_compress=0.

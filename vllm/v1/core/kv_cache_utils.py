@@ -930,9 +930,7 @@ def _contains_deepseek_v4_atom_spec(kv_cache_config: KVCacheConfig) -> bool:
     )
 
 
-def _scalable_blocks_per_request(
-    vllm_config: VllmConfig, spec: KVCacheSpec
-) -> int:
+def _scalable_blocks_per_request(vllm_config: VllmConfig, spec: KVCacheSpec) -> int:
     max_memory_bytes = (
         spec.max_memory_usage_bytes(vllm_config) - spec.fixed_prefix_size_bytes
     )
@@ -1685,9 +1683,7 @@ def _get_kv_cache_groups_uniform_groups(
         full_page_sizes = full_mla_spec.get_page_sizes()
         max_full_page_size = max(full_page_sizes)
         max_swa_page_size = max(
-            page_size
-            for group in swa_mla_specs
-            for page_size in group.get_page_sizes()
+            page_size for group in swa_mla_specs for page_size in group.get_page_sizes()
         )
         if max_swa_page_size > max_full_page_size:
             for layer_spec in full_mla_spec.kv_cache_specs.values():
@@ -2263,8 +2259,7 @@ def get_kv_cache_configs(
             assert scalable_size >= 0
             assert scalable_size % num_blocks_old == 0
             tensor.size = (
-                fixed_prefix_size
-                + scalable_size // num_blocks_old * min_num_blocks
+                fixed_prefix_size + scalable_size // num_blocks_old * min_num_blocks
             )
 
         if len(kv_cache_config.kv_cache_groups) > 0:

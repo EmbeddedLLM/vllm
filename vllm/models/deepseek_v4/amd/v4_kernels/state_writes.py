@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -51,10 +53,11 @@ LAST `actual_count` tokens of seq `i` in `kv` / `positions`, no shared
 GPU index buffer needed (no DMA race window).
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
-import os
 
 _ATOM_VARIABLE_STATE_UPDATE = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_VARIABLE_STATE_UPDATE", "0") == "1"
@@ -166,14 +169,14 @@ def swa_write(
     assert swa_kv.dim() == 3, f"swa_kv must be [S, C, D], got {swa_kv.shape}"
     T, head_dim = kv.shape
     assert positions.shape[0] >= T, f"positions {positions.shape[0]} < kv T={T}"
-    assert (
-        swa_kv.shape[1] == cache_size
-    ), f"swa_kv ring dim {swa_kv.shape[1]} != cache_size {cache_size}"
+    assert swa_kv.shape[1] == cache_size, (
+        f"swa_kv ring dim {swa_kv.shape[1]} != cache_size {cache_size}"
+    )
     assert swa_kv.shape[2] == head_dim
     assert kv.is_contiguous() and swa_kv.is_contiguous()
-    assert (
-        bs > 0 and write_per_batch > 0
-    ), f"bs={bs}, write_per_batch={write_per_batch} must be positive"
+    assert bs > 0 and write_per_batch > 0, (
+        f"bs={bs}, write_per_batch={write_per_batch} must be positive"
+    )
 
     # head_dim is small (e.g. 64-128 for V4 SWA layer), so a single Triton
     # block per token covers it. Round up to the next power of two for tl.
@@ -387,9 +390,9 @@ def update_compressor_states(
     assert ape.dim() == 2 and ape.shape[0] == ratio
     K_pool = (2 if overlap else 1) * ratio  # pool window (lower bound)
     state_size = kv_state.shape[1]  # ring buffer modulo (≥ K_pool)
-    assert (
-        state_size >= K_pool
-    ), f"kv_state.shape[1]={state_size}, must be ≥ K_pool={K_pool}"
+    assert state_size >= K_pool, (
+        f"kv_state.shape[1]={state_size}, must be ≥ K_pool={K_pool}"
+    )
     dim = kv.shape[1]
     assert write_plan.dim() == 2 and write_plan.shape[1] == 4
     assert write_plan.dtype == torch.int32

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -28,8 +30,8 @@ Caller (per-seq loop) gets `cu_compress_cpu` for slicing the kernel's flat
 output `[num_compress, head_dim]` back to per-seq chunks.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable, Tuple
 
 import numpy as np
 import torch
@@ -62,7 +64,7 @@ class CompressPlan:
 def make_compress_plans(
     extend_lens_cpu: np.ndarray,
     context_lens_cpu: np.ndarray,
-    unique_ratios_overlap: Iterable[Tuple[int, bool]],
+    unique_ratios_overlap: Iterable[tuple[int, bool]],
     *,
     plan_buffers: dict,
     decode_capacity_per_ratio: dict[int, int] | None = None,

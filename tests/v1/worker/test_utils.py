@@ -16,8 +16,12 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.attn_utils import _reshape_kv_cache
-from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
-from vllm.v1.worker.utils import _representative_worker_spec, bind_kv_cache
+from vllm.v1.worker.utils import (
+    AttentionGroup,
+    KVBlockZeroer,
+    _representative_worker_spec,
+    bind_kv_cache,
+)
 
 
 class _PostBindLayer:
@@ -71,12 +75,8 @@ def test_bind_kv_cache_calls_post_bind_hook(default_vllm_config):
 
     bind_kv_cache(kv_cache, ctx, runner_kv_caches)
 
-    assert ctx["layers.0.self_attn"].post_bind_calls == [
-        kv_cache["layers.0.self_attn"]
-    ]
-    assert ctx["layers.1.self_attn"].post_bind_calls == [
-        kv_cache["layers.1.self_attn"]
-    ]
+    assert ctx["layers.0.self_attn"].post_bind_calls == [kv_cache["layers.0.self_attn"]]
+    assert ctx["layers.1.self_attn"].post_bind_calls == [kv_cache["layers.1.self_attn"]]
     assert runner_kv_caches == [
         kv_cache["layers.0.self_attn"],
         kv_cache["layers.1.self_attn"],
@@ -501,7 +501,9 @@ def test_kv_block_zeroer_groups_nonuniform_atom_page_sizes():
         ),
     ]
     context = {
-        "regular": SimpleNamespace(kv_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16)),
+        "regular": SimpleNamespace(
+            kv_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16)
+        ),
         "atom": SimpleNamespace(kv_cache=torch.zeros((2, 4, 584), dtype=torch.uint8)),
     }
 
@@ -690,8 +692,9 @@ def test_deepseek_v4_post_bind_exposes_mixed_atom_split_views(monkeypatch):
     scale_bytes = torch.float32.itemsize
     row_bytes = head_dim * torch.float8_e4m3fnuz.itemsize
     tail_pages = num_blocks * k_per_block
-    raw = torch.zeros(prefix_bytes + tail_pages * (row_bytes + scale_bytes),
-                      dtype=torch.int8)
+    raw = torch.zeros(
+        prefix_bytes + tail_pages * (row_bytes + scale_bytes), dtype=torch.int8
+    )
     raw.view(torch.float32)[(prefix_bytes + row_bytes) // torch.float32.itemsize] = 3.5
     tail = torch.as_strided(
         raw[prefix_bytes:].view(torch.float8_e4m3fnuz),

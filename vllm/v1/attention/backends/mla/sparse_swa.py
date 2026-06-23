@@ -114,9 +114,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         # ATOM's DSV4 path uses block_size=128 -> 32.
         # TODO(yifan): make SWA block size automatically determined and configurable.
         self.block_size = (
-            max(1, cache_config.block_size // 4)
-            if _rocm_atom_dsv4_enabled()
-            else 64
+            max(1, cache_config.block_size // 4) if _rocm_atom_dsv4_enabled() else 64
         )
         # uint8: legacy FlashMLA UE8M0 paged layout. bfloat16 / float8_e4m3fn:
         # FlashInfer contiguous full-cache layout.

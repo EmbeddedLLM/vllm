@@ -18,12 +18,8 @@ except Exception:
 _ATOM_USE_AITER_FUSED_CLAMP_ACT_MUL = (
     os.environ.get("ATOM_USE_AITER_FUSED_CLAMP_ACT_MUL", "0") == "1"
 )
-_ROCM_DSV4_ATOM_STATE_ENABLED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_STATE", "0") == "1"
-)
-_ROCM_DSV4_USE_AITER_MHC = (
-    os.environ.get("VLLM_ROCM_DSV4_USE_AITER_MHC", "0") == "1"
-)
+_ROCM_DSV4_ATOM_STATE_ENABLED = os.environ.get("VLLM_ROCM_DSV4_ATOM_STATE", "0") == "1"
+_ROCM_DSV4_USE_AITER_MHC = os.environ.get("VLLM_ROCM_DSV4_USE_AITER_MHC", "0") == "1"
 _ROCM_DSV4_USE_AITER_MHC_FUSE_NORM = (
     os.environ.get("VLLM_ROCM_DSV4_USE_AITER_MHC_FUSE_NORM", "0") == "1"
 )
@@ -389,11 +385,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         norm_eps: float = 0.0,
         use_aiter_pre: bool = False,
     ):
-        mhc_pre = (
-            torch.ops.vllm.mhc_pre_aiter
-            if use_aiter_pre
-            else self.mhc_pre
-        )
+        mhc_pre = torch.ops.vllm.mhc_pre_aiter if use_aiter_pre else self.mhc_pre
         post_mix, res_mix, layer_input = mhc_pre(
             residual=x,
             fn=hc_fn,

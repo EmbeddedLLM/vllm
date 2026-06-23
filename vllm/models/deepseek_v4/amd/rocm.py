@@ -21,8 +21,8 @@ from vllm.models.deepseek_v4.amd.v4_kernels import (
     inverse_rope_inplace,
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_decode_kv_splits,
-    sparse_attn_v4_paged_decode_split_workspace_mode,
     sparse_attn_v4_paged_decode_split_kv,
+    sparse_attn_v4_paged_decode_split_workspace_mode,
     sparse_attn_v4_paged_prefill,
     sparse_attn_v4_paged_prefill_split_kv,
     swa_write,
@@ -113,19 +113,15 @@ _ATOM_PREFILL_ALLOW_MIXED = (
 _ATOM_PREFILL_INDEX_REUSE = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_PREFILL_INDEX_REUSE", "1") != "0"
 )
-_ATOM_PREFILL_SYNC = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC", "0") == "1"
-)
+_ATOM_PREFILL_SYNC = os.environ.get("VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC", "0") == "1"
 _ATOM_PREFILL_SYNC_STAGES = frozenset(
     part.strip().lower()
-    for part in os.environ.get(
-        "VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_STAGES", ""
-    ).split(",")
+    for part in os.environ.get("VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_STAGES", "").split(",")
     if part.strip()
 )
-_ATOM_PREFILL_SYNC_KIND = os.environ.get(
-    "VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_KIND", "device"
-).strip().lower()
+_ATOM_PREFILL_SYNC_KIND = (
+    os.environ.get("VLLM_ROCM_DSV4_ATOM_PREFILL_SYNC_KIND", "device").strip().lower()
+)
 _ATOM_PROBE_INDICES_ONLY = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_PROBE_INDICES_ONLY", "0") == "1"
 )
@@ -141,18 +137,14 @@ _ATOM_DECODE_HCA_INDEX_REUSE = (
 _ATOM_RETURN_FALSE_AT_ENTRY = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_RETURN_FALSE_AT_ENTRY", "0") == "1"
 )
-_ATOM_COMPRESS_FIRST = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_COMPRESS_FIRST", "0") == "1"
-)
+_ATOM_COMPRESS_FIRST = os.environ.get("VLLM_ROCM_DSV4_ATOM_COMPRESS_FIRST", "0") == "1"
 _ATOM_MAIN_COMPRESSOR_ENABLED = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR", "0") == "1"
 )
 _ATOM_DEBUG_COMPRESS_FIRST = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_DEBUG_COMPRESS_FIRST", "0") == "1"
 )
-_ATOM_PROFILE_DECODE = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE", "0") == "1"
-)
+_ATOM_PROFILE_DECODE = os.environ.get("VLLM_ROCM_DSV4_ATOM_PROFILE_DECODE", "0") == "1"
 _ATOM_PROFILE_METADATA = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA", "0") == "1"
 )
@@ -162,15 +154,11 @@ _ATOM_PROFILE_PREFILL = (
 _ATOM_PROFILE_PREFILL_TRACE = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL_TRACE", "0") == "1"
 )
-_ATOM_PROFILE_PREFILL_MIN_T = _env_int(
-    "VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL_MIN_T", 0
-)
+_ATOM_PROFILE_PREFILL_MIN_T = _env_int("VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL_MIN_T", 0)
 _ATOM_PROFILE_PREFILL_MIN_TOKEN_OFFSET = _env_int(
     "VLLM_ROCM_DSV4_ATOM_PROFILE_PREFILL_MIN_TOKEN_OFFSET", 0
 )
-_ATOM_PROFILE_EVERY = max(
-    1, _env_int("VLLM_ROCM_DSV4_ATOM_PROFILE_EVERY", 200)
-)
+_ATOM_PROFILE_EVERY = max(1, _env_int("VLLM_ROCM_DSV4_ATOM_PROFILE_EVERY", 200))
 _ATOM_PROFILE_LAYER = _env_int("VLLM_ROCM_DSV4_ATOM_PROFILE_LAYER", 0)
 _ATOM_DECODE_KV_SPLITS = _env_int("VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS", 0)
 _ATOM_SPLIT_KV_DECODE = (
@@ -261,7 +249,7 @@ def _resolve_atom_kv_views(
             split_swa_kv = unified_kv[: int(atom_state.swa_pages)].view(
                 max_num_reqs,
                 int(atom_state.win_with_spec),
-                int(getattr(attn, "head_dim")),
+                int(attn.head_dim),
             )
 
     return _AtomKVViews(
@@ -817,7 +805,9 @@ def _gather_plain_k_cache_kernel(
         pos = start_pos + i
         block_in_seq = pos // block_size
         pos_in_block = pos - block_in_seq * block_size
-        physical_block = tl.load(block_table + batch_idx * block_table_stride + block_in_seq)
+        physical_block = tl.load(
+            block_table + batch_idx * block_table_stride + block_in_seq
+        )
 
         vals = tl.load(
             k_cache
@@ -828,10 +818,7 @@ def _gather_plain_k_cache_kernel(
             other=0.0,
         )
         tl.store(
-            out
-            + batch_idx * out_stride_b
-            + (offset + i) * out_stride_m
-            + d_offsets,
+            out + batch_idx * out_stride_b + (offset + i) * out_stride_m + d_offsets,
             vals,
             mask=d_mask,
         )
@@ -945,9 +932,7 @@ def _copy_hca_to_atom_indices(
     if T == 0 or max_hca_len <= 0:
         return
     block_n = 128
-    _copy_hca_to_atom_indices_kernel[
-        (T, triton.cdiv(max_hca_len, block_n))
-    ](
+    _copy_hca_to_atom_indices_kernel[(T, triton.cdiv(max_hca_len, block_n))](
         src_indices,
         src_indptr,
         dst_indices,
@@ -1806,9 +1791,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                         else None
                     ),
                     csa_block_capacity=csa_block_capacity,
-                    csa_window_size=(
-                        self.window_size
-                    ),
+                    csa_window_size=(self.window_size),
                 )
                 used_split_kv_decode = True
                 return
@@ -1895,20 +1878,15 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                     int(hca_block_table.data_ptr()),
                     int(hca_block_table.storage_offset()),
                     int(hca_block_table.stride(0)),
-                    int(hca_block_table.stride(1))
-                    if hca_block_table.dim() > 1
-                    else 1,
+                    int(hca_block_table.stride(1)) if hca_block_table.dim() > 1 else 1,
                     tuple(int(x) for x in hca_block_table.shape),
                     int(hca_block_capacity),
                     common_indices_key,
                 )
-            hca_valid = (
-                not write_hca_head
-                or (
-                    hca_index_reuse_enabled
-                    and cache is not None
-                    and cache.hca_indices_key == hca_key
-                )
+            hca_valid = not write_hca_head or (
+                hca_index_reuse_enabled
+                and cache is not None
+                and cache.hca_indices_key == hca_key
             )
             if common_valid and hca_valid:
                 if cache is not None:
@@ -1997,16 +1975,10 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 else 0
             )
             ensure_decode_indices(
-                hca_block_table=attn_metadata.block_table
-                if fused_hca_index
-                else None,
+                hca_block_table=attn_metadata.block_table if fused_hca_index else None,
                 hca_block_capacity=hca_block_capacity,
             )
-        if (
-            profile
-            and not _atom_skip_decode_index_write()
-            and not index_write_launched
-        ):
+        if profile and not _atom_skip_decode_index_write() and not index_write_launched:
             _atom_profile_sync()
             # Keep the following translate/kernel timings bounded without
             # attributing cache-hit sync to the shared decode-index writer.
@@ -2090,11 +2062,11 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                             f"layer={self._atom_layer_id} "
                             f"ratio={self.compress_ratio} T={T} "
                             f"swa_only={swa_only} path=hca_force_swa_skip_kernel "
-                                    f"index_ms={index_ms:.3f} "
-                                    f"translate_ms={translate_ms:.3f} "
-                                    f"kernel_ms=0.000 "
-                                    f"{split_profile}"
-                                    f"idx_hits={getattr(cache, 'common_indices_hits', 0)} "
+                            f"index_ms={index_ms:.3f} "
+                            f"translate_ms={translate_ms:.3f} "
+                            f"kernel_ms=0.000 "
+                            f"{split_profile}"
+                            f"idx_hits={getattr(cache, 'common_indices_hits', 0)} "
                             f"idx_writes={getattr(cache, 'common_indices_writes', 0)} "
                             f"hca_hits={getattr(cache, 'hca_indices_hits', 0)} "
                             f"hca_writes={getattr(cache, 'hca_indices_writes', 0)} "
@@ -2111,11 +2083,11 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                         f"layer={self._atom_layer_id} ratio={self.compress_ratio} "
                         f"T={T} swa_only={swa_only} "
                         f"path={'split_kv_kernel' if used_split_kv_decode else 'hca_force_swa_kernel'} "
-                                f"index_ms={index_ms:.3f} "
-                                f"translate_ms={translate_ms:.3f} "
-                                f"kernel_ms={kernel_ms:.3f} "
-                                f"{split_profile}"
-                                f"idx_hits={getattr(cache, 'common_indices_hits', 0)} "
+                        f"index_ms={index_ms:.3f} "
+                        f"translate_ms={translate_ms:.3f} "
+                        f"kernel_ms={kernel_ms:.3f} "
+                        f"{split_profile}"
+                        f"idx_hits={getattr(cache, 'common_indices_hits', 0)} "
                         f"idx_writes={getattr(cache, 'common_indices_writes', 0)} "
                         f"hca_hits={getattr(cache, 'hca_indices_hits', 0)} "
                         f"hca_writes={getattr(cache, 'hca_indices_writes', 0)} "
@@ -2146,8 +2118,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                     hca_indices=hca_indices,
                     hca_indptr=hca_indptr,
                     swa_pages=int(atom_state.swa_pages),
-                    hca_block_capacity=attn_metadata.block_size
-                    // self.compress_ratio,
+                    hca_block_capacity=attn_metadata.block_size // self.compress_ratio,
                     T=T,
                 )
             kv_indices = hca_indices
@@ -2171,10 +2142,10 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                     "ATOM_PROFILE_DECODE "
                     f"layer={self._atom_layer_id} ratio={self.compress_ratio} "
                     f"T={T} swa_only={swa_only} path=skip_kernel "
-                            f"index_ms={index_ms:.3f} translate_ms={translate_ms:.3f} "
-                            f"kernel_ms=0.000 "
-                            f"{split_profile}"
-                            f"idx_hits={getattr(cache, 'common_indices_hits', 0)} "
+                    f"index_ms={index_ms:.3f} translate_ms={translate_ms:.3f} "
+                    f"kernel_ms=0.000 "
+                    f"{split_profile}"
+                    f"idx_hits={getattr(cache, 'common_indices_hits', 0)} "
                     f"idx_writes={getattr(cache, 'common_indices_writes', 0)} "
                     f"hca_hits={getattr(cache, 'hca_indices_hits', 0)} "
                     f"hca_writes={getattr(cache, 'hca_indices_writes', 0)} "
@@ -2200,11 +2171,11 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 "ATOM_PROFILE_DECODE "
                 f"layer={self._atom_layer_id} ratio={self.compress_ratio} "
                 f"T={T} swa_only={swa_only} "
-                        f"path={'split_kv_kernel' if used_split_kv_decode else 'atom_kernel'} "
-                        f"index_ms={index_ms:.3f} translate_ms={translate_ms:.3f} "
-                        f"kernel_ms={kernel_ms:.3f} "
-                        f"{split_profile}"
-                        f"idx_hits={getattr(cache, 'common_indices_hits', 0)} "
+                f"path={'split_kv_kernel' if used_split_kv_decode else 'atom_kernel'} "
+                f"index_ms={index_ms:.3f} translate_ms={translate_ms:.3f} "
+                f"kernel_ms={kernel_ms:.3f} "
+                f"{split_profile}"
+                f"idx_hits={getattr(cache, 'common_indices_hits', 0)} "
                 f"idx_writes={getattr(cache, 'common_indices_writes', 0)} "
                 f"hca_hits={getattr(cache, 'hca_indices_hits', 0)} "
                 f"hca_writes={getattr(cache, 'hca_indices_writes', 0)} "
@@ -2733,9 +2704,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 )
                 if profile:
                     _atom_profile_sync()
-                    swa_write_ms = (
-                        time.perf_counter() - segment_start
-                    ) * 1000.0
+                    swa_write_ms = (time.perf_counter() - segment_start) * 1000.0
                 _atom_prefill_sync_if_requested("post_swa")
         if profile:
             total_ms = (time.perf_counter() - total_start) * 1000.0

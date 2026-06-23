@@ -223,9 +223,9 @@ def _reshape_kv_cache(
                     kv_cache_spec.storage_block_size // kernel_block_size
                 )
                 kernel_num_blocks = num_blocks * num_blocks_per_kv_block
-                layer_cache_dtype = getattr(
-                    kv_cache_spec, "cache_dtype_str", None
-                ) or cache_dtype
+                layer_cache_dtype = (
+                    getattr(kv_cache_spec, "cache_dtype_str", None) or cache_dtype
+                )
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
                     kernel_block_size,
@@ -263,9 +263,7 @@ def _reshape_kv_cache(
                     strides[inv_order[0]] = page_stride
                     inner_block_stride_bytes = kv_cache_spec.inner_block_stride_bytes
                     if inner_block_stride_bytes is not None:
-                        strides[inv_order[1]] = (
-                            inner_block_stride_bytes // dtype_size
-                        )
+                        strides[inv_order[1]] = inner_block_stride_bytes // dtype_size
                     kv_cache = torch.as_strided(
                         kv_tensor,
                         size=kv_cache_shape,

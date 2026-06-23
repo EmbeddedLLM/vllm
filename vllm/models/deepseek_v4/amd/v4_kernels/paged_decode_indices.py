@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -167,9 +169,7 @@ def _v4_paged_decode_indices_kernel(
             hca_mask = hca_mask & (physical_blocks >= 0)
             tl.store(
                 hca_indices_ptr + hca_base + offs,
-                hca_swa_pages
-                + physical_blocks * hca_block_capacity
-                + slot_offsets,
+                hca_swa_pages + physical_blocks * hca_block_capacity + slot_offsets,
                 mask=hca_mask & hca_slice_valid,
             )
 
@@ -255,12 +255,12 @@ def write_v4_paged_decode_indices(
     assert hca_indices.dim() == 1
 
     BLOCK_N = triton.next_power_of_2(win)
-    page_capacity = int(max_pages) if max_pages is not None else int(
-        state_slot_per_seq.shape[0] * cs
+    page_capacity = (
+        int(max_pages)
+        if max_pages is not None
+        else int(state_slot_per_seq.shape[0] * cs)
     )
-    write_hca_head = (
-        hca_block_table is not None and hca_n_committed_per_seq is not None
-    )
+    write_hca_head = hca_block_table is not None and hca_n_committed_per_seq is not None
     if write_hca_head and hca_block_capacity <= 0:
         raise RuntimeError(
             f"Invalid HCA block capacity for ATOM decode: {hca_block_capacity}."
@@ -330,8 +330,10 @@ def write_v4_paged_decode_indices_reference(
     """
     if T == 0:
         return
-    page_capacity = int(max_pages) if max_pages is not None else int(
-        state_slot_per_seq.shape[0] * cs
+    page_capacity = (
+        int(max_pages)
+        if max_pages is not None
+        else int(state_slot_per_seq.shape[0] * cs)
     )
     bid = batch_id_per_token[:T].long()
     pos_t = positions[:T].long()

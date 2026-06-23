@@ -47,9 +47,9 @@ def _cap_mhc_pre_splitk(
         return selected_splitk
     max_splitk = min(selected_splitk, _AITER_MHC_PRE_MAX_SPLITK)
     for splitk in range(max_splitk, 0, -1):
-        if hc_hidden_size % (splitk * tile_k) == 0 and (
-            hc_hidden_size // splitk
-        ) >= (tile_k * 2):
+        if hc_hidden_size % (splitk * tile_k) == 0 and (hc_hidden_size // splitk) >= (
+            tile_k * 2
+        ):
             return splitk
     return selected_splitk
 
@@ -175,6 +175,7 @@ def mhc_pre_aiter(
         )
 
     from aiter.ops.mhc import get_mhc_pre_splitk, mhc_pre_gemm_sqrsum
+
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         mhc_pre_big_fuse_tilelang,
     )
@@ -188,9 +189,7 @@ def mhc_pre_aiter(
     residual_flat = residual.view(-1, hc_mult, hidden_size)
     num_tokens = residual_flat.shape[0]
     residual_2d = residual_flat.view(num_tokens, hc_hidden_size)
-    selected_splitk, selected_tile_k = get_mhc_pre_splitk(
-        num_tokens, hc_hidden_size
-    )
+    selected_splitk, selected_tile_k = get_mhc_pre_splitk(num_tokens, hc_hidden_size)
     selected_splitk = _cap_mhc_pre_splitk(
         selected_splitk,
         selected_tile_k,

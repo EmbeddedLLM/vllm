@@ -12,12 +12,12 @@ from vllm.utils.import_utils import has_tilelang
 
 HAS_TILELANG = has_tilelang()
 _USE_AITER_MHC = os.environ.get("VLLM_ROCM_DSV4_USE_AITER_MHC", "0") == "1"
-_USE_AITER_MHC_PRE = os.environ.get(
-    "VLLM_ROCM_DSV4_USE_AITER_MHC_PRE", str(int(_USE_AITER_MHC))
-) == "1"
-_USE_AITER_MHC_POST = os.environ.get(
-    "VLLM_ROCM_DSV4_USE_AITER_MHC_POST", str(int(_USE_AITER_MHC))
-) == "1"
+_USE_AITER_MHC_PRE = (
+    os.environ.get("VLLM_ROCM_DSV4_USE_AITER_MHC_PRE", str(int(_USE_AITER_MHC))) == "1"
+)
+_USE_AITER_MHC_POST = (
+    os.environ.get("VLLM_ROCM_DSV4_USE_AITER_MHC_POST", str(int(_USE_AITER_MHC))) == "1"
+)
 _USE_AITER_MHC_FUSED_POST_PRE = (
     os.environ.get("VLLM_ROCM_DSV4_USE_AITER_MHC_FUSED_POST_PRE", "0") == "1"
 )
@@ -25,17 +25,12 @@ _AITER_MHC_FUSED_POST_PRE_MAX_TOKENS = int(
     os.environ.get("VLLM_ROCM_DSV4_AITER_MHC_FUSED_POST_PRE_MAX_TOKENS", "64")
 )
 _USE_AITER_HC_HEAD = os.environ.get("VLLM_ROCM_DSV4_USE_AITER_HC_HEAD", "0") == "1"
-_AITER_MHC_MAX_TOKENS = int(
-    os.environ.get("VLLM_ROCM_DSV4_AITER_MHC_MAX_TOKENS", "-1")
-)
+_AITER_MHC_MAX_TOKENS = int(os.environ.get("VLLM_ROCM_DSV4_AITER_MHC_MAX_TOKENS", "-1"))
 if _USE_AITER_MHC_PRE or _USE_AITER_MHC_POST:
     try:
         import aiter
 
-        HAS_AITER_MHC = (
-            hasattr(aiter, "mhc_pre")
-            and hasattr(aiter, "mhc_post")
-        )
+        HAS_AITER_MHC = hasattr(aiter, "mhc_pre") and hasattr(aiter, "mhc_post")
     except Exception:
         HAS_AITER_MHC = False
 else:

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -42,8 +44,6 @@ Correctness:
     `k_offs < valid_k` mask is the sole correctness barrier. CG-padded slots
     (batch_id=-1) bail in the kernel preamble.
 """
-
-from typing import Optional
 
 import torch
 import triton
@@ -142,7 +142,7 @@ def csa_translate_pack(
     positions: torch.Tensor,
     kv_indptr_csa: torch.Tensor,
     batch_id_per_token: torch.Tensor,
-    skip_prefix_len_per_token: Optional[torch.Tensor],
+    skip_prefix_len_per_token: torch.Tensor | None,
     kv_indices_csa: torch.Tensor,
     *,
     swa_pages: int,
@@ -260,7 +260,7 @@ def csa_translate_pack_reference(
     positions: torch.Tensor,
     kv_indptr_csa: torch.Tensor,
     batch_id_per_token: torch.Tensor,
-    skip_prefix_len_per_token: Optional[torch.Tensor],
+    skip_prefix_len_per_token: torch.Tensor | None,
     kv_indices_csa: torch.Tensor,
     *,
     swa_pages: int,

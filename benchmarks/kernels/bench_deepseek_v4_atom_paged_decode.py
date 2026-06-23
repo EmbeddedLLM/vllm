@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Microbenchmark ROCm DeepSeek-V4 ATOM paged decode kernels.
 
 This is intentionally narrow: it exercises the vendored ATOM sparse paged

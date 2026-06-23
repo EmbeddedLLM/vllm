@@ -33,9 +33,9 @@ def _write_packed_rope_tail(
     block = logical_page // block_size
     slot = logical_page % block_size
     start = slot * _PACKED_TOKEN_DATA_SIZE + _PACKED_NOPE_BYTES
-    _packed_block_bytes(packed_tail)[
-        block, start : start + _PACKED_ROPE_BYTES
-    ].copy_(rope_tail.view(torch.uint8))
+    _packed_block_bytes(packed_tail)[block, start : start + _PACKED_ROPE_BYTES].copy_(
+        rope_tail.view(torch.uint8)
+    )
 
 
 def _write_packed_scale_bytes(

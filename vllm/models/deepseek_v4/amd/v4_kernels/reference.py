@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -49,9 +51,7 @@ def sparse_attn_ragged_torch(
         torch.zeros((), dtype=kv_f32.dtype, device=device),
     )
 
-    scores = torch.einsum("thd,tkd->thk", q.float(), kv_f32) * float(
-        softmax_scale
-    )
+    scores = torch.einsum("thd,tkd->thk", q.float(), kv_f32) * float(softmax_scale)
     scores = scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
 
     sink = attn_sink.float().view(1, H, 1).expand(T, H, 1)

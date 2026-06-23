@@ -31,6 +31,7 @@ from vllm.models.deepseek_v4.amd.v4_kernels.compress_plan import (
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import get_paged_mqa_logits_metadata, has_deep_gemm
 from vllm.utils.platform_utils import num_compute_units
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_compressed_slot_mapping,
 )
@@ -40,7 +41,6 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.utils import AttentionGroup
-from vllm.utils.torch_utils import get_dtype_size
 
 logger = init_logger(__name__)
 
@@ -61,12 +61,8 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-_ATOM_UNIFIED_KV_ENABLED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV", "0") == "1"
-)
-_ATOM_ATTENTION_ENABLED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION", "0") == "1"
-)
+_ATOM_UNIFIED_KV_ENABLED = os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV", "0") == "1"
+_ATOM_ATTENTION_ENABLED = os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION", "0") == "1"
 _ATOM_UNIFIED_KV_FROM_VLLM_ENABLED = (
     os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM", "0") == "1"
 )
@@ -298,17 +294,20 @@ class DeepseekV4RocmAtomPrefillCache:
         self.indptr_key: tuple[int, int, bool] | None = None
         self.totals: tuple[int, int, int, int] = (0, 0, 0, 0)
         self.common_indices_key: tuple[int, int, int, int, int, int] | None = None
-        self.hca_indices_key: tuple[
-            int,
-            int,
-            int,
-            int,
-            int,
-            int,
-            int,
-            tuple[int, ...],
-            tuple[int, int, int, int, int, int],
-        ] | None = None
+        self.hca_indices_key: (
+            tuple[
+                int,
+                int,
+                int,
+                int,
+                int,
+                int,
+                int,
+                tuple[int, ...],
+                tuple[int, int, int, int, int, int],
+            ]
+            | None
+        ) = None
         self.csa_translate_key: tuple[object, ...] | None = None
         self.indptr_hits = 0
         self.indptr_writes = 0
@@ -492,9 +491,7 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         self.k1_csa = atom_block_size // 4
         self.k2_hca = atom_block_size // 128
         self._atom_state_buffers: DeepseekV4RocmAtomStateBuffers | None = None
-        self._atom_unified_kv_buffers: (
-            DeepseekV4RocmAtomUnifiedKVBuffers | None
-        ) = None
+        self._atom_unified_kv_buffers: DeepseekV4RocmAtomUnifiedKVBuffers | None = None
         self._enable_atom_unified_kv = _ATOM_UNIFIED_KV_ENABLED
         self._enable_atom_unified_kv_from_vllm = _ATOM_UNIFIED_KV_FROM_VLLM_ENABLED
         self._enable_atom_compress_plans = _ATOM_COMPRESS_PLAN_ENABLED
@@ -649,7 +646,9 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                 if atom_swa_kv is not None and atom_swa_kv.numel():
                     atom_swa_kv[req_index].zero_()
 
-    def _allocate_compress_plan_buffers(self) -> dict[int, dict[str, _CpuGpuInt32Buffer]]:
+    def _allocate_compress_plan_buffers(
+        self,
+    ) -> dict[int, dict[str, _CpuGpuInt32Buffer]]:
         capacities: dict[int, dict[str, _CpuGpuInt32Buffer]] = {}
         for ratio in sorted({4, 128}.intersection(self.compress_ratios)):
             capacities[ratio] = {
@@ -661,7 +660,7 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                     (max(1, self.max_num_tokens), 4),
                     self.device,
                 ),
-        }
+            }
         return capacities
 
     def _allocate_atom_decode_buffers(self) -> DeepseekV4RocmAtomDecodeBuffers:
@@ -894,12 +893,12 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         csa_layer_ids = tuple(
             layer_id
             for layer_id, module in active_attn
-            if int(getattr(module, "compress_ratio")) == 4
+            if int(module.compress_ratio) == 4
         )
         hca_layer_ids = tuple(
             layer_id
             for layer_id, module in active_attn
-            if int(getattr(module, "compress_ratio")) == 128
+            if int(module.compress_ratio) == 128
         )
 
         state_dtype = torch.float32
@@ -970,9 +969,7 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         )
         return buffers
 
-    def _bind_atom_state_buffers(
-        self, buffers: DeepseekV4RocmAtomStateBuffers
-    ) -> None:
+    def _bind_atom_state_buffers(self, buffers: DeepseekV4RocmAtomStateBuffers) -> None:
         active_pos = {
             layer_id: pos for pos, layer_id in enumerate(buffers.active_layer_ids)
         }
@@ -980,49 +977,29 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         hca_pos = {layer_id: pos for pos, layer_id in enumerate(buffers.hca_layer_ids)}
 
         for layer_id, attn in self._iter_active_attn_modules():
-            setattr(attn, "atom_swa_kv", buffers.swa_kv[active_pos[layer_id]])
-            setattr(attn, "atom_win_with_spec", self.win_with_spec)
-            setattr(attn, "atom_swa_pages", self.swa_pages)
+            attn.atom_swa_kv = buffers.swa_kv[active_pos[layer_id]]
+            attn.atom_win_with_spec = self.win_with_spec
+            attn.atom_swa_pages = self.swa_pages
 
             compressor = getattr(attn, "compressor", None)
             if compressor is not None:
                 ratio = int(getattr(compressor, "compress_ratio", 0))
                 if ratio == 4:
                     pos = csa_pos[layer_id]
-                    setattr(
-                        compressor,
-                        "atom_kv_state",
-                        buffers.csa_main_kv_state[pos],
-                    )
-                    setattr(
-                        compressor,
-                        "atom_score_state",
-                        buffers.csa_main_score_state[pos],
-                    )
+                    compressor.atom_kv_state = buffers.csa_main_kv_state[pos]
+                    compressor.atom_score_state = buffers.csa_main_score_state[pos]
                 elif ratio == 128:
                     pos = hca_pos[layer_id]
-                    setattr(
-                        compressor,
-                        "atom_kv_state",
-                        buffers.hca_main_kv_state[pos],
-                    )
-                    setattr(
-                        compressor,
-                        "atom_score_state",
-                        buffers.hca_main_score_state[pos],
-                    )
+                    compressor.atom_kv_state = buffers.hca_main_kv_state[pos]
+                    compressor.atom_score_state = buffers.hca_main_score_state[pos]
 
             indexer = getattr(attn, "indexer", None)
             if indexer is not None:
                 pos = csa_pos[layer_id]
                 inner = getattr(indexer, "compressor", None)
                 if inner is not None:
-                    setattr(inner, "atom_kv_state", buffers.csa_idx_kv_state[pos])
-                    setattr(
-                        inner,
-                        "atom_score_state",
-                        buffers.csa_idx_score_state[pos],
-                    )
+                    inner.atom_kv_state = buffers.csa_idx_kv_state[pos]
+                    inner.atom_score_state = buffers.csa_idx_score_state[pos]
 
     def _allocate_atom_unified_kv_buffers(
         self,
@@ -1039,7 +1016,7 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         compressed_kv_scales: dict[int, torch.Tensor | None] = {}
         compressed_kv_layout: dict[int, str] = {}
         for layer_id, module in active_attn:
-            ratio = int(getattr(module, "compress_ratio"))
+            ratio = int(module.compress_ratio)
             k_per_block = k_per_block_by_ratio.get(ratio, 0)
 
             compress_pages = num_blocks * k_per_block
@@ -1087,18 +1064,12 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         for layer_id, attn in self._iter_active_attn_modules():
             unified = buffers.unified_kv_by_layer.get(layer_id)
             if unified is not None:
-                setattr(attn, "atom_unified_kv", unified)
-                setattr(
-                    attn,
-                    "atom_swa_kv",
-                    unified[: buffers.swa_pages].view(
-                        self.max_num_reqs,
-                        self.win_with_spec,
-                        self.head_dim,
-                    ),
+                attn.atom_unified_kv = unified
+                attn.atom_swa_kv = unified[: buffers.swa_pages].view(
+                    self.max_num_reqs, self.win_with_spec, self.head_dim
                 )
-                setattr(attn, "atom_win_with_spec", self.win_with_spec)
-                setattr(attn, "atom_swa_pages", buffers.swa_pages)
+                attn.atom_win_with_spec = self.win_with_spec
+                attn.atom_swa_pages = buffers.swa_pages
             else:
                 atom_swa_kv = getattr(attn, "atom_swa_kv", None)
                 if atom_swa_kv is None:
@@ -1106,38 +1077,26 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                         "ROCm DSV4 ATOM split-only KV bundle requires an "
                         f"existing atom_swa_kv view for layer {layer_id}."
                     )
-                setattr(attn, "atom_win_with_spec", self.win_with_spec)
-                setattr(attn, "atom_swa_pages", buffers.swa_pages)
+                attn.atom_win_with_spec = self.win_with_spec
+                attn.atom_swa_pages = buffers.swa_pages
 
             compressed = buffers.compressed_kv_cache.get(layer_id)
             if compressed is None:
                 continue
 
-            setattr(attn, "atom_compressed_kv_cache", compressed)
-            setattr(attn, "atom_split_kv_swa", getattr(attn, "atom_swa_kv"))
-            setattr(attn, "atom_split_kv_compressed", compressed)
-            setattr(
-                attn,
-                "atom_split_kv_scales",
-                buffers.compressed_kv_scales.get(layer_id),
-            )
-            setattr(
-                attn,
-                "atom_split_kv_layout",
-                buffers.compressed_kv_layout.get(layer_id, "dense"),
+            attn.atom_compressed_kv_cache = compressed
+            attn.atom_split_kv_swa = attn.atom_swa_kv
+            attn.atom_split_kv_compressed = compressed
+            attn.atom_split_kv_scales = buffers.compressed_kv_scales.get(layer_id)
+            attn.atom_split_kv_layout = buffers.compressed_kv_layout.get(
+                layer_id, "dense"
             )
             compressor = getattr(attn, "compressor", None)
             if compressor is not None:
-                setattr(compressor, "atom_kv_cache", compressed)
-                setattr(
-                    compressor,
-                    "atom_kv_scales",
-                    getattr(attn, "atom_split_kv_scales", None),
-                )
-                setattr(
-                    compressor,
-                    "atom_kv_layout",
-                    getattr(attn, "atom_split_kv_layout", "dense"),
+                compressor.atom_kv_cache = compressed
+                compressor.atom_kv_scales = getattr(attn, "atom_split_kv_scales", None)
+                compressor.atom_kv_layout = getattr(
+                    attn, "atom_split_kv_layout", "dense"
                 )
 
     def _make_storage_view(
@@ -1239,14 +1198,12 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         for layer_id, attn in atom_attn:
             ratio = int(getattr(attn, "compress_ratio", 0))
 
-            prefix_bytes = int(
-                getattr(attn, "atom_vllm_unified_kv_prefix_bytes", 0)
-            )
+            prefix_bytes = int(getattr(attn, "atom_vllm_unified_kv_prefix_bytes", 0))
             swa_pages = int(getattr(attn, "atom_vllm_unified_kv_swa_pages", 0))
             if prefix_bytes <= 0 or swa_pages <= 0:
                 return False
             k_per_block = self.k1_csa if ratio == 4 else self.k2_hca
-            kv_cache = getattr(attn, "kv_cache")
+            kv_cache = attn.kv_cache
             compressed_layout = getattr(attn, "atom_vllm_compressed_layout", "dense")
             if compressed_layout == "fp8_ds_mla":
                 if (
@@ -1287,24 +1244,22 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                 compressed_kv_scales[layer_id] = None
                 compressed_kv_layout[layer_id] = "fp8_ds_mla"
 
-                setattr(
-                    attn,
-                    "atom_swa_kv",
-                    swa.view(self.max_num_reqs, self.win_with_spec, self.head_dim),
+                attn.atom_swa_kv = swa.view(
+                    self.max_num_reqs, self.win_with_spec, self.head_dim
                 )
-                setattr(attn, "atom_swa_pages", swa_pages)
-                setattr(attn, "atom_compressed_kv_cache", compressed)
-                setattr(attn, "atom_split_kv_swa", getattr(attn, "atom_swa_kv"))
-                setattr(attn, "atom_split_kv_compressed", compressed)
-                setattr(attn, "atom_split_kv_scales", None)
-                setattr(attn, "atom_split_kv_layout", "fp8_ds_mla")
+                attn.atom_swa_pages = swa_pages
+                attn.atom_compressed_kv_cache = compressed
+                attn.atom_split_kv_swa = attn.atom_swa_kv
+                attn.atom_split_kv_compressed = compressed
+                attn.atom_split_kv_scales = None
+                attn.atom_split_kv_layout = "fp8_ds_mla"
                 if hasattr(attn, "atom_unified_kv"):
                     delattr(attn, "atom_unified_kv")
                 compressor = getattr(attn, "compressor", None)
                 if compressor is not None:
-                    setattr(compressor, "atom_kv_cache", compressed)
-                    setattr(compressor, "atom_kv_scales", None)
-                    setattr(compressor, "atom_kv_layout", "fp8_ds_mla")
+                    compressor.atom_kv_cache = compressed
+                    compressor.atom_kv_scales = None
+                    compressor.atom_kv_layout = "fp8_ds_mla"
                 continue
 
             if kv_cache.dtype != self.dtype:
@@ -1319,20 +1274,16 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                     attn, "atom_split_kv_layout", "dense"
                 )
                 unified_layer_ids.append(layer_id)
-                setattr(attn, "atom_swa_pages", swa_pages)
-                setattr(attn, "atom_compressed_kv_cache", compressed)
+                attn.atom_swa_pages = swa_pages
+                attn.atom_compressed_kv_cache = compressed
                 compressor = getattr(attn, "compressor", None)
                 if compressor is not None:
-                    setattr(compressor, "atom_kv_cache", compressed)
-                    setattr(
-                        compressor,
-                        "atom_kv_scales",
-                        getattr(attn, "atom_split_kv_scales", None),
+                    compressor.atom_kv_cache = compressed
+                    compressor.atom_kv_scales = getattr(
+                        attn, "atom_split_kv_scales", None
                     )
-                    setattr(
-                        compressor,
-                        "atom_kv_layout",
-                        getattr(attn, "atom_split_kv_layout", "dense"),
+                    compressor.atom_kv_layout = getattr(
+                        attn, "atom_split_kv_layout", "dense"
                     )
                 continue
 
@@ -1366,31 +1317,21 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
             compressed_kv_scales[layer_id] = None
             compressed_kv_layout[layer_id] = "dense"
 
-            setattr(attn, "atom_unified_kv", unified)
-            setattr(
-                attn,
-                "atom_swa_kv",
-                unified[:swa_pages].view(
-                    self.max_num_reqs,
-                    self.win_with_spec,
-                    self.head_dim,
-                ),
+            attn.atom_unified_kv = unified
+            attn.atom_swa_kv = unified[:swa_pages].view(
+                self.max_num_reqs, self.win_with_spec, self.head_dim
             )
-            setattr(attn, "atom_swa_pages", swa_pages)
-            setattr(attn, "atom_compressed_kv_cache", compressed)
-            setattr(attn, "atom_split_kv_swa", getattr(attn, "atom_swa_kv"))
-            setattr(attn, "atom_split_kv_compressed", compressed)
-            setattr(attn, "atom_split_kv_scales", None)
-            setattr(attn, "atom_split_kv_layout", "dense")
+            attn.atom_swa_pages = swa_pages
+            attn.atom_compressed_kv_cache = compressed
+            attn.atom_split_kv_swa = attn.atom_swa_kv
+            attn.atom_split_kv_compressed = compressed
+            attn.atom_split_kv_scales = None
+            attn.atom_split_kv_layout = "dense"
             compressor = getattr(attn, "compressor", None)
             if compressor is not None:
-                setattr(compressor, "atom_kv_cache", compressed)
-                setattr(
-                    compressor,
-                    "atom_kv_scales",
-                    getattr(attn, "atom_split_kv_scales", None),
-                )
-                setattr(compressor, "atom_kv_layout", "dense")
+                compressor.atom_kv_cache = compressed
+                compressor.atom_kv_scales = getattr(attn, "atom_split_kv_scales", None)
+                compressor.atom_kv_layout = "dense"
 
         self._atom_unified_kv_buffers = DeepseekV4RocmAtomUnifiedKVBuffers(
             unified_kv=tuple(unified_kv),
@@ -1516,9 +1457,9 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
             else:
                 scheduled, computed, context_lens = request_length_views
 
-            self._state_slot_mapping_cpu[:num_actual_reqs] = (
-                input_batch.idx_mapping_np[:num_actual_reqs]
-            )
+            self._state_slot_mapping_cpu[:num_actual_reqs] = input_batch.idx_mapping_np[
+                :num_actual_reqs
+            ]
 
             actual_tokens = int(input_batch.num_tokens)
             pure_decode_one_token = (
@@ -1895,11 +1836,7 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         backend_names: frozenset[str],
     ) -> list[list[AttentionGroup]]:
         return [
-            [
-                group
-                for group in groups
-                if group.backend.get_name() not in backend_names
-            ]
+            [group for group in groups if group.backend.get_name() not in backend_names]
             for groups in attn_groups
         ]
 
@@ -2052,9 +1989,7 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
             for group in groups:
                 backend_name = group.backend.get_name()
                 if backend_name == "DEEPSEEK_SPARSE_SWA":
-                    block_size = int(
-                        getattr(group.kv_cache_spec, "block_size", 0) or 0
-                    )
+                    block_size = int(getattr(group.kv_cache_spec, "block_size", 0) or 0)
                     if block_size <= 0:
                         continue
                     swa_metadata = DeepseekV4RocmAtomSWADecodeMetadata(
@@ -2079,9 +2014,7 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                     "FLASHMLA_SPARSE_DSV4",
                     "ROCM_FLASHMLA_SPARSE_DSV4",
                 ):
-                    block_size = int(
-                        getattr(group.kv_cache_spec, "block_size", 0) or 0
-                    )
+                    block_size = int(getattr(group.kv_cache_spec, "block_size", 0) or 0)
                     if block_size <= 0:
                         continue
                     mla_metadata = DeepseekV4RocmAtomMLADecodeMetadata(
@@ -2104,11 +2037,8 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                     )
                     for layer_name in group.layer_names:
                         existing_metadata = attn_metadata.get(layer_name)
-                        if (
-                            DeepseekV32IndexerMetadata is not None
-                            and isinstance(
-                                existing_metadata, DeepseekV32IndexerMetadata
-                            )
+                        if DeepseekV32IndexerMetadata is not None and isinstance(
+                            existing_metadata, DeepseekV32IndexerMetadata
                         ):
                             attn_metadata[
                                 layer_name + _ATOM_INDEXER_METADATA_ALIAS_SUFFIX
@@ -2132,8 +2062,7 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         if num_decodes <= 0 or num_decodes >= num_reqs:
             return False
         return bool(
-            np.all(decode_mask[:num_decodes])
-            and not np.any(decode_mask[num_decodes:])
+            np.all(decode_mask[:num_decodes]) and not np.any(decode_mask[num_decodes:])
         )
 
     def _atom_minimal_decode_prefill_counts(
@@ -2236,12 +2165,10 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
 
         if current_platform.is_cuda() and has_deep_gemm():
             seq_lens = metadata.n_committed_csa_per_seq[:num_reqs].unsqueeze(-1)
-            self._indexer_decode_schedule_metadata[:] = (
-                get_paged_mqa_logits_metadata(
-                    seq_lens,
-                    storage_block_size,
-                    num_compute_units(self.device.index or 0),
-                )
+            self._indexer_decode_schedule_metadata[:] = get_paged_mqa_logits_metadata(
+                seq_lens,
+                storage_block_size,
+                num_compute_units(self.device.index or 0),
             )
 
         object.__setattr__(metadata, "indexer_decode_requires_padding", False)
@@ -2333,9 +2260,7 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                     continue
                 if self._is_atom_main_compressor_group(group):
                     continue
-                block_size = int(
-                    getattr(group.kv_cache_spec, "block_size", 0) or 0
-                )
+                block_size = int(getattr(group.kv_cache_spec, "block_size", 0) or 0)
                 if block_size <= 0:
                     continue
                 compressor_metadata = CompressorMetadata(
@@ -2630,11 +2555,9 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
             input_batch,
             pure_decode_one_token,
         )
-        skip_generic_atom_decode_metadata = (
-            self._can_skip_generic_atom_decode_metadata(
-                input_batch,
-                pure_decode_one_token,
-            )
+        skip_generic_atom_decode_metadata = self._can_skip_generic_atom_decode_metadata(
+            input_batch,
+            pure_decode_one_token,
         )
         skip_generic_atom_compressor_metadata = (
             self._can_skip_generic_atom_compressor_metadata(

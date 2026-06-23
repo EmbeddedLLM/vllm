@@ -58,9 +58,11 @@ def scale_indexer_weights(
     if n_elements == 0:
         return out
     if not weights.is_cuda:
-        return weights.to(torch.float32) * q_scale.squeeze(-1).to(
-            torch.float32
-        ) * weights_scale
+        return (
+            weights.to(torch.float32)
+            * q_scale.squeeze(-1).to(torch.float32)
+            * weights_scale
+        )
 
     grid = (triton.cdiv(n_elements, block_size),)
     _scale_indexer_weights_kernel[grid](

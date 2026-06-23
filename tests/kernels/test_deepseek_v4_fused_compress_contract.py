@@ -5,7 +5,9 @@ import pytest
 import torch
 
 from vllm.models.deepseek_v4.amd.v4_kernels import CompressPlan
-from vllm.models.deepseek_v4.amd.v4_kernels import fused_compress as fused_compress_module
+from vllm.models.deepseek_v4.amd.v4_kernels import (
+    fused_compress as fused_compress_module,
+)
 from vllm.models.deepseek_v4.amd.v4_kernels.fused_compress import (
     _validate_packed_fp8_ds_mla_fused_compress_args,
     fused_compress_attn,

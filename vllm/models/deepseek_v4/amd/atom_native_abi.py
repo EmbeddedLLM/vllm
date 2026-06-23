@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 
-
 _PACKED_LAYOUT_TERMS = (
     "fp8_ds_mla",
     "packed_fp8_ds_mla",
@@ -89,8 +88,7 @@ def _public_text(module: ModuleType) -> str:
 def _module_mentions_packed_dsv4_abi(module: ModuleType) -> bool:
     text = _public_text(module)
     return any(term in text for term in _PACKED_LAYOUT_TERMS) or (
-        "584" in text
-        and any(term in text for term in _PACKED_SLOT_TERMS)
+        "584" in text and any(term in text for term in _PACKED_SLOT_TERMS)
     )
 
 
@@ -142,9 +140,9 @@ def probe_atom_native_abi() -> AtomNativeAbiStatus:
         if torch is not None
         else object()
     )
-    maybe_dual_stream_forward = hasattr(
-        aiter, "maybe_dual_stream_forward"
-    ) or hasattr(torch_aiter_ops, "maybe_dual_stream_forward")
+    maybe_dual_stream_forward = hasattr(aiter, "maybe_dual_stream_forward") or hasattr(
+        torch_aiter_ops, "maybe_dual_stream_forward"
+    )
 
     missing: list[str] = []
     if not has_compressor:
