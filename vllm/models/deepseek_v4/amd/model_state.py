@@ -332,6 +332,7 @@ class DeepseekV4RocmAtomDecodeCache:
         self.hca_indices_writes = 0
         self.csa_translate_hits = 0
         self.csa_translate_writes = 0
+        self.hca_compress_total: int | None = None
 
 
 @dataclass(frozen=True)

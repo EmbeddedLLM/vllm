@@ -1917,6 +1917,40 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                     segment_start = time.perf_counter()
                 return
 
+            hca_compress_valid = (
+                cache is not None
+                and cache.hca_compress_total == atom_state.decode_hca_total
+            )
+            if not common_valid and write_hca_head and hca_compress_valid:
+                index_write_launched = True
+                write_v4_paged_decode_indices(
+                    state_slot_per_seq=atom_state.state_slot_mapping,
+                    batch_id_per_token=atom_state.batch_id_per_token,
+                    positions=positions,
+                    swa_indptr=swa_indptr,
+                    csa_indptr=csa_indptr,
+                    hca_indptr=hca_indptr,
+                    swa_indices=swa_indices,
+                    csa_indices=csa_indices,
+                    hca_indices=hca_indices,
+                    T=T,
+                    win=self.window_size,
+                    cs=int(atom_state.win_with_spec),
+                    max_pages=int(atom_state.swa_pages),
+                    hca_block_table=None,
+                    hca_n_committed_per_seq=None,
+                    hca_swa_pages=int(atom_state.swa_pages),
+                    hca_block_capacity=hca_block_capacity,
+                )
+                if _ATOM_DECODE_INDEX_REUSE and cache is not None:
+                    cache.common_indices_key = common_indices_key
+                    cache.common_indices_writes += 1
+                if profile:
+                    _atom_profile_sync()
+                    index_ms = (time.perf_counter() - segment_start) * 1000.0
+                    segment_start = time.perf_counter()
+                return
+
             index_write_launched = True
             write_v4_paged_decode_indices(
                 state_slot_per_seq=atom_state.state_slot_mapping,
@@ -1945,6 +1979,8 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 if write_hca_head and hca_index_reuse_enabled:
                     cache.hca_indices_key = hca_key
                     cache.hca_indices_writes += 1
+                if write_hca_head:
+                    cache.hca_compress_total = atom_state.decode_hca_total
             if profile:
                 _atom_profile_sync()
                 index_ms = (time.perf_counter() - segment_start) * 1000.0
