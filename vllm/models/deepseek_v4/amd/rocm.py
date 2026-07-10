@@ -172,6 +172,30 @@ _ATOM_SEPARATE_INVERSE_ROPE = (
 )
 
 
+# Module-level reusable buffer for attention output.  Eliminates 61 torch.empty
+# calls per decode step under breakable CUDA graph.  Grown (never shrunk) to
+# the largest num_tokens × padded_heads × head_dim seen so far.
+_O_PADDED_BUF: torch.Tensor | None = None
+
+
+def _get_o_padded(
+    num_tokens: int,
+    padded_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    global _O_PADDED_BUF
+    needed = num_tokens * padded_heads * head_dim
+    if _O_PADDED_BUF is None or _O_PADDED_BUF.numel() < needed:
+        _O_PADDED_BUF = torch.empty(
+            (num_tokens, padded_heads, head_dim),
+            dtype=dtype,
+            device=device,
+        )
+    return _O_PADDED_BUF[:num_tokens]
+
+
 def _atom_attention_enabled_for_ratio(ratio: int) -> bool:
     if not _ATOM_ATTENTION_ENABLED:
         return False
@@ -206,6 +230,12 @@ class _AtomKVViews:
     unified_kv_scales: torch.Tensor | None
 
 
+# Per-layer KV view cache.  Keyed by (id(atom_state), layer_id) so the cache
+# auto-invalidates when the model state is recreated (server restart / KV
+# realloc).  Saves ~15 getattr calls × 61 layers = ~915 lookups per step.
+_KV_VIEW_CACHE: dict[tuple[int, int | None], _AtomKVViews] = {}
+
+
 def _resolve_atom_kv_views(
     attn: object,
     atom_state: object,
@@ -219,6 +249,12 @@ def _resolve_atom_kv_views(
     stale default layout string.
     """
 
+    layer_id = getattr(attn, "_atom_layer_id", None)
+    cache_key = (id(atom_state), layer_id)
+    cached = _KV_VIEW_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     unified_kv = getattr(attn, "atom_unified_kv", None)
     split_swa_kv = getattr(attn, "atom_split_kv_swa", None)
     split_compressed_kv = getattr(attn, "atom_split_kv_compressed", None)
@@ -226,7 +262,6 @@ def _resolve_atom_kv_views(
     split_kv_layout = getattr(attn, "atom_split_kv_layout", "dense")
     unified_kv_scales = getattr(attn, "atom_unified_kv_scales", None)
 
-    layer_id = getattr(attn, "_atom_layer_id", None)
     buffers = getattr(atom_state, "unified_kv_buffers", None)
     if buffers is not None and layer_id is not None:
         if layer_id in buffers.compressed_kv_cache:
@@ -252,7 +287,7 @@ def _resolve_atom_kv_views(
                 int(attn.head_dim),
             )
 
-    return _AtomKVViews(
+    views = _AtomKVViews(
         unified_kv=unified_kv,
         split_swa_kv=split_swa_kv,
         split_compressed_kv=split_compressed_kv,
@@ -260,6 +295,8 @@ def _resolve_atom_kv_views(
         split_kv_layout=split_kv_layout,
         unified_kv_scales=unified_kv_scales,
     )
+    _KV_VIEW_CACHE[cache_key] = views
+    return views
 
 
 def _atom_attention_enabled_for_layer(layer_id: int | None) -> bool:
@@ -1281,10 +1318,12 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             return super().forward(positions, hidden_states, llama_4_scaling)
 
         num_tokens = hidden_states.shape[0]
-        o_padded = torch.empty(
-            (num_tokens, self.padded_heads, self.head_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+        o_padded = _get_o_padded(
+            num_tokens,
+            self.padded_heads,
+            self.head_dim,
+            hidden_states.dtype,
+            hidden_states.device,
         )
 
         qr_kv, kv_score, indexer_kv_score, indexer_weights = (
@@ -1319,15 +1358,20 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
-        has_prefill = False
-        if isinstance(attn_metadata, dict):
-            has_prefill = any(
-                int(getattr(metadata, "num_prefills", 0) or 0) > 0
-                or int(getattr(metadata, "num_prefill_tokens", 0) or 0) > 0
-                for metadata in attn_metadata.values()
-            )
-
-        use_compress_first = self._atom_sequential_compress_first() and not has_prefill
+        # Short-circuit: compress_first requires _ATOM_COMPRESS_FIRST=1 which
+        # is off in the production path.  Skip the expensive per-metadata
+        # has_prefill iteration when compress_first can never be True.
+        if self._atom_sequential_compress_first():
+            has_prefill = False
+            if isinstance(attn_metadata, dict):
+                has_prefill = any(
+                    int(getattr(metadata, "num_prefills", 0) or 0) > 0
+                    or int(getattr(metadata, "num_prefill_tokens", 0) or 0) > 0
+                    for metadata in attn_metadata.values()
+                )
+            use_compress_first = not has_prefill
+        else:
+            use_compress_first = False
         if _ATOM_DEBUG_COMPRESS_FIRST and self._atom_layer_id == 0:
             prefill_counts = []
             if isinstance(attn_metadata, dict):

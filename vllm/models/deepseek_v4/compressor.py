@@ -648,12 +648,13 @@ class DeepseekCompressor(nn.Module):
 
         kv_state = getattr(self, "atom_kv_state", None)
         score_state = getattr(self, "atom_score_state", None)
-        kv_cache = getattr(self, "atom_kv_cache", None)
         if kv_state is None or score_state is None:
             raise RuntimeError(
                 "ATOM compressor requested but atom_kv_state or "
                 "atom_score_state is not bound."
             )
+
+        kv_cache = getattr(self, "atom_kv_cache", None)
 
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         block_tables = None
