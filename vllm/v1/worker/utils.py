@@ -26,7 +26,6 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
-    FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -35,6 +34,18 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+
+def _representative_worker_spec(
+    group_spec: KVCacheSpec,
+) -> KVCacheSpec:
+    if not isinstance(group_spec, UniformTypeKVCacheSpecs):
+        return group_spec
+
+    for spec in group_spec.kv_cache_specs.values():
+        if spec.fixed_prefix_size_bytes > 0:
+            return spec
+    return next(iter(group_spec.kv_cache_specs.values()))
 
 
 @triton.jit
@@ -110,6 +121,7 @@ class KVBlockZeroer:
         """
         self.device = device
         self.pin_memory = pin_memory
+        self._metas: list[tuple[torch.Tensor, int, int, int]] = []
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be at least 1")
         self.max_concurrency = max_concurrency
@@ -122,12 +134,11 @@ class KVBlockZeroer:
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
         seen_ptrs: set[int] = set()
-        seg_addrs: list[int] = []
-        page_size_el: int | None = None
+        seg_addrs_by_page_size: dict[int, list[int]] = {}
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
-            if not isinstance(spec, FullAttentionSpec):
+            if not isinstance(spec, AttentionSpec):
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
@@ -156,12 +167,7 @@ class KVBlockZeroer:
                 assert cur_bytes % 4 == 0
                 kernel_block_el = cur_bytes // 4
                 cur_page_el = kernel_block_el * ratio
-                if page_size_el is None:
-                    page_size_el = cur_page_el
-                else:
-                    assert page_size_el == cur_page_el, (
-                        f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
-                    )
+                seg_addrs = seg_addrs_by_page_size.setdefault(cur_page_el, [])
 
                 block_stride_bytes = cur_bytes
                 outer_dims = [
@@ -174,12 +180,27 @@ class KVBlockZeroer:
                     off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
                     seg_addrs.append(dp + off_bytes)
 
-        if not seg_addrs or page_size_el is None:
-            self._meta = None
+        if not seg_addrs_by_page_size:
             return
 
-        blk_size = min(largest_power_of_2_divisor(page_size_el), 1024)
         self._id_cap = 8192
+        self._ids_pinned = torch.empty(
+            self._id_cap,
+            dtype=torch.int64,
+            pin_memory=self.pin_memory,
+        )
+        self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
+        self._metas = []
+        for page_size_el, seg_addrs in seg_addrs_by_page_size.items():
+            blk_size = min(largest_power_of_2_divisor(page_size_el), 1024)
+            self._metas.append(
+                (
+                    torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
+                    page_size_el,
+                    blk_size,
+                    len(seg_addrs),
+                )
+            )
         self._allocate_id_buffers()
         self._meta = (
             torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
@@ -205,15 +226,36 @@ class KVBlockZeroer:
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
-        if not block_ids or self._meta is None:
+        if not block_ids or not self._metas:
             return
-        seg_addrs, page_size_el, blk_size, n_segs = self._meta
         n_blocks = len(block_ids)
         if n_blocks > self._id_cap:
             # The old pinned buffers may still be the source of an in-flight
             # nonblocking copy. Growing is rare, so we don't mind the sync overhead
             torch.accelerator.synchronize()
             self._id_cap = n_blocks * 2
+            self._ids_pinned = torch.empty(
+                self._id_cap,
+                dtype=torch.int64,
+                pin_memory=self.pin_memory,
+            )
+            self._ids_gpu = torch.empty(
+                self._id_cap, dtype=torch.int64, device=self.device
+            )
+        assert self._ids_pinned is not None and self._ids_gpu is not None
+        self._ids_pinned[:n_blocks].numpy()[:] = block_ids
+        idx = self._ids_gpu[:n_blocks]
+        idx.copy_(self._ids_pinned[:n_blocks], non_blocking=True)
+        for seg_addrs, page_size_el, blk_size, n_segs in self._metas:
+            grid = (n_blocks * n_segs * (page_size_el // blk_size),)
+            _zero_kv_blocks_kernel[grid](
+                seg_addrs,
+                idx,
+                n_blocks,
+                N_SEGS=n_segs,
+                PAGE_SIZE_EL=page_size_el,
+                BLOCK_SIZE=blk_size,
+            )
             self._allocate_id_buffers()
 
         # The H2D copy is nonblocking, so its pinned source must not be mutated
@@ -364,11 +406,7 @@ def prepare_kernel_block_sizes(
     """
     kernel_block_sizes = []
     for kv_cache_gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
-        kv_cache_spec = kv_cache_group.kv_cache_spec
-        if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-            # All layers in the UniformTypeKVCacheSpecs have the same type,
-            # pick an arbitrary one to dispatch.
-            kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
+        kv_cache_spec = _representative_worker_spec(kv_cache_group.kv_cache_spec)
         if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
             continue
         if isinstance(kv_cache_spec, AttentionSpec):
@@ -532,7 +570,11 @@ def bind_kv_cache(
 
     # Bind kv_caches to forward context
     for layer_name, kv_cache in kv_caches.items():
-        forward_context[layer_name].kv_cache = kv_cache
+        layer = forward_context[layer_name]
+        layer.kv_cache = kv_cache
+        post_bind = getattr(layer, "post_bind_kv_cache", None)
+        if post_bind is not None:
+            post_bind(kv_cache)
 
 
 def is_residual_scattered_for_sp(

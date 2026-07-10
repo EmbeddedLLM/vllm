@@ -12,6 +12,72 @@ MXFP4_BLOCK_SIZE = 32
 
 
 @triton.jit
+def _scale_indexer_weights_kernel(
+    weights_ptr,
+    q_scale_ptr,
+    out_ptr,
+    n_elements,
+    weights_scale: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    weights = tl.load(weights_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    q_scale = tl.load(q_scale_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    tl.store(out_ptr + offsets, weights * q_scale * weights_scale, mask=mask)
+
+
+def scale_indexer_weights(
+    weights: torch.Tensor,
+    q_scale: torch.Tensor,
+    weights_scale: float,
+    block_size: int = 1024,
+) -> torch.Tensor:
+    """ATOM-compatible indexer weight scaling.
+
+    Equivalent to ``weights * q_scale.squeeze(-1) * weights_scale``.  ATOM
+    keeps this as a separate Triton helper in ``v4_kernels.indexer_weights``.
+    vLLM's hot FP8 indexer path folds the same math into
+    ``fused_indexer_q_rope_quant`` to avoid an extra launch.
+    """
+    assert weights.dim() == 2, f"weights must be [T, H], got {tuple(weights.shape)}"
+    assert q_scale.shape == (
+        weights.size(0),
+        weights.size(1),
+        1,
+    ), (
+        f"q_scale shape {tuple(q_scale.shape)} incompatible with weights "
+        f"{tuple(weights.shape)}"
+    )
+    assert weights.is_contiguous(), "weights must be contiguous"
+    assert q_scale.is_contiguous(), "q_scale must be contiguous"
+
+    out = torch.empty_like(weights, dtype=torch.float32)
+    n_elements = weights.numel()
+    if n_elements == 0:
+        return out
+    if not weights.is_cuda:
+        return (
+            weights.to(torch.float32)
+            * q_scale.squeeze(-1).to(torch.float32)
+            * weights_scale
+        )
+
+    grid = (triton.cdiv(n_elements, block_size),)
+    _scale_indexer_weights_kernel[grid](
+        weights,
+        q_scale,
+        out,
+        n_elements,
+        weights_scale,
+        BLOCK_SIZE=block_size,
+    )
+    return out
+
+
+@triton.jit
 def _get_cos_sin(
     cos_sin_cache_ptr,
     cos_sin_cache_stride,

@@ -169,12 +169,12 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     start = position - (1 + OVERLAP) * COMPRESS_RATIO + 1
     tokens = tl.arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
     pos = start + tokens
-    mask_pos = pos >= 0
+    state_mask_pos = pos >= 0
 
     block_indices = pos // block_size
     block_numbers = tl.load(
         block_table_ptr + req_idx * block_table_stride + block_indices,
-        mask=mask_pos,
+        mask=state_mask_pos,
         other=0,
     )
     block_offsets = pos % block_size
@@ -192,21 +192,20 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
         + head_offset
     )
 
-    combined_mask = mask_pos[:, None] & mask[None, :]
+    state_combined_mask = state_mask_pos[:, None] & mask[None, :]
 
     # ── Softmax + weighted sum ───────────────────────────────────────
     score = tl.load(
         row_base[:, None] + STATE_WIDTH + block[None, :],
-        mask=combined_mask,
+        mask=state_combined_mask,
         other=float("-inf"),
     )
-    score = tl.softmax(score, dim=0)
-
     kv = tl.load(
         row_base[:, None] + block[None, :],
-        mask=combined_mask,
+        mask=state_combined_mask,
         other=0.0,
     )
+    score = tl.softmax(score, dim=0)
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 
@@ -363,12 +362,12 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     start = position - (1 + OVERLAP) * COMPRESS_RATIO + 1
     tokens = tl.arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
     pos = start + tokens
-    mask_pos = pos >= 0
+    state_mask_pos = pos >= 0
 
     block_indices = pos // block_size
     block_numbers = tl.load(
         block_table_ptr + req_idx * block_table_stride + block_indices,
-        mask=mask_pos,
+        mask=state_mask_pos,
         other=0,
     )
     block_offsets = pos % block_size
@@ -385,20 +384,18 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
         + head_offset
     )
 
-    combined_mask = mask_pos[:, None] & mask[None, :]
-
+    state_combined_mask = state_mask_pos[:, None] & mask[None, :]
     score = tl.load(
         row_base[:, None] + STATE_WIDTH + block[None, :],
-        mask=combined_mask,
+        mask=state_combined_mask,
         other=float("-inf"),
     )
-    score = tl.softmax(score, dim=0)
-
     kv = tl.load(
         row_base[:, None] + block[None, :],
-        mask=combined_mask,
+        mask=state_combined_mask,
         other=0.0,
     )
+    score = tl.softmax(score, dim=0)
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 
@@ -542,12 +539,12 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     start = position - (1 + OVERLAP) * COMPRESS_RATIO + 1
     tokens = tl.arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
     pos = start + tokens
-    mask_pos = pos >= 0
+    state_mask_pos = pos >= 0
 
     block_indices = pos // block_size
     block_numbers = tl.load(
         block_table_ptr + req_idx * block_table_stride + block_indices,
-        mask=mask_pos,
+        mask=state_mask_pos,
         other=0,
     )
     block_offsets = pos % block_size
@@ -564,20 +561,18 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
         + head_offset
     )
 
-    combined_mask = mask_pos[:, None] & mask[None, :]
-
+    state_combined_mask = state_mask_pos[:, None] & mask[None, :]
     score = tl.load(
         row_base[:, None] + STATE_WIDTH + block[None, :],
-        mask=combined_mask,
+        mask=state_combined_mask,
         other=float("-inf"),
     )
-    score = tl.softmax(score, dim=0)
-
     kv = tl.load(
         row_base[:, None] + block[None, :],
-        mask=combined_mask,
+        mask=state_combined_mask,
         other=0.0,
     )
+    score = tl.softmax(score, dim=0)
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 

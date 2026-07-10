@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
+import torch.nn.functional as F
 
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -129,7 +130,6 @@ def mhc_pre_tilelang(
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         compute_num_split,
         mhc_pre_big_fuse_tilelang,
-        mhc_pre_big_fuse_with_norm_tilelang,
     )
     from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
     from vllm.utils.math_utils import cdiv
@@ -209,45 +209,32 @@ def mhc_pre_tilelang(
             hc_mult,
         )
 
-    if norm_weight is None:
-        mhc_pre_big_fuse_tilelang(
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            hc_scale,
-            hc_base,
-            residual_flat,
-            post_mix,
-            comb_mix,
-            layer_input,
-            hidden_size,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            n_splits,
-            hc_mult,
-        )
-    else:
-        mhc_pre_big_fuse_with_norm_tilelang(
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            hc_scale,
-            hc_base,
-            residual_flat,
-            post_mix,
-            comb_mix,
-            layer_input,
-            norm_weight,
-            hidden_size,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            norm_eps,
-            n_splits,
-            hc_mult,
+    mhc_pre_big_fuse_tilelang(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual_flat,
+        post_mix,
+        comb_mix,
+        layer_input,
+        hidden_size,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        hc_mult,
+    )
+    if norm_weight is not None:
+        layer_input.copy_(
+            F.rms_norm(
+                layer_input.float(),
+                (hidden_size,),
+                norm_weight.float(),
+                norm_eps,
+            ).to(torch.bfloat16)
         )
 
     return (
@@ -360,7 +347,6 @@ def mhc_fused_post_pre_tilelang(
         mhc_fused_tilelang,
         mhc_post_tilelang,
         mhc_pre_big_fuse_tilelang,
-        mhc_pre_big_fuse_with_norm_tilelang,
     )
     from vllm.utils.math_utils import cdiv
 
@@ -505,45 +491,32 @@ def mhc_fused_post_pre_tilelang(
                 hc_mult,
             )
 
-    if norm_weight is None:
-        mhc_pre_big_fuse_tilelang(
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            hc_scale,
-            hc_base,
-            residual_cur,
-            post_mix_cur,
-            comb_mix_cur,
-            layer_input_cur,
-            hidden_size,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            n_splits,
-            hc_mult,
-        )
-    else:
-        mhc_pre_big_fuse_with_norm_tilelang(
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            hc_scale,
-            hc_base,
-            residual_cur,
-            post_mix_cur,
-            comb_mix_cur,
-            layer_input_cur,
-            norm_weight,
-            hidden_size,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            norm_eps,
-            n_splits,
-            hc_mult,
+    mhc_pre_big_fuse_tilelang(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual_cur,
+        post_mix_cur,
+        comb_mix_cur,
+        layer_input_cur,
+        hidden_size,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        hc_mult,
+    )
+    if norm_weight is not None:
+        layer_input_cur.copy_(
+            F.rms_norm(
+                layer_input_cur.float(),
+                (hidden_size,),
+                norm_weight.float(),
+                norm_eps,
+            ).to(torch.bfloat16)
         )
 
     return (

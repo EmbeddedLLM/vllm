@@ -1299,6 +1299,66 @@ def _use_packed_kv_cache_config(
     return is_dsv4 or (enable_cross_layers and len(kv_cache_groups) > 1)
 
 
+def _split_fixed_prefix_layers(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> tuple[list[KVCacheGroupSpec], list[tuple[str, KVCacheSpec]]]:
+    regular_groups: list[KVCacheGroupSpec] = []
+    prefix_layers: list[tuple[str, KVCacheSpec]] = []
+    for group in kv_cache_groups:
+        regular_layer_names: list[str] = []
+        for layer_name in group.layer_names:
+            spec = group.kv_cache_spec
+            layer_spec = (
+                spec.kv_cache_specs[layer_name]
+                if isinstance(spec, UniformTypeKVCacheSpecs)
+                else spec
+            )
+            if layer_spec.fixed_prefix_size_bytes:
+                prefix_layers.append((layer_name, layer_spec))
+            else:
+                regular_layer_names.append(layer_name)
+        if regular_layer_names:
+            regular_groups.append(
+                KVCacheGroupSpec(
+                    layer_names=regular_layer_names,
+                    kv_cache_spec=group.kv_cache_spec,
+                    is_eagle_group=group.is_eagle_group,
+                )
+            )
+    return regular_groups, prefix_layers
+
+
+def _get_kv_cache_config_fixed_prefix(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> tuple[int, list[KVCacheTensor]]:
+    regular_groups, prefix_layers = _split_fixed_prefix_layers(kv_cache_groups)
+    buckets = _bucket_layers_by_page_size(regular_groups)
+    bytes_per_block = sum(ps * len(slots) for ps, slots in buckets.items())
+    bytes_per_block += sum(spec.page_size_bytes for _, spec in prefix_layers)
+    prefix_bytes = sum(spec.fixed_prefix_size_bytes for _, spec in prefix_layers)
+    if bytes_per_block <= 0 or available_memory <= prefix_bytes:
+        raise ValueError("Insufficient memory for fixed-prefix KV cache layout")
+    num_blocks = may_override_num_blocks(
+        vllm_config, (available_memory - prefix_bytes) // bytes_per_block
+    )
+    tensors = [
+        KVCacheTensor(size=ps * num_blocks, shared_by=slot)
+        for ps, slots in buckets.items()
+        for slot in slots
+    ]
+    tensors.extend(
+        KVCacheTensor(
+            size=spec.fixed_prefix_size_bytes + spec.page_size_bytes * num_blocks,
+            shared_by=[layer_name],
+            fixed_prefix_size=spec.fixed_prefix_size_bytes,
+        )
+        for layer_name, spec in prefix_layers
+    )
+    return num_blocks, tensors
+
+
 def _get_kv_cache_config_packed(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1381,6 +1441,18 @@ def get_kv_cache_config_from_groups(
             )
             for layer_name in kv_cache_groups[0].layer_names
         ]
+    elif any(
+        spec.fixed_prefix_size_bytes
+        for group in kv_cache_groups
+        for spec in (
+            group.kv_cache_spec.kv_cache_specs.values()
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else (group.kv_cache_spec,)
+        )
+    ):
+        num_blocks, kv_cache_tensors = _get_kv_cache_config_fixed_prefix(
+            vllm_config, kv_cache_groups, available_memory
+        )
     elif _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
         # DeepSeek V4 uses the packed layout by default. Other multi-group
         # layouts can opt in with --enable-cross-layers.
@@ -1607,6 +1679,20 @@ def _get_kv_cache_groups_uniform_groups(
         isinstance(spec, MLAAttentionSpec)
         for spec in full_mla_spec.kv_cache_specs.values()
     )
+    swa_mla_specs = grouped_specs[1:]
+    if swa_mla_specs:
+        full_page_sizes = full_mla_spec.get_page_sizes()
+        max_full_page_size = max(full_page_sizes)
+        max_swa_page_size = max(
+            page_size for group in swa_mla_specs for page_size in group.get_page_sizes()
+        )
+        if max_swa_page_size > max_full_page_size:
+            for layer_spec in full_mla_spec.kv_cache_specs.values():
+                if layer_spec.page_size_bytes == max_full_page_size:
+                    object.__setattr__(
+                        layer_spec, "page_size_padded", max_swa_page_size
+                    )
+                    break
     full_mla_group = KVCacheGroupSpec(
         layer_names=list(full_mla_spec.kv_cache_specs.keys()),
         kv_cache_spec=full_mla_spec,
@@ -1631,7 +1717,6 @@ def _get_kv_cache_groups_uniform_groups(
         round_up(x, num_layer_tuples) for x in num_layer_tuples_per_group
     ]
 
-    swa_mla_specs = grouped_specs[1:]
     assert all(
         isinstance(spec, SlidingWindowMLASpec)
         for group in swa_mla_specs
@@ -2152,8 +2237,12 @@ def get_kv_cache_configs(
 
         # Shrink tensor size proportionally
         for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+            scalable_size = tensor.size - tensor.fixed_prefix_size
+            assert scalable_size % num_blocks_old == 0
+            tensor.size = (
+                tensor.fixed_prefix_size
+                + scalable_size // num_blocks_old * min_num_blocks
+            )
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             max_model_len = vllm_config.model_config.max_model_len

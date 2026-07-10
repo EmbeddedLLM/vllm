@@ -40,6 +40,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    DeepseekV4AtomMLAAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -148,6 +149,52 @@ def new_sliding_window_spec(
         page_size_padded=page_size_padded,
         sliding_window=sliding_window,
         indexes_kv_by_block_stride=indexes_kv_by_block_stride,
+    )
+
+
+def new_mla_cache_spec(
+    block_size=4,
+    num_kv_heads=1,
+    head_size=8,
+    dtype=torch.bfloat16,
+):
+    return MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=dtype,
+    )
+
+
+def new_atom_mla_cache_spec(
+    block_size=4,
+    num_kv_heads=1,
+    head_size=8,
+    dtype=torch.bfloat16,
+    cache_dtype_str=None,
+    compress_ratio=1,
+    model_version=None,
+    atom_swa_prefix_bytes=100,
+    atom_swa_pages=5,
+    atom_compressed_kv_dtype=None,
+    atom_compressed_layout="dense",
+    atom_compressed_scale_dtype=None,
+    atom_compressed_scale_bytes_per_page=0,
+):
+    return DeepseekV4AtomMLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=dtype,
+        cache_dtype_str=cache_dtype_str,
+        compress_ratio=compress_ratio,
+        model_version=model_version,
+        atom_swa_prefix_bytes=atom_swa_prefix_bytes,
+        atom_swa_pages=atom_swa_pages,
+        atom_compressed_kv_dtype=atom_compressed_kv_dtype,
+        atom_compressed_layout=atom_compressed_layout,
+        atom_compressed_scale_dtype=atom_compressed_scale_dtype,
+        atom_compressed_scale_bytes_per_page=atom_compressed_scale_bytes_per_page,
     )
 
 
@@ -1314,6 +1361,117 @@ def test_merge_kv_cache_spec():
     assert merged_layer_spec.sliding_window == 1
 
 
+def test_merge_atom_mla_spec_preserves_layout_metadata():
+    packed_specs = [
+        new_atom_mla_cache_spec(
+            block_size=8,
+            head_size=512,
+            dtype=torch.uint8,
+            cache_dtype_str="fp8_ds_mla",
+            compress_ratio=4,
+            model_version="deepseek_v4",
+            atom_swa_prefix_bytes=4096,
+            atom_swa_pages=4,
+            atom_compressed_kv_dtype=torch.uint8,
+            atom_compressed_layout="fp8_ds_mla",
+        ),
+        new_atom_mla_cache_spec(
+            block_size=8,
+            head_size=512,
+            dtype=torch.uint8,
+            cache_dtype_str="fp8_ds_mla",
+            compress_ratio=4,
+            model_version="deepseek_v4",
+            atom_swa_prefix_bytes=4096,
+            atom_swa_pages=4,
+            atom_compressed_kv_dtype=torch.uint8,
+            atom_compressed_layout="fp8_ds_mla",
+        ),
+    ]
+
+    merged = packed_specs[0].merge(packed_specs)
+
+    assert isinstance(merged, DeepseekV4AtomMLAAttentionSpec)
+    assert merged.cache_dtype_str == "fp8_ds_mla"
+    assert merged.compress_ratio == 4
+    assert merged.model_version == "deepseek_v4"
+    assert merged.atom_swa_prefix_bytes == 4096
+    assert merged.atom_swa_pages == 4
+    assert merged.atom_compressed_kv_dtype is torch.uint8
+    assert merged.atom_compressed_layout == "fp8_ds_mla"
+
+    sidecar_specs = [
+        new_atom_mla_cache_spec(
+            block_size=8,
+            head_size=512,
+            dtype=torch.float8_e4m3fnuz,
+            cache_dtype_str="auto",
+            compress_ratio=4,
+            atom_swa_prefix_bytes=4096,
+            atom_swa_pages=4,
+            atom_compressed_kv_dtype=torch.float8_e4m3fnuz,
+            atom_compressed_layout="dense",
+            atom_compressed_scale_dtype=torch.float32,
+            atom_compressed_scale_bytes_per_page=32,
+        ),
+        new_atom_mla_cache_spec(
+            block_size=8,
+            head_size=512,
+            dtype=torch.float8_e4m3fnuz,
+            cache_dtype_str="auto",
+            compress_ratio=4,
+            atom_swa_prefix_bytes=4096,
+            atom_swa_pages=4,
+            atom_compressed_kv_dtype=torch.float8_e4m3fnuz,
+            atom_compressed_layout="dense",
+            atom_compressed_scale_dtype=torch.float32,
+            atom_compressed_scale_bytes_per_page=32,
+        ),
+    ]
+
+    merged = sidecar_specs[0].merge(sidecar_specs)
+
+    assert isinstance(merged, DeepseekV4AtomMLAAttentionSpec)
+    assert merged.atom_swa_prefix_bytes == 4096
+    assert merged.atom_swa_pages == 4
+    assert merged.atom_compressed_kv_dtype is torch.float8_e4m3fnuz
+    assert merged.atom_compressed_layout == "dense"
+    assert merged.atom_compressed_scale_dtype is torch.float32
+    assert merged.atom_compressed_scale_bytes_per_page == 32
+
+
+@pytest.mark.parametrize(
+    "changed_kwargs",
+    [
+        {"atom_swa_prefix_bytes": 8192},
+        {"atom_swa_pages": 8},
+        {"atom_compressed_layout": "dense"},
+        {"atom_compressed_scale_dtype": torch.float32},
+        {"atom_compressed_scale_bytes_per_page": 16},
+    ],
+)
+def test_merge_atom_mla_spec_rejects_layout_mismatch(changed_kwargs):
+    base_kwargs = dict(
+        block_size=8,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+        compress_ratio=4,
+        model_version="deepseek_v4",
+        atom_swa_prefix_bytes=4096,
+        atom_swa_pages=4,
+        atom_compressed_kv_dtype=torch.uint8,
+        atom_compressed_layout="fp8_ds_mla",
+    )
+    specs = [
+        new_atom_mla_cache_spec(**base_kwargs),
+        new_atom_mla_cache_spec(**{**base_kwargs, **changed_kwargs}),
+    ]
+
+    with pytest.raises(AssertionError, match="same SWA prefix"):
+        specs[0].merge(specs)
+
+
 def test_is_kv_cache_spec_uniform():
     kv_cache_spec = {
         "layer_1": new_kv_cache_spec(num_kv_heads=32),
@@ -1344,6 +1502,29 @@ def test_is_kv_cache_spec_uniform():
         "layer_2": new_sliding_window_spec(num_kv_heads=32, sliding_window=2),
     }
     assert not is_kv_cache_spec_uniform(kv_cache_spec)
+
+
+def test_atom_mla_mixed_uniformity_is_order_independent():
+    regular = new_mla_cache_spec()
+    atom = new_atom_mla_cache_spec()
+
+    assert not is_kv_cache_spec_uniform({"regular": regular, "atom": atom})
+    assert not is_kv_cache_spec_uniform({"atom": atom, "regular": regular})
+
+    atom_2 = new_atom_mla_cache_spec()
+    assert is_kv_cache_spec_uniform({"atom_1": atom, "atom_2": atom_2})
+
+
+def test_atom_mla_mixed_regular_is_uniform_type_not_uniform_spec():
+    regular = new_mla_cache_spec()
+    atom = new_atom_mla_cache_spec()
+    kv_cache_specs = {"regular": regular, "atom": atom}
+
+    assert not is_kv_cache_spec_uniform(kv_cache_specs)
+    uniform_type_spec = UniformTypeKVCacheSpecs.from_specs(kv_cache_specs)
+
+    assert uniform_type_spec is not None
+    assert uniform_type_spec.kv_cache_specs == kv_cache_specs
 
 
 @pytest.mark.parametrize(
@@ -1472,6 +1653,59 @@ def test_get_max_concurrency_for_kv_cache_config():
     )
     assert num_tokens == max_concurrency_hybrid_model * max_model_len
     assert max_concurrency == max_concurrency_hybrid_model
+
+
+def test_atom_mla_capacity_ignores_fixed_prefix_bytes():
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    regular = new_mla_cache_spec()
+    atom = new_atom_mla_cache_spec()
+    uniform_spec = UniformTypeKVCacheSpecs(
+        block_size=regular.block_size,
+        kv_cache_specs={"regular": regular, "atom": atom},
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[
+            KVCacheTensor(size=4 * regular.page_size_bytes, shared_by=["regular"]),
+            KVCacheTensor(
+                size=atom.atom_swa_prefix_bytes + 4 * atom.page_size_bytes,
+                shared_by=["atom"],
+                fixed_prefix_size=atom.atom_swa_prefix_bytes,
+            ),
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(["regular", "atom"], uniform_spec)],
+    )
+
+    assert get_kv_cache_capacity(vllm_config, kv_cache_config) == (16, 1.0)
+
+
+def test_atom_mla_capacity_skips_empty_projected_groups():
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    atom = new_atom_mla_cache_spec()
+    empty_uniform_spec = UniformTypeKVCacheSpecs(
+        block_size=atom.block_size,
+        kv_cache_specs={},
+    )
+    atom_uniform_spec = UniformTypeKVCacheSpecs(
+        block_size=atom.block_size,
+        kv_cache_specs={"atom": atom},
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=atom.atom_swa_prefix_bytes + 4 * atom.page_size_bytes,
+                shared_by=["atom"],
+                fixed_prefix_size=atom.atom_swa_prefix_bytes,
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec([], empty_uniform_spec),
+            KVCacheGroupSpec(["atom"], atom_uniform_spec),
+        ],
+    )
+
+    assert get_kv_cache_capacity(vllm_config, kv_cache_config) == (16, 1.0)
 
 
 def test_allocate_with_lookahead():
@@ -1854,6 +2088,151 @@ def test_get_kv_cache_config_one_worker():
     )
 
 
+def test_atom_mla_single_uniform_group_allocates_fixed_prefix():
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    regular = new_mla_cache_spec()
+    atom = new_atom_mla_cache_spec()
+    kv_cache_specs = {"regular": regular, "atom": atom}
+
+    kv_cache_config = get_kv_cache_configs(vllm_config, [kv_cache_specs], [1000])[0]
+
+    assert kv_cache_config == KVCacheConfig(
+        num_blocks=7,
+        kv_cache_tensors=[
+            KVCacheTensor(size=7 * regular.page_size_bytes, shared_by=["regular"]),
+            KVCacheTensor(
+                size=atom.atom_swa_prefix_bytes + 7 * atom.page_size_bytes,
+                shared_by=["atom"],
+                fixed_prefix_size=atom.atom_swa_prefix_bytes,
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["regular", "atom"],
+                UniformTypeKVCacheSpecs(block_size=4, kv_cache_specs=kv_cache_specs),
+            )
+        ],
+    )
+
+
+def test_atom_mla_multiple_layers_sum_fixed_prefixes_in_allocation():
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=12))
+    regular = new_mla_cache_spec()
+    atom_a = new_atom_mla_cache_spec(atom_swa_prefix_bytes=96)
+    atom_b = new_atom_mla_cache_spec(atom_swa_prefix_bytes=160)
+    kv_cache_specs = {
+        "regular": regular,
+        "atom_a": atom_a,
+        "atom_b": atom_b,
+    }
+    prefixes = atom_a.atom_swa_prefix_bytes + atom_b.atom_swa_prefix_bytes
+    bytes_per_block = (
+        regular.page_size_bytes + atom_a.page_size_bytes + atom_b.page_size_bytes
+    )
+    available_memory = prefixes + 3 * bytes_per_block
+
+    kv_cache_config = get_kv_cache_configs(
+        vllm_config, [kv_cache_specs], [available_memory]
+    )[0]
+
+    assert kv_cache_config.num_blocks == 3
+    assert kv_cache_config.kv_cache_tensors == [
+        KVCacheTensor(size=3 * regular.page_size_bytes, shared_by=["regular"]),
+        KVCacheTensor(
+            size=atom_a.atom_swa_prefix_bytes + 3 * atom_a.page_size_bytes,
+            shared_by=["atom_a"],
+            fixed_prefix_size=atom_a.atom_swa_prefix_bytes,
+        ),
+        KVCacheTensor(
+            size=atom_b.atom_swa_prefix_bytes + 3 * atom_b.page_size_bytes,
+            shared_by=["atom_b"],
+            fixed_prefix_size=atom_b.atom_swa_prefix_bytes,
+        ),
+    ]
+
+
+def test_atom_mla_num_gpu_blocks_override_keeps_fixed_prefix():
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    vllm_config.cache_config.num_gpu_blocks_override = 4
+    regular = new_mla_cache_spec()
+    atom = new_atom_mla_cache_spec()
+    kv_cache_specs = {"regular": regular, "atom": atom}
+
+    kv_cache_config = get_kv_cache_configs(vllm_config, [kv_cache_specs], [10000])[0]
+
+    assert kv_cache_config.num_blocks == 4
+    assert kv_cache_config.kv_cache_tensors == [
+        KVCacheTensor(size=4 * regular.page_size_bytes, shared_by=["regular"]),
+        KVCacheTensor(
+            size=atom.atom_swa_prefix_bytes + 4 * atom.page_size_bytes,
+            shared_by=["atom"],
+            fixed_prefix_size=atom.atom_swa_prefix_bytes,
+        ),
+    ]
+
+
+def test_atom_mla_mixed_tail_scale_bytes_participate_in_allocation():
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    regular = new_mla_cache_spec()
+    atom = new_atom_mla_cache_spec(
+        dtype=torch.uint8,
+        atom_compressed_kv_dtype=torch.uint8,
+        atom_compressed_scale_dtype=torch.float32,
+        atom_compressed_scale_bytes_per_page=16,
+    )
+    kv_cache_specs = {"regular": regular, "atom": atom}
+
+    kv_cache_config = get_kv_cache_configs(vllm_config, [kv_cache_specs], [1000])[0]
+
+    assert atom.real_page_size_bytes == 96
+    assert atom.page_size_bytes == 96
+    assert kv_cache_config == KVCacheConfig(
+        num_blocks=5,
+        kv_cache_tensors=[
+            KVCacheTensor(size=5 * regular.page_size_bytes, shared_by=["regular"]),
+            KVCacheTensor(
+                size=atom.atom_swa_prefix_bytes + 5 * atom.page_size_bytes,
+                shared_by=["atom"],
+                fixed_prefix_size=atom.atom_swa_prefix_bytes,
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["regular", "atom"],
+                UniformTypeKVCacheSpecs(block_size=4, kv_cache_specs=kv_cache_specs),
+            )
+        ],
+    )
+
+
+def test_atom_mla_packed_fp8_tail_uses_dsv4_584_byte_pages():
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    atom = new_atom_mla_cache_spec(
+        block_size=8,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+        compress_ratio=4,
+        model_version="deepseek_v4",
+        atom_swa_prefix_bytes=256,
+        atom_compressed_kv_dtype=torch.uint8,
+        atom_compressed_layout="fp8_ds_mla",
+    )
+    kv_cache_specs = {"atom": atom}
+
+    kv_cache_config = get_kv_cache_configs(vllm_config, [kv_cache_specs], [4096])[0]
+
+    assert atom.storage_block_size == 2
+    assert atom.real_page_size_bytes == 2 * 584
+    assert atom.page_size_bytes == 2 * 584
+    assert kv_cache_config.kv_cache_tensors[0] == KVCacheTensor(
+        size=atom.atom_swa_prefix_bytes
+        + kv_cache_config.num_blocks * atom.page_size_bytes,
+        shared_by=["atom"],
+        fixed_prefix_size=atom.atom_swa_prefix_bytes,
+    )
+
+
 def test_get_kv_cache_configs_attention_free():
     kv_cache_specs: dict[str, KVCacheSpec] = {}
     vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
@@ -1940,6 +2319,148 @@ def test_generate_scheduler_kv_cache_config():
     )
 
 
+def test_generate_scheduler_kv_cache_config_preserves_atom_spec():
+    regular = new_mla_cache_spec()
+    atom = new_atom_mla_cache_spec()
+    kv_cache_specs = {"regular": regular, "atom": atom}
+    kv_cache_configs = [
+        KVCacheConfig(
+            num_blocks=10,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["regular", "atom"],
+                    UniformTypeKVCacheSpecs(
+                        block_size=regular.block_size,
+                        kv_cache_specs=kv_cache_specs,
+                    ),
+                ),
+            ],
+        )
+    ]
+
+    scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+    scheduler_spec = scheduler_kv_cache_config.kv_cache_groups[0].kv_cache_spec
+
+    assert isinstance(scheduler_spec, DeepseekV4AtomMLAAttentionSpec)
+    assert scheduler_spec.atom_swa_prefix_bytes == atom.atom_swa_prefix_bytes
+    assert scheduler_spec.atom_swa_pages == atom.atom_swa_pages
+
+
+def test_scheduler_atom_mla_preserves_mixed_tail_contract():
+    regular = new_mla_cache_spec()
+    atom = new_atom_mla_cache_spec(
+        dtype=torch.uint8,
+        atom_compressed_kv_dtype=torch.uint8,
+        atom_compressed_scale_dtype=torch.float32,
+        atom_compressed_scale_bytes_per_page=16,
+    )
+    kv_cache_specs = {"regular": regular, "atom": atom}
+    kv_cache_configs = [
+        KVCacheConfig(
+            num_blocks=10,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["regular", "atom"],
+                    UniformTypeKVCacheSpecs(
+                        block_size=regular.block_size,
+                        kv_cache_specs=kv_cache_specs,
+                    ),
+                ),
+            ],
+        )
+    ]
+
+    scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+    scheduler_spec = scheduler_kv_cache_config.kv_cache_groups[0].kv_cache_spec
+
+    assert isinstance(scheduler_spec, DeepseekV4AtomMLAAttentionSpec)
+    assert scheduler_spec.atom_compressed_kv_dtype is torch.uint8
+    assert scheduler_spec.atom_compressed_layout == "dense"
+    assert scheduler_spec.atom_compressed_scale_dtype is torch.float32
+    assert scheduler_spec.atom_compressed_scale_bytes_per_page == 16
+
+
+def test_scheduler_atom_mla_preserves_packed_fp8_tail_contract():
+    regular = new_mla_cache_spec()
+    atom = new_atom_mla_cache_spec(
+        block_size=8,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+        compress_ratio=4,
+        model_version="deepseek_v4",
+        atom_compressed_kv_dtype=torch.uint8,
+        atom_compressed_layout="fp8_ds_mla",
+    )
+    kv_cache_specs = {"regular": regular, "atom": atom}
+    kv_cache_configs = [
+        KVCacheConfig(
+            num_blocks=10,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["regular", "atom"],
+                    UniformTypeKVCacheSpecs(
+                        block_size=regular.block_size,
+                        kv_cache_specs=kv_cache_specs,
+                    ),
+                ),
+            ],
+        )
+    ]
+
+    scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+    scheduler_spec = scheduler_kv_cache_config.kv_cache_groups[0].kv_cache_spec
+
+    assert isinstance(scheduler_spec, DeepseekV4AtomMLAAttentionSpec)
+    assert scheduler_spec.cache_dtype_str == "fp8_ds_mla"
+    assert scheduler_spec.atom_compressed_kv_dtype is torch.uint8
+    assert scheduler_spec.atom_compressed_layout == "fp8_ds_mla"
+
+
+def test_deepseek_v4_grouping_pads_full_mla_when_swa_page_is_larger():
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    small_full = new_mla_cache_spec()
+    atom_full = new_atom_mla_cache_spec(
+        dtype=torch.uint8,
+        atom_compressed_kv_dtype=torch.uint8,
+        atom_compressed_scale_dtype=torch.float32,
+        atom_compressed_scale_bytes_per_page=16,
+    )
+    large_swa = SlidingWindowMLASpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.bfloat16,
+        sliding_window=16,
+    )
+    assert large_swa.page_size_bytes > max(
+        small_full.page_size_bytes,
+        atom_full.page_size_bytes,
+    )
+
+    groups = kv_cache_utils.get_kv_cache_groups(
+        vllm_config,
+        {
+            "small_full": small_full,
+            "atom_full": atom_full,
+            "large_swa": large_swa,
+        },
+    )
+
+    full_group = groups[0].kv_cache_spec
+    assert isinstance(full_group, UniformTypeKVCacheSpecs)
+    assert max(full_group.get_page_sizes()) == large_swa.page_size_bytes
+    assert atom_full.page_size_padded == large_swa.page_size_bytes
+    swa_group = groups[1].kv_cache_spec
+    assert isinstance(swa_group, UniformTypeKVCacheSpecs)
+    assert swa_group.kv_cache_specs["large_swa"].page_size_bytes == (
+        large_swa.page_size_bytes
+    )
+
+
 def new_mla_spec(cache_dtype_str=None):
     # head_size = kv_lora_rank(512) + qk_rope_head_dim(64) = 576
     return MLAAttentionSpec(
@@ -1953,6 +2474,10 @@ def new_mla_spec(cache_dtype_str=None):
 
 def test_get_kv_cache_spec_kind_prefers_specific_attention_subclasses():
     assert get_kv_cache_spec_kind(new_mla_spec()) == KVCacheSpecKind.MLA_ATTENTION
+    assert (
+        get_kv_cache_spec_kind(new_atom_mla_cache_spec())
+        == KVCacheSpecKind.MLA_ATTENTION
+    )
 
     sliding_window_mla_spec = SlidingWindowMLASpec(
         block_size=16,

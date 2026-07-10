@@ -290,12 +290,16 @@ def _reshape_kv_cache(
 
             kv_raw_tensor = kv_cache_raw_tensors[layer_name]
             packing = layer_packing.get(layer_name)
+            prefix_bytes = kv_cache_spec.fixed_prefix_size_bytes
             if packing is not None:
+                assert prefix_bytes == 0
                 _, blk_stride = packing
                 num_blocks = kv_raw_tensor.numel() // blk_stride
             else:
-                assert kv_raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                num_blocks = kv_raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                assert kv_raw_tensor.numel() >= prefix_bytes
+                scalable_bytes = kv_raw_tensor.numel() - prefix_bytes
+                assert scalable_bytes % kv_cache_spec.page_size_bytes == 0
+                num_blocks = scalable_bytes // kv_cache_spec.page_size_bytes
 
             if isinstance(kv_cache_spec, AttentionSpec):
                 has_attn = True
@@ -310,10 +314,13 @@ def _reshape_kv_cache(
                 # unquantized shape; only the quantized primary uses the
                 # quantized cache dtype's (possibly packed) layout.
                 layer_cache_dtype = (
-                    "auto"
-                    if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
-                    and not isinstance(kv_cache_spec, TQFullAttentionSpec)
-                    else cache_dtype
+                    getattr(kv_cache_spec, "cache_dtype_str", None)
+                    or (
+                        "auto"
+                        if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+                        and not isinstance(kv_cache_spec, TQFullAttentionSpec)
+                        else cache_dtype
+                    )
                 )
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
@@ -331,7 +338,7 @@ def _reshape_kv_cache(
                     kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
 
                 kv_caches[layer_name] = _reshape_attention_kv_cache(
-                    kv_raw_tensor,
+                    kv_raw_tensor[prefix_bytes:],
                     kv_cache_spec,
                     kv_cache_shape,
                     kv_cache_stride_order,

@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from importlib.util import find_spec
 
 import torch
@@ -17,6 +18,19 @@ from vllm.utils.torch_utils import LayerNameType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
+
+try:
+    from aiter.ops.topk import (
+        top_k_per_row_decode as _aiter_top_k_per_row_decode,
+    )
+    from aiter.ops.topk import (
+        top_k_per_row_prefill as _aiter_top_k_per_row_prefill,
+    )
+except Exception:
+    _aiter_top_k_per_row_decode = None
+    _aiter_top_k_per_row_prefill = None
+
+_USE_AITER_TOPK = os.environ.get("ATOM_DISABLE_AITER_TOPK", "0") != "1"
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950
@@ -623,6 +637,77 @@ def _topk_indices_torch(
     return padded
 
 
+def _top_k_per_row_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    topk_tokens: int,
+) -> None:
+    if _USE_AITER_TOPK and _aiter_top_k_per_row_prefill is not None:
+        _aiter_top_k_per_row_prefill(
+            logits,
+            row_starts,
+            row_ends,
+            indices,
+            None,
+            num_rows,
+            stride0,
+            stride1,
+            k=topk_tokens,
+        )
+        starts = row_starts.to(dtype=indices.dtype).view(-1, 1)
+        indices.copy_(torch.where(indices < 0, indices, indices - starts))
+        return
+    torch.ops._C.top_k_per_row_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        num_rows,
+        stride0,
+        stride1,
+        topk_tokens,
+    )
+
+
+def _top_k_per_row_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    topk_tokens: int,
+) -> None:
+    if _USE_AITER_TOPK and _aiter_top_k_per_row_decode is not None:
+        _aiter_top_k_per_row_decode(
+            logits,
+            next_n,
+            seq_lens,
+            indices,
+            num_rows,
+            stride0,
+            stride1,
+            k=topk_tokens,
+        )
+        return
+    torch.ops._C.top_k_per_row_decode(
+        logits,
+        next_n,
+        seq_lens,
+        indices,
+        num_rows,
+        stride0,
+        stride1,
+        topk_tokens,
+    )
+
+
 def rocm_aiter_sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -721,6 +806,12 @@ def rocm_aiter_sparse_attn_indexer(
             skip_k_cache_insert,
         )
     layer_attn_metadata = attn_metadata[k_cache_prefix]
+    if not isinstance(layer_attn_metadata, DeepseekV32IndexerMetadata):
+        indexer_metadata_alias = attn_metadata.get(
+            k_cache_prefix + ".__rocm_atom_indexer_metadata"
+        )
+        if isinstance(indexer_metadata_alias, DeepseekV32IndexerMetadata):
+            layer_attn_metadata = indexer_metadata_alias
     assert isinstance(layer_attn_metadata, DeepseekV32IndexerMetadata)
     assert topk_indices_buffer is not None
     assert scale_fmt is not None
@@ -780,7 +871,7 @@ def rocm_aiter_sparse_attn_indexer(
 
             num_rows = logits.shape[0]
 
-            torch.ops._C.top_k_per_row_prefill(
+            _top_k_per_row_prefill(
                 logits,
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
@@ -829,7 +920,7 @@ def rocm_aiter_sparse_attn_indexer(
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         num_rows = logits.shape[0]
 
-        torch.ops._C.top_k_per_row_decode(
+        _top_k_per_row_decode(
             logits,
             next_n,
             decode_metadata.seq_lens,
@@ -1987,6 +2078,7 @@ def _decode_num_splits(
     in one wave, so s8 is strictly better). Snapping needs the average segment
     lengths, which the caller derives sync-free from the ragged index sizes.
     """
+
     base = max(1, num_queries * heads_blocks)
     # Target ~1 workgroup per CU: enough to fill the device while keeping the
     # reduce cost (which grows with split count) small. Tuned on gfx950.

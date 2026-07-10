@@ -7,7 +7,7 @@ pieces that have no analogue in V3/V32:
   * separate ``e_proj`` / ``h_proj`` with fp8 linear quantization (instead of
     the fused ``eh_proj``);
   * ``hc_head`` hypercompressed vocab projection applied in ``compute_logits``;
-  * ``DeepseekV4DecoderLayer`` with its own aux-stream management;
+  * ``DeepseekV4DecoderLayer`` with V4-specific attention/compressor plumbing;
   * V4-specific checkpoint weight-name remapping in ``load_weights``.
 """
 
@@ -42,6 +42,7 @@ from vllm.models.deepseek_v4.common.ops import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.import_utils import has_tilelang
 
 from .model import DeepseekV4DecoderLayer
 
@@ -64,7 +65,6 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         vllm_config: VllmConfig,
         topk_indices_buffer: torch.Tensor,
         prefix: str,
-        aux_stream_list: list[torch.cuda.Stream] | None = None,
     ) -> None:
         super().__init__()
 
@@ -119,10 +119,10 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
             vllm_config,
             prefix,
             topk_indices_buffer=topk_indices_buffer,
-            aux_stream_list=aux_stream_list,
         )
 
         self.hc_head_op = HCHeadOp()
+        self.has_tilelang = has_tilelang()
 
     def forward(
         self,
@@ -155,7 +155,10 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         hidden_states, residual, post_mix, res_mix = self.mtp_block(
             positions=positions, x=hidden_states, input_ids=None
         )
-        if self.mtp_block.use_fused_mhc:
+        # The fused post+pre path (tilelang, on CUDA or ROCm) defers the final
+        # hc_post and returns the residual streams; the unfused path (aiter /
+        # torch on ROCm) applies hc_post inline and returns None.
+        if residual is not None:
             hidden_states = self.mtp_block.hc_post(
                 hidden_states, residual, post_mix, res_mix
             )
@@ -181,14 +184,6 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
             device=self.device,
         )
 
-        # Three aux streams shared across all MTP layers, mirroring
-        # DeepseekV4Model. ROCm runs the same work serially for now.
-        aux_stream_list = (
-            None
-            if current_platform.is_rocm()
-            else [torch.cuda.Stream() for _ in range(3)]
-        )
-
         # to map the exact layer index from weights
         self.layers = torch.nn.ModuleDict(
             {
@@ -196,7 +191,6 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
                     vllm_config,
                     self.topk_indices_buffer,
                     f"{prefix}.layers.{idx}",
-                    aux_stream_list=aux_stream_list,
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,
