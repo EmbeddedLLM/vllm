@@ -7,62 +7,28 @@ import torch
 # this import will also register the custom ops
 # import vllm.model_executor.kernels.mhc  # noqa: F401
 import vllm.model_executor.kernels.mhc as mhc_kernels
+from vllm._aiter_ops import is_aiter_found_and_supported
 from vllm.model_executor.custom_op import CustomOp
+from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 
-HAS_TILELANG = has_tilelang()
-_USE_AITER_MHC = os.environ.get("VLLM_ROCM_DSV4_USE_AITER_MHC", "0") == "1"
-_USE_AITER_MHC_PRE = (
-    os.environ.get("VLLM_ROCM_DSV4_USE_AITER_MHC_PRE", str(int(_USE_AITER_MHC))) == "1"
-)
-_USE_AITER_MHC_POST = (
-    os.environ.get("VLLM_ROCM_DSV4_USE_AITER_MHC_POST", str(int(_USE_AITER_MHC))) == "1"
-)
-_USE_AITER_MHC_FUSED_POST_PRE = (
-    os.environ.get("VLLM_ROCM_DSV4_USE_AITER_MHC_FUSED_POST_PRE", "0") == "1"
-)
-_AITER_MHC_FUSED_POST_PRE_MAX_TOKENS = int(
-    os.environ.get("VLLM_ROCM_DSV4_AITER_MHC_FUSED_POST_PRE_MAX_TOKENS", "64")
-)
-_USE_AITER_HC_HEAD = os.environ.get("VLLM_ROCM_DSV4_USE_AITER_HC_HEAD", "0") == "1"
-_AITER_MHC_MAX_TOKENS = int(os.environ.get("VLLM_ROCM_DSV4_AITER_MHC_MAX_TOKENS", "-1"))
-if _USE_AITER_MHC_PRE or _USE_AITER_MHC_POST:
-    try:
-        import aiter
 
-        HAS_AITER_MHC = hasattr(aiter, "mhc_pre") and hasattr(aiter, "mhc_post")
-    except Exception:
-        HAS_AITER_MHC = False
-else:
-    HAS_AITER_MHC = False
-HAS_AITER_HC_HEAD = _USE_AITER_HC_HEAD
-
-
-def _use_aiter_mhc_for_shape(residual: torch.Tensor) -> bool:
-    if not HAS_AITER_MHC:
+def _has_tilelang_mhc() -> bool:
+    if not has_tilelang():
         return False
-    hidden_size = residual.shape[-1]
-    if hidden_size % 256 != 0:
-        return False
-    num_tokens = residual.numel() // (residual.shape[-2] * hidden_size)
-    if _AITER_MHC_MAX_TOKENS >= 0 and num_tokens > _AITER_MHC_MAX_TOKENS:
-        return False
-    return True
+    if current_platform.is_cuda():
+        return True
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx942
+
+        # TileLang MHC currently produces incorrect results on gfx942. Keep
+        # gfx942 on the existing torch/triton fallbacks until that path is fixed.
+        return not on_gfx942()
+    return False
 
 
-def _use_aiter_mhc_pre_for_shape(residual: torch.Tensor) -> bool:
-    return _USE_AITER_MHC_PRE and _use_aiter_mhc_for_shape(residual)
-
-
-def _use_aiter_mhc_post_for_shape(residual: torch.Tensor) -> bool:
-    return _USE_AITER_MHC_POST and _use_aiter_mhc_for_shape(residual)
-
-
-def _use_aiter_mhc_fused_post_pre_for_shape(residual: torch.Tensor) -> bool:
-    if not _USE_AITER_MHC_FUSED_POST_PRE or not _use_aiter_mhc_for_shape(residual):
-        return False
-    num_tokens = residual.numel() // (residual.shape[-2] * residual.shape[-1])
-    return num_tokens <= _AITER_MHC_FUSED_POST_PRE_MAX_TOKENS
+HAS_TILELANG_MHC = _has_tilelang_mhc()
+HAS_AITER_MHC = is_aiter_found_and_supported()
 
 
 # --8<-- [start:mhc_pre]
@@ -125,10 +91,8 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # The aiter mhc_pre kernel only supports hidden sizes that are a
-        # multiple of 256. Requires aiter >= 0.1.14 for correct results at
-        # large token counts (sqrsum race-condition fix, commit b639cb6).
-        if _use_aiter_mhc_pre_for_shape(residual):
+        hidden_size = residual.shape[-1]
+        if HAS_AITER_MHC and hidden_size % 256 == 0:
             return torch.ops.vllm.mhc_pre_aiter(
                 residual,
                 fn,
@@ -139,11 +103,8 @@ class MHCPreOp(CustomOp):
                 hc_sinkhorn_eps,
                 hc_post_mult_value,
                 sinkhorn_repeat,
-                n_splits,
-                norm_weight,
-                norm_eps,
             )
-        if HAS_TILELANG:
+        elif HAS_TILELANG_MHC:
             return torch.ops.vllm.mhc_pre_tilelang(
                 residual,
                 fn,
@@ -265,17 +226,15 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
-        # The aiter mhc_post kernel only supports hidden sizes that are a
-        # multiple of 256. Requires aiter >= 0.1.14 for correct results at
-        # large token counts (sqrsum race-condition fix, commit b639cb6).
-        if _use_aiter_mhc_post_for_shape(residual):
+        hidden_size = residual.shape[-1]
+        if HAS_AITER_MHC and hidden_size % 256 == 0:
             return torch.ops.vllm.mhc_post_aiter(
                 x,
                 residual,
                 post_layer_mix,
                 comb_res_mix,
             )
-        if HAS_TILELANG:
+        if HAS_TILELANG_MHC:
             return torch.ops.vllm.mhc_post_tilelang(
                 x, residual, post_layer_mix, comb_res_mix
             )
@@ -361,16 +320,7 @@ class HCHeadOp(CustomOp):
         outer_shape = hidden_states.shape[:-2]
         hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
 
-        if HAS_AITER_HC_HEAD and hidden_size % 256 == 0:
-            out = torch.ops.vllm.hc_head_aiter(
-                hs_flat,
-                hc_fn,
-                hc_scale,
-                hc_base,
-                rms_norm_eps,
-                hc_eps,
-            )
-        elif HAS_TILELANG:
+        if HAS_TILELANG_MHC:
             out = torch.ops.vllm.hc_head_fused_kernel_tilelang(
                 hs_flat,
                 hc_fn,
@@ -526,7 +476,26 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return torch.ops.vllm.mhc_fused_post_pre_tilelang(
+        if HAS_TILELANG_MHC:
+            return torch.ops.vllm.mhc_fused_post_pre_tilelang(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+                norm_weight,
+                norm_eps,
+            )
+        return self.forward_native(
             x,
             residual,
             post_layer_mix,

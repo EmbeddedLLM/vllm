@@ -105,6 +105,7 @@ class KVBlockZeroer:
         cache_dtype: str,
         static_forward_context: dict[str, Any],
         runner_only_attn_layers: set[str] | None = None,
+        max_concurrency: int = 1,
     ) -> None:
         """Precompute the absolute-address table for the Triton zeroing kernel.
 
@@ -121,9 +122,14 @@ class KVBlockZeroer:
         self.device = device
         self.pin_memory = pin_memory
         self._metas: list[tuple[torch.Tensor, int, int, int]] = []
+        if max_concurrency < 1:
+            raise ValueError("max_concurrency must be at least 1")
+        self.max_concurrency = max_concurrency
+        self._meta: tuple[torch.Tensor, int, int, int] | None = None
         self._id_cap: int = 0
-        self._ids_pinned: torch.Tensor | None = None
-        self._ids_gpu: torch.Tensor | None = None
+        self._ids_pinned: list[torch.Tensor] = []
+        self._ids_gpu: list[torch.Tensor] = []
+        self._id_buffer_index = 0
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
@@ -195,6 +201,28 @@ class KVBlockZeroer:
                     len(seg_addrs),
                 )
             )
+        self._allocate_id_buffers()
+        self._meta = (
+            torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
+            page_size_el,
+            blk_size,
+            len(seg_addrs),
+        )
+
+    def _allocate_id_buffers(self) -> None:
+        self._ids_pinned = [
+            torch.empty(
+                self._id_cap,
+                dtype=torch.int64,
+                pin_memory=self.pin_memory,
+            )
+            for _ in range(self.max_concurrency)
+        ]
+        self._ids_gpu = [
+            torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
+            for _ in range(self.max_concurrency)
+        ]
+        self._id_buffer_index = 0
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
@@ -202,6 +230,9 @@ class KVBlockZeroer:
             return
         n_blocks = len(block_ids)
         if n_blocks > self._id_cap:
+            # The old pinned buffers may still be the source of an in-flight
+            # nonblocking copy. Growing is rare, so we don't mind the sync overhead
+            torch.accelerator.synchronize()
             self._id_cap = n_blocks * 2
             self._ids_pinned = torch.empty(
                 self._id_cap,
@@ -225,6 +256,26 @@ class KVBlockZeroer:
                 PAGE_SIZE_EL=page_size_el,
                 BLOCK_SIZE=blk_size,
             )
+            self._allocate_id_buffers()
+
+        # The H2D copy is nonblocking, so its pinned source must not be mutated
+        # while this batch is in flight. Rotate through as many buffers as concurrent
+        # in-flight batches, to avoid collisions.
+        buffer_index = self._id_buffer_index
+        self._id_buffer_index = (buffer_index + 1) % self.max_concurrency
+        ids_pinned = self._ids_pinned[buffer_index]
+        ids_pinned[:n_blocks].numpy()[:] = block_ids
+        idx = self._ids_gpu[buffer_index][:n_blocks]
+        idx.copy_(ids_pinned[:n_blocks], non_blocking=True)
+        grid = (n_blocks * n_segs * (page_size_el // blk_size),)
+        _zero_kv_blocks_kernel[grid](
+            seg_addrs,
+            idx,
+            n_blocks,
+            N_SEGS=n_segs,
+            PAGE_SIZE_EL=page_size_el,
+            BLOCK_SIZE=blk_size,
+        )
 
 
 @dataclass

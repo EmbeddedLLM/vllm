@@ -305,6 +305,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.bool,
             device=self.device,
         )
+        spec_config = self.vllm_config.speculative_config
+        self.is_dspark = spec_config is not None and spec_config.use_dspark()
+        self.noncausal_index_width = (
+            cdiv(self.window_size + self.num_speculative_tokens, 128) * 128
+            if self.is_dspark
+            else 0
+        )
 
     def build(
         self,

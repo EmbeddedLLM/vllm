@@ -7,7 +7,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
-import numpy as np
 import torch
 
 from vllm.config import VllmConfig
@@ -119,7 +118,6 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
-        "bfloat16",
         "fp8_ds_mla",
         "fp8",  # alias for fp8_ds_mla
     ]
@@ -159,6 +157,10 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
 
     @classmethod
     def is_sparse(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_sink(cls) -> bool:
         return True
 
     @classmethod
@@ -290,18 +292,7 @@ class DeepseekV4FlashMLAMetadataBuilder(
         profile, profile_call = self._profile_metadata_this_call()
         t0 = time.perf_counter() if profile else 0.0
         cm = common_attn_metadata
-        num_tokens = cm.num_actual_tokens
-        starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
-        seg_lengths = np.diff(starts)
-        req_id_per_token = np.repeat(
-            np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
-        )
-        # Zero-fill for cudagraphs
-        self.req_id_per_token_buffer.fill_(0)
-        self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
-            torch.from_numpy(req_id_per_token), non_blocking=True
-        )
-        req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+        req_id_per_token = cm.token_to_req_indices(self.req_id_per_token_buffer)
         t1 = time.perf_counter() if profile else 0.0
 
         slot_mapping = cm.slot_mapping
