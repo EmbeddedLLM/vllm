@@ -51,25 +51,11 @@ the captured launch sequence.
 from __future__ import annotations
 
 import functools
-import os
 
 import torch
 import triton
 import triton.language as tl
 
-_ATOM_DECODE_KV_SPLITS_OVERRIDE = os.environ.get("VLLM_ROCM_DSV4_ATOM_DECODE_KV_SPLITS")
-_ATOM_DECODE_SPLIT_WORKSPACE = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_DECODE_SPLIT_WORKSPACE", "torch_empty")
-    .strip()
-    .lower()
-)
-_ATOM_USE_TRITON_ATTN = os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1"
-_ATOM_DECODE_TRUST_INDICES = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_DECODE_TRUST_INDICES", "1") != "0"
-)
-_ATOM_USE_AITER_PA_DECODE = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_USE_AITER_PA_DECODE", "0") == "1"
-)
 try:
     from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
         _pa_decode_sparse as _aiter_pa_decode_sparse_kernel,
@@ -85,7 +71,6 @@ from aiter.ops.triton.utils.device_info import get_num_sms
 from vllm.models.deepseek_v4.amd.v4_kernels.reference import (
     sparse_attn_ragged_torch,
 )
-from vllm.v1.worker.workspace import current_workspace_manager
 
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
 _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
@@ -239,7 +224,7 @@ def _kernel_config(block_h: int) -> tuple[int, int, int]:
     config is identical between CUDAGraph capture and replay regardless of
     per-token K. In production ``kv_indices.shape[0]`` is a padded bucket
     whose value is unrelated to the true per-token kv_len, so any heuristic
-    that reads it would mis-tune at capture time.
+    that reads it would mistune at capture time.
 
     Derived from autotune statistics over ~150 shapes on MI355:
       - BLOCK_K=16 dominated (~78% of best configs for D=512); D=512 has
@@ -332,13 +317,11 @@ def sparse_attn_v4_paged_decode_kv_splits(
         block_h = triton.next_power_of_2(block_h)
     block_h = max(block_h, 16)
 
-    if _ATOM_DECODE_KV_SPLITS_OVERRIDE:
-        return max(1, int(_ATOM_DECODE_KV_SPLITS_OVERRIDE)), "override"
     return _kv_splits_heuristic(T, H, block_h), "heuristic"
 
 
 def sparse_attn_v4_paged_decode_split_workspace_mode() -> str:
-    return _ATOM_DECODE_SPLIT_WORKSPACE
+    return "torch_empty"
 
 
 def _alloc_decode_split_partials(
@@ -358,27 +341,7 @@ def _alloc_decode_split_partials(
         )
         return m_partial, l_partial, acc_partial
 
-    if _ATOM_DECODE_SPLIT_WORKSPACE == "torch_empty":
-        return _alloc_torch_empty()
-
-    if _ATOM_DECODE_SPLIT_WORKSPACE != "workspace":
-        raise RuntimeError(
-            "VLLM_ROCM_DSV4_ATOM_DECODE_SPLIT_WORKSPACE must be "
-            "'workspace' or 'torch_empty', got "
-            f"{_ATOM_DECODE_SPLIT_WORKSPACE!r}"
-        )
-
-    try:
-        workspace_manager = current_workspace_manager()
-    except RuntimeError:
-        return _alloc_torch_empty()
-    return tuple(
-        workspace_manager.get_simultaneous(
-            ((T, kv_splits, h_padded), torch.float32),
-            ((T, kv_splits, h_padded), torch.float32),
-            ((T, kv_splits, h_padded, D), torch.float32),
-        )
-    )
+    return _alloc_torch_empty()
 
 
 # ---------------------------------------------------------------------------
@@ -1463,10 +1426,7 @@ def _sparse_attn_v4_paged_decode_triton(
     block_d = triton.next_power_of_2(D)
 
     if kv_splits is None:
-        if _ATOM_DECODE_KV_SPLITS_OVERRIDE:
-            kv_splits = max(1, int(_ATOM_DECODE_KV_SPLITS_OVERRIDE))
-        else:
-            kv_splits = _kv_splits_heuristic(T, H, block_h)
+        kv_splits = _kv_splits_heuristic(T, H, block_h)
 
     qk_scale = float(softmax_scale) * LOG2E
     _bk, num_warps, num_stages = _kernel_config(block_h)
@@ -1524,7 +1484,7 @@ def _sparse_attn_v4_paged_decode_triton(
             QUANT_KV=quant_kv,
             GROUP_SIZE=_FP8_GROUP_SIZE,
             NUM_GROUPS=num_groups_arg,
-            TRUST_INDICES=_ATOM_DECODE_TRUST_INDICES,
+            TRUST_INDICES=True,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -1575,7 +1535,7 @@ def _sparse_attn_v4_paged_decode_triton(
         GROUP_SIZE=_FP8_GROUP_SIZE,
         NUM_GROUPS=num_groups_arg,
         TOTAL_PAGES=unified_kv.shape[0],
-        TRUST_INDICES=_ATOM_DECODE_TRUST_INDICES,
+        TRUST_INDICES=True,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -1896,7 +1856,7 @@ def sparse_attn_v4_paged_decode_split_kv(
     a homogeneous ``[swa_prefix + compressed_tail, D]`` tensor and loads either
     the SWA prefix or compressed tail directly based on each unified slot id.
     """
-    if not _ATOM_USE_TRITON_ATTN or not q.is_cuda:
+    if not q.is_cuda:
         return sparse_attn_v4_paged_decode_split_kv_reference(
             q,
             swa_kv,
@@ -2038,10 +1998,7 @@ def sparse_attn_v4_paged_decode_split_kv(
     block_d = triton.next_power_of_2(D)
 
     if kv_splits is None:
-        if _ATOM_DECODE_KV_SPLITS_OVERRIDE:
-            kv_splits = max(1, int(_ATOM_DECODE_KV_SPLITS_OVERRIDE))
-        else:
-            kv_splits = _kv_splits_heuristic(T, H, block_h)
+        kv_splits = _kv_splits_heuristic(T, H, block_h)
 
     _bk, num_warps, num_stages = _kernel_config(block_h)
     if block_k is None:
@@ -2107,7 +2064,7 @@ def sparse_attn_v4_paged_decode_split_kv(
             PACKED_BLOCK_SIZE=int(compressed_kv.shape[1]) if packed_tail else 1,
             ORDERED_SPLIT=ordered_split,
             CSA_WINDOW_SIZE=int(csa_window_size) if ordered_split else 1,
-            TRUST_INDICES=_ATOM_DECODE_TRUST_INDICES,
+            TRUST_INDICES=True,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -2199,7 +2156,7 @@ def sparse_attn_v4_paged_decode_split_kv(
         CSA_INDEX_TOPK=csa_index_topk,
         CSA_BLOCK_CAPACITY=int(csa_block_capacity) if fuse_csa_topk else 1,
         CSA_WINDOW_SIZE=int(csa_window_size) if ordered_split else 1,
-        TRUST_INDICES=_ATOM_DECODE_TRUST_INDICES,
+        TRUST_INDICES=True,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -2330,41 +2287,14 @@ def sparse_attn_v4_paged_decode(
     softmax_scale: float,
     kv_scales: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
-    use_aiter_direct: bool = True,
+    kv_splits: int | None = None,
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
     When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
     """
-    if (
-        _ATOM_USE_AITER_PA_DECODE
-        and use_aiter_direct
-        and _aiter_pa_decode_sparse_kernel is not None
-        and kv_scales is None
-        and unified_kv.dtype == q.dtype
-    ):
-        return _sparse_attn_v4_paged_decode_aiter_direct(
-            q,
-            unified_kv,
-            kv_indices,
-            kv_indptr,
-            attn_sink,
-            softmax_scale,
-            out=out,
-        )
-    if _ATOM_USE_TRITON_ATTN:
-        return _sparse_attn_v4_paged_decode_triton(
-            q,
-            unified_kv,
-            kv_indices,
-            kv_indptr,
-            attn_sink,
-            softmax_scale,
-            kv_scales=kv_scales,
-            out=out,
-        )
-    return sparse_attn_v4_paged_decode_reference(
+    return _sparse_attn_v4_paged_decode_triton(
         q,
         unified_kv,
         kv_indices,
@@ -2373,4 +2303,5 @@ def sparse_attn_v4_paged_decode(
         softmax_scale,
         kv_scales=kv_scales,
         out=out,
+        kv_splits=kv_splits,
     )

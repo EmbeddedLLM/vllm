@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 from dataclasses import dataclass
 
 import torch
@@ -33,11 +32,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
-_ATOM_ROCM_DSV4_ENABLED = current_platform.is_rocm() and (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION", "0") == "1"
-    or os.environ.get("VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR", "0") == "1"
-    or os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV", "0") == "1"
-)
+_ATOM_ROCM_DSV4_ENABLED = current_platform.is_rocm()
 
 
 @triton.jit
@@ -296,12 +291,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.reorder_batch_threshold += self.num_speculative_tokens
         # NOTE: SM100 datacenter GPUs support any next_n natively via the
         # multi-atom paged MQA logits kernels (FP8 and FP4 indexer
-        # caches). Outside the SM100 family the FP8
-        # paged MQA logits kernel only supports next_n in (1, 2)
-        # (deepgemm smxx_fp8_fp4_paged_mqa_logits.hpp:233), so flatten there.
-        self.use_flattening = not current_platform.is_device_capability_family(
-            100
-        ) and next_n not in (1, 2)
+        # caches). ROCm's paged kernel is not safe for multi-token decode at
+        # long context and high batch sizes, so always flatten next_n > 1.
+        # On other non-SM100 platforms the FP8 paged MQA logits kernel only
+        # supports next_n in (1, 2), so flatten larger horizons there.
+        self.use_flattening = (
+            current_platform.is_rocm() and next_n > 1
+        ) or (
+            not current_platform.is_device_capability_family(100)
+            and next_n not in (1, 2)
+        )
         logger.info_once(
             "DSA indexer decode path: use_flattening=%s "
             "(next_n=%d, use_fp4_indexer_cache=%s)",
@@ -672,8 +671,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
 
             max_decode_len = int(decode_lens_cpu.max().item())
-            next_n = 1 + self.num_speculative_tokens
-            use_native = not self.use_flattening and max_decode_len <= next_n
+            configured_next_n = 1 + self.num_speculative_tokens
+            # A mixed prefill/decode step can suppress speculative tokens for
+            # every decode request.  Treat that as an ordinary one-token decode
+            # even when the runner is globally configured for MTP; carrying the
+            # configured speculative width into this path gives the ROCm
+            # indexer inconsistent metadata (actual width 1, next_n > 1).
+            next_n = 1 if max_decode_len == 1 else configured_next_n
+            use_native = max_decode_len == 1 or (
+                not self.use_flattening and max_decode_len <= next_n
+            )
 
             global_seq_lens_for_decode = self._prepare_global_decode_seq_lens(
                 global_seq_lens=global_seq_lens_for_decode,

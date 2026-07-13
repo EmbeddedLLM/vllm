@@ -10,8 +10,6 @@ state such as SWA rings and compressor state rings.
 
 from __future__ import annotations
 
-import os
-import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,7 +21,6 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.models.deepseek_v4.amd.atom_native_abi import require_atom_native_abi
 from vllm.models.deepseek_v4.amd.v4_kernels.compress_plan import (
     CompressPlan,
     make_compress_plans,
@@ -32,115 +29,14 @@ from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import get_paged_mqa_logits_metadata, has_deep_gemm
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.attention.backends.mla.compressor_utils import (
-    get_compressed_slot_mapping,
-)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
-
-
-def _check_required_native_atom_abi() -> None:
-    if not _REQUIRE_NATIVE_ATOM_ABI:
-        return
-    require_atom_native_abi()
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
-_ATOM_UNIFIED_KV_ENABLED = os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV", "0") == "1"
-_ATOM_ATTENTION_ENABLED = os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION", "0") == "1"
-_ATOM_UNIFIED_KV_FROM_VLLM_ENABLED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM", "0") == "1"
-)
-_ATOM_COMPRESS_PLAN_ENABLED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_COMPRESS_PLAN", "0") == "1"
-)
-_ATOM_STATE_ALLOC_ENABLED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_STATE_ALLOC", "0") == "1"
-)
-_ATOM_PROFILE_METADATA = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA", "0") == "1"
-)
-_ATOM_PROFILE_METADATA_EVERY = max(
-    1, _env_int("VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_EVERY", 128)
-)
-_ATOM_PROFILE_METADATA_START_AFTER = max(
-    0, _env_int("VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_START_AFTER", 0)
-)
-_ATOM_INDEXER_FASTPATH_ENABLED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_INDEXER_FASTPATH", "0") == "1"
-)
-_ATOM_SKIP_GENERIC_INDEXER_METADATA = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_SKIP_INDEXER_METADATA", "0") == "1"
-)
-_ATOM_SKIP_GENERIC_DECODE_METADATA = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_SKIP_DECODE_METADATA", "1") != "0"
-)
-_ATOM_SKIP_GENERIC_COMPRESSOR_METADATA = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_SKIP_COMPRESSOR_METADATA", "1") != "0"
-)
-_ATOM_FAST_PURE_DECODE_METADATA = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_FAST_PURE_DECODE_METADATA", "1") != "0"
-)
-_ATOM_SKIP_MIXED_GENERIC_DECODE_METADATA = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_SKIP_MIXED_DECODE_METADATA", "0") == "1"
-)
-_ATOM_PREFILL_ALLOW_MIXED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED", "1") == "1"
-)
-_ATOM_SKIP_PAGED_PREFILL = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_SKIP_PAGED_PREFILL", "0") == "1"
-)
-_ATOM_HCA_NATIVE_INDICES = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_HCA_NATIVE_INDICES", "0") == "1"
-)
-_ATOM_MAIN_COMPRESSOR_ENABLED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR", "0") == "1"
-)
-_ATOM_NATIVE_AFTER_MAIN_COMPRESSOR = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_NATIVE_AFTER_MAIN_COMPRESSOR", "0") == "1"
-)
-_REQUIRE_NATIVE_ATOM_ABI = (
-    os.environ.get("VLLM_ROCM_DSV4_REQUIRE_NATIVE_ATOM_ABI", "0") == "1"
-)
-_ATOM_RETURN_FALSE_AT_ENTRY = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_RETURN_FALSE_AT_ENTRY", "0") == "1"
-)
-_ATOM_PROBE_INDICES_ONLY = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_PROBE_INDICES_ONLY", "0") == "1"
-)
-_ATOM_ATTENTION_RATIOS = frozenset(
-    part.strip()
-    for part in os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION_RATIOS", "").split(",")
-    if part.strip()
-)
-_ATOM_ATTENTION_LAYERS = frozenset(
-    part.strip()
-    for part in os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION_LAYERS", "").split(",")
-    if part.strip()
-)
-_ATOM_DECODE_METADATA_BACKENDS = frozenset(
-    (
-        "DEEPSEEK_SPARSE_SWA",
-        "FLASHMLA_SPARSE_DSV4",
-        "ROCM_FLASHMLA_SPARSE_DSV4",
-    )
-)
-_ATOM_INDEXER_METADATA_ALIAS_SUFFIX = ".__rocm_atom_indexer_metadata"
 
 
 class _CpuGpuInt32Buffer:
@@ -176,12 +72,10 @@ class _CpuGpuInt32Buffer:
 class DeepseekV4RocmAtomStateBuffers:
     """Persistent ATOM-style request-state buffers.
 
-    These are intentionally separate from vLLM's active cache tensors for now.
-    Later integration slices can replace the current cache consumers with these
-    buffers without changing the request lifecycle again.
+    The scheduler-owned KV allocation contains the SWA and compressed token
+    caches. These buffers only hold compressor state that is not block-managed.
     """
 
-    swa_kv: torch.Tensor
     csa_main_kv_state: torch.Tensor
     csa_main_score_state: torch.Tensor
     csa_idx_kv_state: torch.Tensor
@@ -335,15 +229,6 @@ class DeepseekV4RocmAtomDecodeCache:
 
 
 @dataclass(frozen=True)
-class DeepseekV4RocmAtomIndexerKCacheMetadata:
-    """Minimal metadata needed by the indexer compressor cache writer."""
-
-    slot_mapping: torch.Tensor
-    block_table: torch.Tensor | None = None
-    block_size: int = 0
-
-
-@dataclass(frozen=True)
 class DeepseekV4RocmAtomSWADecodeMetadata:
     """Minimal SWA metadata for ROCm DSV4 pure ATOM decode."""
 
@@ -469,8 +354,6 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         device: torch.device,
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
-        _check_required_native_atom_abi()
-
         hf_config = vllm_config.model_config.hf_config
         self.window_size = int(getattr(hf_config, "sliding_window", 0) or 0)
         self.num_spec_tokens = int(vllm_config.num_speculative_tokens or 0)
@@ -490,14 +373,12 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
             )
         self.k1_csa = atom_block_size // 4
         self.k2_hca = atom_block_size // 128
+        self._additional_atom_models: list[nn.Module] = []
         self._atom_state_buffers: DeepseekV4RocmAtomStateBuffers | None = None
         self._atom_unified_kv_buffers: DeepseekV4RocmAtomUnifiedKVBuffers | None = None
-        self._enable_atom_unified_kv = _ATOM_UNIFIED_KV_ENABLED
-        self._enable_atom_unified_kv_from_vllm = _ATOM_UNIFIED_KV_FROM_VLLM_ENABLED
-        self._enable_atom_compress_plans = _ATOM_COMPRESS_PLAN_ENABLED
+        self._atom_swa_only_kv_by_layer: dict[int, torch.Tensor] = {}
         self._compress_plan_buffers = self._allocate_compress_plan_buffers()
         self._req_id_to_atom_slot: dict[str, int] = {}
-        self._atom_metadata_profile_calls = 0
 
         self._state_slot_mapping = torch.zeros(
             self.max_num_reqs,
@@ -559,6 +440,11 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
             fill=0,
         )
         self._positions_cpu = self._positions_cpu_tensor.numpy()
+        self._draft_positions_cpu_tensor = self._new_pinned_int32(
+            (self.max_num_reqs,),
+            fill=0,
+        )
+        self._draft_positions_cpu = self._draft_positions_cpu_tensor.numpy()
         self._scheduled_tokens_cpu = np.empty(self.max_num_reqs, dtype=np.int32)
         self._computed_tokens_cpu = np.empty(self.max_num_reqs, dtype=np.int32)
         self._context_lens_cpu = np.empty(self.max_num_reqs, dtype=np.int32)
@@ -580,9 +466,8 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
             device=self.device,
         )
 
-        if _ATOM_STATE_ALLOC_ENABLED:
-            self._atom_state_buffers = self._allocate_atom_state_buffers()
-            self._bind_atom_state_buffers(self._atom_state_buffers)
+        self._atom_state_buffers = self._allocate_atom_state_buffers()
+        self._bind_atom_state_buffers(self._atom_state_buffers)
 
     @staticmethod
     def _new_pinned_int32(
@@ -615,8 +500,6 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
 
         buffers = self._atom_state_buffers
         if buffers is not None:
-            if buffers.swa_kv.numel():
-                buffers.swa_kv[:, req_index].zero_()
             for kv_state in (
                 buffers.csa_main_kv_state,
                 buffers.csa_idx_kv_state,
@@ -872,20 +755,57 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
 
     def _iter_active_attn_modules(self) -> list[tuple[int, nn.Module]]:
         modules: list[tuple[int, nn.Module]] = []
-        for module in self.model.modules():
-            if not (
-                hasattr(module, "swa_cache_layer")
-                and hasattr(module, "compress_ratio")
-                and hasattr(module, "head_dim")
-                and hasattr(module, "prefix")
-            ):
-                continue
-            try:
-                layer_id = extract_layer_index(module.prefix)
-            except Exception:
-                continue
-            modules.append((layer_id, module))
+        for model in (self.model, *self._additional_atom_models):
+            for module in model.modules():
+                if not (
+                    hasattr(module, "swa_cache_layer")
+                    and hasattr(module, "compress_ratio")
+                    and hasattr(module, "head_dim")
+                    and hasattr(module, "prefix")
+                ):
+                    continue
+                try:
+                    layer_id = extract_layer_index(module.prefix)
+                except Exception:
+                    continue
+                modules.append((layer_id, module))
         return sorted(modules, key=lambda item: item[0])
+
+    def register_atom_model(self, model: nn.Module) -> None:
+        """Include an auxiliary model (for example MTP) in ATOM state.
+
+        Registration happens after target and draft weights are loaded but
+        before KV-cache profiling/initialization, so all draft allocations are
+        visible to the normal vLLM memory profiler and are bound from the same
+        KVCacheConfig as target layers.
+        """
+        if model is self.model or any(
+            model is item for item in self._additional_atom_models
+        ):
+            return
+        if self._atom_unified_kv_buffers is not None:
+            raise RuntimeError(
+                "ATOM auxiliary models must be registered before KV binding."
+            )
+        self._additional_atom_models.append(model)
+        self._atom_state_buffers = self._allocate_atom_state_buffers()
+        self._bind_atom_state_buffers(self._atom_state_buffers)
+        for layer_id, attn in self._iter_active_attn_modules():
+            if int(getattr(attn, "compress_ratio", 0)) > 1:
+                continue
+            unified = self._atom_swa_only_kv_by_layer.get(layer_id)
+            if unified is None:
+                unified = torch.zeros(
+                    (self.swa_pages, self.head_dim),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                self._atom_swa_only_kv_by_layer[layer_id] = unified
+            attn.atom_unified_kv = unified
+            attn.atom_swa_kv = unified.view(
+                self.max_num_reqs, self.win_with_spec, self.head_dim
+            )
+            attn.atom_swa_pages = self.swa_pages
 
     def _allocate_atom_state_buffers(self) -> DeepseekV4RocmAtomStateBuffers:
         active_attn = self._iter_active_attn_modules()
@@ -902,21 +822,10 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         )
 
         state_dtype = torch.float32
-        swa_dtype = self.dtype
         ring_extra = self.num_spec_tokens
         csa_state_len = 2 * 4 + ring_extra
         hca_state_len = 128 + ring_extra
 
-        swa_kv = torch.zeros(
-            (
-                len(active_layer_ids),
-                self.max_num_reqs,
-                self.win_with_spec,
-                self.head_dim,
-            ),
-            dtype=swa_dtype,
-            device=self.device,
-        )
         csa_main_shape = (
             len(csa_layer_ids),
             self.max_num_reqs,
@@ -948,7 +857,6 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
             )
 
         buffers = DeepseekV4RocmAtomStateBuffers(
-            swa_kv=swa_kv,
             csa_main_kv_state=zeros(csa_main_shape),
             csa_main_score_state=neg_inf(csa_main_shape),
             csa_idx_kv_state=zeros(csa_idx_shape),
@@ -970,14 +878,10 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         return buffers
 
     def _bind_atom_state_buffers(self, buffers: DeepseekV4RocmAtomStateBuffers) -> None:
-        active_pos = {
-            layer_id: pos for pos, layer_id in enumerate(buffers.active_layer_ids)
-        }
         csa_pos = {layer_id: pos for pos, layer_id in enumerate(buffers.csa_layer_ids)}
         hca_pos = {layer_id: pos for pos, layer_id in enumerate(buffers.hca_layer_ids)}
 
         for layer_id, attn in self._iter_active_attn_modules():
-            attn.atom_swa_kv = buffers.swa_kv[active_pos[layer_id]]
             attn.atom_win_with_spec = self.win_with_spec
             attn.atom_swa_pages = self.swa_pages
 
@@ -1000,104 +904,6 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                 if inner is not None:
                     inner.atom_kv_state = buffers.csa_idx_kv_state[pos]
                     inner.atom_score_state = buffers.csa_idx_score_state[pos]
-
-    def _allocate_atom_unified_kv_buffers(
-        self,
-        num_blocks: int,
-        k_per_block_by_ratio: dict[int, int],
-    ) -> DeepseekV4RocmAtomUnifiedKVBuffers:
-        active_attn = self._iter_active_attn_modules()
-        active_layer_ids = tuple(layer_id for layer_id, _ in active_attn)
-        dtype = self.dtype
-
-        unified_kv: list[torch.Tensor] = []
-        unified_kv_by_layer: dict[int, torch.Tensor] = {}
-        compressed_kv_cache: dict[int, torch.Tensor] = {}
-        compressed_kv_scales: dict[int, torch.Tensor | None] = {}
-        compressed_kv_layout: dict[int, str] = {}
-        for layer_id, module in active_attn:
-            ratio = int(module.compress_ratio)
-            k_per_block = k_per_block_by_ratio.get(ratio, 0)
-
-            compress_pages = num_blocks * k_per_block
-            unified = torch.zeros(
-                (self.swa_pages + compress_pages, self.head_dim),
-                dtype=dtype,
-                device=self.device,
-            )
-            unified_kv.append(unified)
-            unified_kv_by_layer[layer_id] = unified
-            if k_per_block:
-                compressed_kv_cache[layer_id] = unified[self.swa_pages :].view(
-                    num_blocks,
-                    k_per_block,
-                    self.head_dim,
-                )
-                compressed_kv_scales[layer_id] = None
-                compressed_kv_layout[layer_id] = "dense"
-
-        buffers = DeepseekV4RocmAtomUnifiedKVBuffers(
-            unified_kv=tuple(unified_kv),
-            unified_kv_by_layer=unified_kv_by_layer,
-            compressed_kv_cache=compressed_kv_cache,
-            compressed_kv_scales=compressed_kv_scales,
-            compressed_kv_layout=compressed_kv_layout,
-            active_layer_ids=active_layer_ids,
-            num_blocks=num_blocks,
-            swa_pages=self.swa_pages,
-            k1_csa=self.k1_csa,
-            k2_hca=self.k2_hca,
-        )
-        logger.info(
-            "Allocated ROCm DSV4 ATOM unified KV buffers: active_layers=%d, "
-            "num_blocks=%d, swa_pages=%d",
-            len(active_layer_ids),
-            num_blocks,
-            self.swa_pages,
-        )
-        return buffers
-
-    def _bind_atom_unified_kv_buffers(
-        self,
-        buffers: DeepseekV4RocmAtomUnifiedKVBuffers,
-    ) -> None:
-        for layer_id, attn in self._iter_active_attn_modules():
-            unified = buffers.unified_kv_by_layer.get(layer_id)
-            if unified is not None:
-                attn.atom_unified_kv = unified
-                attn.atom_swa_kv = unified[: buffers.swa_pages].view(
-                    self.max_num_reqs, self.win_with_spec, self.head_dim
-                )
-                attn.atom_win_with_spec = self.win_with_spec
-                attn.atom_swa_pages = buffers.swa_pages
-            else:
-                atom_swa_kv = getattr(attn, "atom_swa_kv", None)
-                if atom_swa_kv is None:
-                    raise RuntimeError(
-                        "ROCm DSV4 ATOM split-only KV bundle requires an "
-                        f"existing atom_swa_kv view for layer {layer_id}."
-                    )
-                attn.atom_win_with_spec = self.win_with_spec
-                attn.atom_swa_pages = buffers.swa_pages
-
-            compressed = buffers.compressed_kv_cache.get(layer_id)
-            if compressed is None:
-                continue
-
-            attn.atom_compressed_kv_cache = compressed
-            attn.atom_split_kv_swa = attn.atom_swa_kv
-            attn.atom_split_kv_compressed = compressed
-            attn.atom_split_kv_scales = buffers.compressed_kv_scales.get(layer_id)
-            attn.atom_split_kv_layout = buffers.compressed_kv_layout.get(
-                layer_id, "dense"
-            )
-            compressor = getattr(attn, "compressor", None)
-            if compressor is not None:
-                compressor.atom_kv_cache = compressed
-                compressor.atom_kv_scales = getattr(attn, "atom_split_kv_scales", None)
-                compressor.atom_kv_layout = getattr(
-                    attn, "atom_split_kv_layout", "dense"
-                )
 
     def _make_storage_view(
         self,
@@ -1126,8 +932,6 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         self,
         kv_cache_config: KVCacheConfig,
     ) -> bool:
-        if not self._enable_atom_unified_kv_from_vllm:
-            return False
         if self._atom_unified_kv_from_vllm_bound:
             return True
 
@@ -1165,21 +969,20 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                         f"dtype={kv_cache.dtype}, shape={tuple(kv_cache.shape)}."
                     )
                 continue
-            if kv_cache.dtype != self.dtype:
-                if not (
-                    hasattr(attn, "atom_split_kv_swa")
-                    and hasattr(attn, "atom_split_kv_compressed")
-                    and hasattr(attn, "atom_split_kv_scales")
-                ):
-                    logger.warning_once(
-                        "ROCm DSV4 ATOM vLLM-owned mixed KV cannot bind yet: "
-                        "layer %s compressed tail dtype is %s and split KV "
-                        "views are not available. Falling back to the "
-                        "model-state side allocation.",
-                        getattr(attn, "prefix", "<unknown>"),
-                        kv_cache.dtype,
-                    )
-                    return False
+            if kv_cache.dtype != self.dtype and not (
+                hasattr(attn, "atom_split_kv_swa")
+                and hasattr(attn, "atom_split_kv_compressed")
+                and hasattr(attn, "atom_split_kv_scales")
+            ):
+                logger.warning_once(
+                    "ROCm DSV4 ATOM vLLM-owned mixed KV cannot bind yet: "
+                    "layer %s compressed tail dtype is %s and split KV "
+                    "views are not available. Falling back to the "
+                    "model-state side allocation.",
+                    getattr(attn, "prefix", "<unknown>"),
+                    kv_cache.dtype,
+                )
+                return False
 
         if not atom_attn:
             logger.warning_once(
@@ -1194,6 +997,11 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         compressed_kv_scales: dict[int, torch.Tensor | None] = {}
         compressed_kv_layout: dict[int, str] = {}
         unified_layer_ids: list[int] = []
+
+        for layer_id, unified in self._atom_swa_only_kv_by_layer.items():
+            unified_kv.append(unified)
+            unified_kv_by_layer[layer_id] = unified
+            unified_layer_ids.append(layer_id)
 
         for layer_id, attn in atom_attn:
             ratio = int(getattr(attn, "compress_ratio", 0))
@@ -1225,7 +1033,8 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                     raise RuntimeError(
                         "ROCm DSV4 ATOM packed fp8_ds_mla KV storage is too "
                         f"small for layer {getattr(attn, 'prefix', '<unknown>')}: "
-                        f"storage_bytes={storage_bytes}, expected_bytes={expected_bytes}, "
+                        f"storage_bytes={storage_bytes}, "
+                        f"expected_bytes={expected_bytes}, "
                         f"swa_pages={swa_pages}, num_blocks={num_blocks}, "
                         f"k_per_block={k_per_block}."
                     )
@@ -1247,6 +1056,7 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                 attn.atom_swa_kv = swa.view(
                     self.max_num_reqs, self.win_with_spec, self.head_dim
                 )
+                attn.atom_direct_swa_bound = True
                 attn.atom_swa_pages = swa_pages
                 attn.atom_compressed_kv_cache = compressed
                 attn.atom_split_kv_swa = attn.atom_swa_kv
@@ -1321,6 +1131,7 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
             attn.atom_swa_kv = unified[:swa_pages].view(
                 self.max_num_reqs, self.win_with_spec, self.head_dim
             )
+            attn.atom_direct_swa_bound = True
             attn.atom_swa_pages = swa_pages
             attn.atom_compressed_kv_cache = compressed
             attn.atom_split_kv_swa = attn.atom_swa_kv
@@ -1358,7 +1169,7 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
             "Bound ROCm DSV4 ATOM unified KV views from vLLM-owned KV storage: "
             "active_layers=%d, ratio_counts=%s, num_blocks=%d, swa_pages=%d, "
             "win_with_spec=%d, head_dim=%d, dtype=%s, layout_counts=%s",
-            len(atom_attn),
+            len(unified_layer_ids),
             ratio_counts,
             num_blocks,
             self.swa_pages,
@@ -1373,9 +1184,6 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         self,
         kv_cache_config: KVCacheConfig,
     ) -> None:
-        if not self._enable_atom_unified_kv:
-            return
-
         if self._try_bind_atom_unified_kv_from_vllm(kv_cache_config):
             return
 
@@ -1386,48 +1194,10 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                 "kv_cache_config.num_blocks is unavailable."
             )
             return
-        if self._enable_atom_unified_kv_from_vllm:
-            raise RuntimeError(
-                "ROCm DSV4 ATOM vLLM-owned unified KV was requested with "
-                "VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1, but the model "
-                "state could not bind ATOM unified KV views from vLLM KV "
-                "storage. Refusing to fall back to the side allocation because "
-                "that would not test the requested KV-cache integration path."
-            )
-
-        if self._atom_unified_kv_buffers is not None:
-            if self._atom_unified_kv_buffers.num_blocks != num_blocks:
-                logger.warning_once(
-                    "ROCm DSV4 ATOM unified KV was allocated for %d blocks; "
-                    "current kv_cache_config has %d blocks.",
-                    self._atom_unified_kv_buffers.num_blocks,
-                    num_blocks,
-                )
-            return
-
-        k_per_block_by_ratio: dict[int, int] = {}
-        for group in kv_cache_config.kv_cache_groups:
-            specs = getattr(group.kv_cache_spec, "kv_cache_specs", None)
-            if specs is None:
-                iter_specs = (group.kv_cache_spec,)
-            else:
-                iter_specs = tuple(specs.values())
-            for spec in iter_specs:
-                ratio = int(getattr(spec, "compress_ratio", 0) or 0)
-                if ratio <= 1:
-                    continue
-                storage_block_size = int(getattr(spec, "storage_block_size", 0) or 0)
-                if storage_block_size <= 0:
-                    continue
-                k_per_block_by_ratio[ratio] = storage_block_size
-        self.k1_csa = k_per_block_by_ratio.get(4, self.k1_csa)
-        self.k2_hca = k_per_block_by_ratio.get(128, self.k2_hca)
-
-        self._atom_unified_kv_buffers = self._allocate_atom_unified_kv_buffers(
-            num_blocks,
-            k_per_block_by_ratio,
+        raise RuntimeError(
+            "ROCm DeepSeek-V4 requires ATOM KV views backed by vLLM-owned "
+            "storage, but ModelState could not bind the allocated KV cache."
         )
-        self._bind_atom_unified_kv_buffers(self._atom_unified_kv_buffers)
 
     def _build_atom_state_metadata(
         self,
@@ -1436,10 +1206,7 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         compress_plans: dict[int, CompressPlan] | None,
         *,
         request_length_views: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
-        profile: bool = False,
-        profile_call: int = 0,
     ) -> DeepseekV4RocmAtomStateMetadata:
-        t0 = time.perf_counter() if profile else 0.0
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding
@@ -1490,8 +1257,6 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                 self._batch_id_per_token_cpu_tensor[:num_tokens],
                 non_blocking=True,
             )
-        t1 = time.perf_counter() if profile else 0.0
-
         if num_actual_reqs:
             if pure_decode_one_token:
                 self._positions_cpu[:num_actual_reqs] = computed
@@ -1522,7 +1287,6 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                 self._n_committed_hca_per_seq_cpu_tensor[:num_actual_reqs],
                 non_blocking=True,
             )
-        t2 = time.perf_counter() if profile else 0.0
         if num_reqs > num_actual_reqs:
             self._state_slot_mapping[num_actual_reqs:num_reqs].zero_()
             self._state_slot_mapping_cpu[num_actual_reqs:num_reqs] = 0
@@ -1538,8 +1302,6 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
             self._positions_cpu[:num_tokens] = 0
             self._chunk_start_per_seq_cpu[:num_reqs] = 0
             self._chunk_start_per_seq[:num_reqs].zero_()
-        t3 = time.perf_counter() if profile else 0.0
-
         # Pure decode consumes CPU arrays only while building graph-stable
         # indptrs below; the model forward reads the GPU tensors. Avoid per-step
         # numpy allocations for snapshots that would otherwise die unused.
@@ -1593,27 +1355,7 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
             prefill_cache=DeepseekV4RocmAtomPrefillCache(self.index_topk),
             compress_plans=compress_plans,
         )
-        t4 = time.perf_counter() if profile else 0.0
         self._prepare_atom_decode_metadata(metadata)
-        if profile:
-            t5 = time.perf_counter()
-            logger.info(
-                "ROCm DSV4 ATOM state metadata detail call=%d reqs=%d/%d "
-                "tokens=%d/%d map_batch=%.3fms pos_commit=%.3fms "
-                "pad=%.3fms dataclass=%.3fms decode_indptr=%.3fms "
-                "total=%.3fms",
-                profile_call,
-                input_batch.num_reqs,
-                input_batch.num_reqs_after_padding,
-                input_batch.num_tokens,
-                input_batch.num_tokens_after_padding,
-                (t1 - t0) * 1000.0,
-                (t2 - t1) * 1000.0,
-                (t3 - t2) * 1000.0,
-                (t4 - t3) * 1000.0,
-                (t5 - t4) * 1000.0,
-                (t5 - t0) * 1000.0,
-            )
         return metadata
 
     def _prepare_atom_decode_metadata(
@@ -1811,25 +1553,6 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         )
         return scheduled.size == num_reqs and bool(np.all(scheduled == 1))
 
-    def _can_skip_generic_indexer_metadata(
-        self,
-        input_batch: InputBatch,
-        pure_decode_one_token: bool | None = None,
-    ) -> bool:
-        if (
-            not _ATOM_SKIP_GENERIC_INDEXER_METADATA
-            or not _ATOM_INDEXER_FASTPATH_ENABLED
-            or not current_platform.is_rocm()
-        ):
-            return False
-        if self.vllm_config.attention_config.use_fp4_indexer_cache:
-            return False
-        if pure_decode_one_token is None:
-            pure_decode_one_token = self._is_pure_decode_one_token_batch(input_batch)
-        # Mixed decode+prefill still needs the native indexer metadata to build
-        # prefill top-k rows. Only pure decode can bypass the generic indexer.
-        return pure_decode_one_token
-
     @staticmethod
     def _without_attn_backends(
         attn_groups: list[list[AttentionGroup]],
@@ -1868,52 +1591,50 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         input_batch: InputBatch,
         pure_decode_one_token: bool | None = None,
     ) -> bool:
-        if (
-            not _ATOM_SKIP_GENERIC_DECODE_METADATA
-            or not _ATOM_ATTENTION_ENABLED
-            or not _ATOM_UNIFIED_KV_ENABLED
-            or not current_platform.is_rocm()
-            or _ATOM_HCA_NATIVE_INDICES
-            or _ATOM_RETURN_FALSE_AT_ENTRY
-            or _ATOM_PROBE_INDICES_ONLY
-            or _ATOM_ATTENTION_RATIOS
-            or _ATOM_ATTENTION_LAYERS
-        ):
+        if not current_platform.is_rocm():
             return False
         if pure_decode_one_token is None:
             pure_decode_one_token = self._is_pure_decode_one_token_batch(input_batch)
-        if pure_decode_one_token:
-            return True
-        if (
-            _ATOM_SKIP_MIXED_GENERIC_DECODE_METADATA
-            and _ATOM_PREFILL_ALLOW_MIXED
-            and not _ATOM_SKIP_PAGED_PREFILL
-            and self._atom_mixed_batch_is_decode_then_prefill(input_batch)
-        ):
-            return True
-        # Mixed decode+prefill previously hit HIP illegal access when generic
-        # sparse metadata was skipped. Keep the default on the stable generic
-        # mixed metadata path; the env gate above is for the ordered ATOM mixed
-        # path experiment.
-        return False
+        # Mixed decode+prefill needs native sparse metadata to build its
+        # prefill rows; pure one-token decode uses ModelState metadata directly.
+        return pure_decode_one_token
+
+    def _attn_groups_use_only_bound_atom_layers(
+        self,
+        attn_groups: list[list[AttentionGroup]],
+    ) -> bool:
+        buffers = self._atom_state_buffers
+        if buffers is None:
+            return False
+        bound_layer_ids = frozenset(buffers.active_layer_ids)
+        saw_sparse_group = False
+        sparse_backends = frozenset(
+            (
+                "DEEPSEEK_SPARSE_SWA",
+                "FLASHMLA_SPARSE_DSV4",
+                "ROCM_FLASHMLA_SPARSE_DSV4",
+            )
+        )
+        for groups in attn_groups:
+            for group in groups:
+                if group.backend.get_name() not in sparse_backends:
+                    continue
+                saw_sparse_group = True
+                for layer_name in group.layer_names:
+                    try:
+                        layer_id = extract_layer_index(layer_name)
+                    except Exception:
+                        return False
+                    if layer_id not in bound_layer_ids:
+                        return False
+        return saw_sparse_group
 
     def _can_skip_generic_atom_compressor_metadata(
         self,
         input_batch: InputBatch,
         pure_decode_one_token: bool | None = None,
     ) -> bool:
-        if (
-            not _ATOM_SKIP_GENERIC_COMPRESSOR_METADATA
-            or not _ATOM_MAIN_COMPRESSOR_ENABLED
-            or not _ATOM_ATTENTION_ENABLED
-            or not _ATOM_UNIFIED_KV_ENABLED
-            or not current_platform.is_rocm()
-            or _ATOM_NATIVE_AFTER_MAIN_COMPRESSOR
-            or _ATOM_RETURN_FALSE_AT_ENTRY
-            or _ATOM_PROBE_INDICES_ONLY
-            or _ATOM_ATTENTION_RATIOS
-            or _ATOM_ATTENTION_LAYERS
-        ):
+        if not current_platform.is_rocm():
             return False
         if pure_decode_one_token is None:
             pure_decode_one_token = self._is_pure_decode_one_token_batch(input_batch)
@@ -2041,29 +1762,11 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                             existing_metadata, DeepseekV32IndexerMetadata
                         ):
                             attn_metadata[
-                                layer_name + _ATOM_INDEXER_METADATA_ALIAS_SUFFIX
+                                layer_name + ".__rocm_atom_indexer_metadata"
                             ] = existing_metadata
                         attn_metadata[layer_name] = mla_metadata
                         attached = True
         return attached
-
-    def _atom_mixed_batch_is_decode_then_prefill(
-        self,
-        input_batch: InputBatch,
-    ) -> bool:
-        num_reqs = int(input_batch.num_reqs)
-        if num_reqs <= 0:
-            return False
-        scheduled = input_batch.num_scheduled_tokens[:num_reqs]
-        if scheduled.size <= 0 or not bool(np.any(scheduled > 1)):
-            return False
-        decode_mask = scheduled <= 1
-        num_decodes = int(np.count_nonzero(decode_mask))
-        if num_decodes <= 0 or num_decodes >= num_reqs:
-            return False
-        return bool(
-            np.all(decode_mask[:num_decodes]) and not np.any(decode_mask[num_decodes:])
-        )
 
     def _atom_minimal_decode_prefill_counts(
         self,
@@ -2181,100 +1884,6 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         )
         return True
 
-    def _attach_minimal_indexer_k_cache_metadata(
-        self,
-        metadata: DeepseekV4RocmAtomStateMetadata,
-        attn_metadata: dict[str, Any],
-        block_tables: tuple[torch.Tensor, ...],
-        attn_groups: list[list[AttentionGroup]],
-    ) -> bool:
-        """Attach enough indexer metadata for the compressor cache write.
-
-        The indexer-inner compressor needs ``attn_metadata[indexer_k_cache]
-        .slot_mapping`` before the ATOM decode fastpath can bypass the generic
-        ``SparseAttnIndexer`` object. This helper avoids building the full
-        ``DeepseekV32IndexerMetadata`` for the pure-decode probe while keeping
-        the native cache writer functional.
-        """
-
-        group_info = self._find_indexer_kv_cache_group(attn_groups)
-        if group_info is None:
-            return False
-        group_idx, storage_block_size = group_info
-        if group_idx >= len(block_tables):
-            return False
-        block_table = block_tables[group_idx]
-        if block_table.shape[0] < metadata.num_reqs:
-            return False
-
-        slot_mapping = get_compressed_slot_mapping(
-            metadata.num_tokens,
-            metadata.query_start_loc,
-            metadata.seq_lens,
-            block_table,
-            storage_block_size,
-            4,
-            out=self._indexer_compressed_slot_mapping,
-        )
-        k_cache_metadata = DeepseekV4RocmAtomIndexerKCacheMetadata(
-            slot_mapping=slot_mapping,
-            block_table=block_table,
-            block_size=storage_block_size,
-        )
-        for group in attn_groups[group_idx]:
-            if group.backend.get_name() != "DEEPSEEK_V4_INDEXER":
-                continue
-            for layer_name in group.layer_names:
-                attn_metadata[layer_name] = k_cache_metadata
-        return True
-
-    def _attach_minimal_compressor_state_metadata(
-        self,
-        metadata: DeepseekV4RocmAtomStateMetadata,
-        attn_metadata: dict[str, Any],
-        block_tables: tuple[torch.Tensor, ...],
-        slot_mappings: torch.Tensor,
-        attn_groups: list[list[AttentionGroup]],
-    ) -> bool:
-        """Attach native compressor state metadata without generic builders.
-
-        Pure decode with ATOM attention bypasses the generic sparse-attention
-        and main-compressor builders, but the indexer-inner compressor still
-        uses vLLM's native state/KV cache writer. Its builder normally creates
-        a per-token request map with ``repeat_interleave``; for one-token
-        decode this is exactly the already-prepared ``batch_id_per_token``.
-        """
-
-        from vllm.models.deepseek_v4.compressor import CompressorMetadata
-
-        attached = False
-        token_to_req_indices = metadata.batch_id_per_token[: metadata.num_tokens]
-        query_start_loc = metadata.query_start_loc
-        for group_idx, groups in enumerate(attn_groups):
-            if group_idx >= len(block_tables) or group_idx >= len(slot_mappings):
-                continue
-            block_table = block_tables[group_idx]
-            slot_mapping = slot_mappings[group_idx]
-            for group in groups:
-                if group.backend.get_name() != "CompressorBackend":
-                    continue
-                if self._is_atom_main_compressor_group(group):
-                    continue
-                block_size = int(getattr(group.kv_cache_spec, "block_size", 0) or 0)
-                if block_size <= 0:
-                    continue
-                compressor_metadata = CompressorMetadata(
-                    block_table=block_table,
-                    slot_mapping=slot_mapping,
-                    block_size=block_size,
-                    token_to_req_indices=token_to_req_indices,
-                    query_start_loc=query_start_loc,
-                )
-                for layer_name in group.layer_names:
-                    attn_metadata[layer_name] = compressor_metadata
-                    attached = True
-        return attached
-
     def _copy_actual_request_length_views(
         self,
         input_batch: InputBatch,
@@ -2302,8 +1911,6 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         input_batch: InputBatch,
         request_length_views: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
     ) -> dict[int, CompressPlan] | None:
-        if not self._enable_atom_compress_plans:
-            return None
         num_reqs = input_batch.num_reqs
         if num_reqs <= 0 or not self._compress_plan_buffers:
             return None
@@ -2324,11 +1931,7 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         extend_lens_cpu: np.ndarray,
         context_lens_cpu: np.ndarray,
     ) -> dict[int, CompressPlan] | None:
-        if (
-            not self._enable_atom_compress_plans
-            or extend_lens_cpu.size <= 0
-            or not self._compress_plan_buffers
-        ):
+        if extend_lens_cpu.size <= 0 or not self._compress_plan_buffers:
             return None
         ratios_overlap = [
             (ratio, ratio == 4) for ratio in sorted(self._compress_plan_buffers)
@@ -2533,43 +2136,35 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
     ) -> dict[str, Any]:
-        profile = False
-        call = 0
-        if _ATOM_PROFILE_METADATA:
-            self._atom_metadata_profile_calls += 1
-            call = self._atom_metadata_profile_calls
-            if call > _ATOM_PROFILE_METADATA_START_AFTER:
-                printed_count = call - _ATOM_PROFILE_METADATA_START_AFTER
-                profile = (
-                    printed_count <= 16
-                    or printed_count % _ATOM_PROFILE_METADATA_EVERY == 0
-                )
-
-        t0 = time.perf_counter() if profile else 0.0
         request_length_views = self._copy_actual_request_length_views(input_batch)
         pure_decode_one_token = self._is_pure_decode_one_token_batch(
             input_batch,
             request_length_views[0],
         )
-        skip_generic_indexer_metadata = self._can_skip_generic_indexer_metadata(
-            input_batch,
-            pure_decode_one_token,
-        )
         skip_generic_atom_decode_metadata = self._can_skip_generic_atom_decode_metadata(
             input_batch,
             pure_decode_one_token,
-        )
+        ) and self._attn_groups_use_only_bound_atom_layers(attn_groups)
         skip_generic_atom_compressor_metadata = (
             self._can_skip_generic_atom_compressor_metadata(
                 input_batch,
                 pure_decode_one_token,
             )
+            and any(
+                self._is_atom_main_compressor_group(group)
+                for groups in attn_groups
+                for group in groups
+            )
         )
         skip_backend_names: set[str] = set()
-        if skip_generic_indexer_metadata:
-            skip_backend_names.add("DEEPSEEK_V4_INDEXER")
         if skip_generic_atom_decode_metadata:
-            skip_backend_names.update(_ATOM_DECODE_METADATA_BACKENDS)
+            skip_backend_names.update(
+                (
+                    "DEEPSEEK_SPARSE_SWA",
+                    "FLASHMLA_SPARSE_DSV4",
+                    "ROCM_FLASHMLA_SPARSE_DSV4",
+                )
+            )
         metadata_attn_groups = (
             self._without_attn_backends(attn_groups, frozenset(skip_backend_names))
             if skip_backend_names
@@ -2579,56 +2174,27 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
             metadata_attn_groups = self._without_atom_main_compressor_groups(
                 metadata_attn_groups
             )
-        fast_pure_decode_metadata = (
-            _ATOM_FAST_PURE_DECODE_METADATA
-            and not for_capture
-            and pure_decode_one_token
-            and skip_generic_indexer_metadata
-            and skip_generic_atom_decode_metadata
-            and skip_generic_atom_compressor_metadata
+        attn_metadata = super().prepare_attn(
+            input_batch=input_batch,
+            cudagraph_mode=cudagraph_mode,
+            block_tables=block_tables,
+            slot_mappings=slot_mappings,
+            attn_groups=metadata_attn_groups,
+            kv_cache_config=kv_cache_config,
+            for_capture=for_capture,
         )
-        if fast_pure_decode_metadata:
-            attn_metadata: dict[str, Any] = {}
-        else:
-            attn_metadata = super().prepare_attn(
-                input_batch=input_batch,
-                cudagraph_mode=cudagraph_mode,
-                block_tables=block_tables,
-                slot_mappings=slot_mappings,
-                attn_groups=metadata_attn_groups,
-                kv_cache_config=kv_cache_config,
-                for_capture=for_capture,
-            )
-        t1 = time.perf_counter() if profile else 0.0
 
         self._maybe_allocate_atom_unified_kv(kv_cache_config)
-        t2 = time.perf_counter() if profile else 0.0
         compress_plans = self._build_compress_plans(
             input_batch,
             request_length_views,
         )
-        t3 = time.perf_counter() if profile else 0.0
         atom_state = self._build_atom_state_metadata(
             input_batch,
             cudagraph_mode,
             compress_plans,
             request_length_views=request_length_views,
-            profile=profile,
-            profile_call=call,
         )
-        t4 = time.perf_counter() if profile else 0.0
-        if fast_pure_decode_metadata:
-            if not self._attach_minimal_compressor_state_metadata(
-                atom_state,
-                attn_metadata,
-                block_tables,
-                slot_mappings,
-                attn_groups,
-            ):
-                raise RuntimeError(
-                    "VLLM_ROCM_DSV4_ATOM_FAST_PURE_DECODE_METADATA=1 could "
-                    "not attach minimal compressor state metadata."
-                )
         if not self._attach_direct_indexer_decode_metadata(
             atom_state,
             input_batch,
@@ -2636,47 +2202,29 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
             attn_groups,
             pure_decode_one_token,
         ):
-            if fast_pure_decode_metadata:
-                raise RuntimeError(
-                    "VLLM_ROCM_DSV4_ATOM_FAST_PURE_DECODE_METADATA=1 could "
-                    "not attach direct indexer decode metadata."
-                )
-            else:
-                self._attach_indexer_decode_metadata(atom_state, attn_metadata)
-        if skip_generic_indexer_metadata:
-            if not self._attach_minimal_indexer_k_cache_metadata(
-                atom_state,
-                attn_metadata,
-                block_tables,
-                attn_groups,
-            ):
-                raise RuntimeError(
-                    "VLLM_ROCM_DSV4_ATOM_SKIP_INDEXER_METADATA=1 could not "
-                    "attach minimal indexer k-cache metadata."
-                )
-        if skip_generic_atom_decode_metadata:
-            if not self._attach_minimal_atom_decode_metadata(
+            self._attach_indexer_decode_metadata(atom_state, attn_metadata)
+        if skip_generic_atom_decode_metadata and not (
+            self._attach_minimal_atom_decode_metadata(
                 atom_state,
                 attn_metadata,
                 block_tables,
                 slot_mappings,
                 attn_groups,
                 input_batch=input_batch,
-            ):
-                raise RuntimeError(
-                    "VLLM_ROCM_DSV4_ATOM_SKIP_DECODE_METADATA=1 could not "
-                    "attach minimal ROCm DSV4 decode metadata."
-                )
-        if skip_generic_atom_compressor_metadata:
-            if not self._attach_minimal_atom_compressor_decode_metadata(
+            )
+        ):
+            raise RuntimeError(
+                "Could not attach minimal ROCm DeepSeek-V4 decode metadata."
+            )
+        if skip_generic_atom_compressor_metadata and not (
+            self._attach_minimal_atom_compressor_decode_metadata(
                 attn_metadata,
                 attn_groups,
-            ):
-                raise RuntimeError(
-                    "VLLM_ROCM_DSV4_ATOM_SKIP_COMPRESSOR_METADATA=1 could "
-                    "not attach minimal ROCm DSV4 compressor metadata."
-                )
-        t5 = time.perf_counter() if profile else 0.0
+            )
+        ):
+            raise RuntimeError(
+                "Could not attach minimal ROCm DeepSeek-V4 compressor metadata."
+            )
         seen: set[int] = set()
         for metadata in attn_metadata.values():
             metadata_id = id(metadata)
@@ -2684,30 +2232,118 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                 continue
             seen.add(metadata_id)
             object.__setattr__(metadata, "deepseek_v4_rocm_atom_state", atom_state)
-        if profile:
-            t6 = time.perf_counter()
-            logger.info(
-                "ROCm DSV4 ATOM metadata profile call=%d capture=%s "
-                "reqs=%d/%d tokens=%d/%d super=%.3fms "
-                "unified=%.3fms plans=%.3fms state=%.3fms "
-                "indexer_attach=%.3fms annotate=%.3fms total=%.3fms",
-                call,
-                (
-                    f"{for_capture} skip_indexer={skip_generic_indexer_metadata} "
-                    f"skip_decode={skip_generic_atom_decode_metadata} "
-                    f"skip_compressor={skip_generic_atom_compressor_metadata} "
-                    f"fast_pure={fast_pure_decode_metadata}"
-                ),
-                input_batch.num_reqs,
-                input_batch.num_reqs_after_padding,
-                input_batch.num_tokens,
-                input_batch.num_tokens_after_padding,
-                (t1 - t0) * 1000.0,
-                (t2 - t1) * 1000.0,
-                (t3 - t2) * 1000.0,
-                (t4 - t3) * 1000.0,
-                (t5 - t4) * 1000.0,
-                (t6 - t5) * 1000.0,
-                (t6 - t0) * 1000.0,
-            )
+        return attn_metadata
+
+    def augment_draft_decode_attn_metadata(
+        self,
+        attn_metadata: dict[str, Any],
+        *,
+        num_reqs: int,
+        num_reqs_padded: int,
+        num_tokens_padded: int,
+        input_buffers: InputBuffers,
+        idx_mapping: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        kv_cache_config: KVCacheConfig,
+    ) -> dict[str, Any]:
+        """Attach ATOM request state to later autoregressive MTP forwards."""
+        del attn_groups, block_tables, slot_mappings
+        self._maybe_allocate_atom_unified_kv(kv_cache_config)
+
+        if num_reqs <= 0:
+            return attn_metadata
+        if num_tokens_padded < num_reqs or num_reqs_padded < num_reqs:
+            raise ValueError("Invalid padded shape for MTP draft decode.")
+
+        self._state_slot_mapping[:num_reqs].copy_(idx_mapping[:num_reqs])
+        if num_reqs_padded > num_reqs:
+            self._state_slot_mapping[num_reqs:num_reqs_padded].zero_()
+
+        self._batch_id_per_token_cpu[:num_reqs] = self._req_arange_cpu[:num_reqs]
+        if num_tokens_padded > num_reqs:
+            self._batch_id_per_token_cpu[num_reqs:num_tokens_padded] = -1
+        self._batch_id_per_token[:num_tokens_padded].copy_(
+            self._batch_id_per_token_cpu_tensor[:num_tokens_padded],
+            non_blocking=True,
+        )
+
+        self._draft_positions_cpu_tensor[:num_reqs].copy_(
+            input_buffers.positions[:num_reqs],
+            non_blocking=False,
+        )
+        self._positions_cpu[:num_reqs] = self._draft_positions_cpu[:num_reqs]
+        if num_tokens_padded > num_reqs:
+            self._positions_cpu[num_reqs:num_tokens_padded] = 0
+
+        self._chunk_start_per_seq_cpu[:num_reqs] = self._positions_cpu[:num_reqs]
+        self._chunk_start_per_seq[:num_reqs].copy_(
+            self._chunk_start_per_seq_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+        np.add(
+            self._positions_cpu[:num_reqs],
+            1,
+            out=self._context_lens_cpu[:num_reqs],
+        )
+        np.floor_divide(
+            self._context_lens_cpu[:num_reqs],
+            4,
+            out=self._n_committed_csa_per_seq_cpu[:num_reqs],
+        )
+        np.floor_divide(
+            self._context_lens_cpu[:num_reqs],
+            128,
+            out=self._n_committed_hca_per_seq_cpu[:num_reqs],
+        )
+        self._n_committed_csa_per_seq[:num_reqs].copy_(
+            self._n_committed_csa_per_seq_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+        self._n_committed_hca_per_seq[:num_reqs].copy_(
+            self._n_committed_hca_per_seq_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+        if num_reqs_padded > num_reqs:
+            self._chunk_start_per_seq[num_reqs:num_reqs_padded].zero_()
+            self._n_committed_csa_per_seq[num_reqs:num_reqs_padded].zero_()
+            self._n_committed_hca_per_seq[num_reqs:num_reqs_padded].zero_()
+
+        atom_state = DeepseekV4RocmAtomStateMetadata(
+            state_slot_mapping=self._state_slot_mapping[:num_reqs_padded],
+            state_slot_mapping_cpu=self._state_slot_mapping_cpu[:num_reqs_padded],
+            num_actual_reqs=num_reqs,
+            num_reqs=num_reqs_padded,
+            num_actual_tokens=num_reqs,
+            num_tokens=num_tokens_padded,
+            win_with_spec=self.win_with_spec,
+            swa_pages=self.swa_pages,
+            chunk_start_per_seq=self._chunk_start_per_seq[:num_reqs_padded],
+            chunk_start_per_seq_cpu=self._chunk_start_per_seq_cpu[:num_reqs_padded],
+            positions=input_buffers.positions[:num_tokens_padded],
+            positions_cpu=self._positions_cpu[:num_tokens_padded],
+            query_start_loc=input_buffers.query_start_loc[: num_reqs_padded + 1],
+            seq_lens=input_buffers.seq_lens[:num_reqs_padded],
+            batch_id_per_token=self._batch_id_per_token[:num_tokens_padded],
+            batch_id_per_token_cpu=self._batch_id_per_token_cpu[:num_tokens_padded],
+            n_committed_csa_per_seq=self._n_committed_csa_per_seq[:num_reqs_padded],
+            n_committed_csa_per_seq_cpu=(
+                self._n_committed_csa_per_seq_cpu[:num_reqs_padded]
+            ),
+            n_committed_hca_per_seq=self._n_committed_hca_per_seq[:num_reqs_padded],
+            n_committed_hca_per_seq_cpu=(
+                self._n_committed_hca_per_seq_cpu[:num_reqs_padded]
+            ),
+            buffers=self._atom_state_buffers,
+            unified_kv_buffers=self._atom_unified_kv_buffers,
+            decode_buffers=self._atom_decode_buffers,
+            decode_cache=DeepseekV4RocmAtomDecodeCache(),
+            prefill_buffers=self._atom_prefill_buffers,
+            prefill_cache=DeepseekV4RocmAtomPrefillCache(self.index_topk),
+            compress_plans=None,
+        )
+        self._prepare_atom_decode_metadata(atom_state)
+        for metadata in {id(value): value for value in attn_metadata.values()}.values():
+            object.__setattr__(metadata, "deepseek_v4_rocm_atom_state", atom_state)
         return attn_metadata

@@ -4,7 +4,6 @@
 DeepseekV4 MLA Attention Layer
 """
 
-import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -12,11 +11,9 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.library import Library
 from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm.envs as envs
-from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -24,14 +21,10 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    per_token_group_quant_fp8,
-)
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_q_kv_rmsnorm,
-    scale_indexer_weights,
 )
 
 if TYPE_CHECKING:
@@ -58,7 +51,7 @@ from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
 )
-from vllm.utils.torch_utils import direct_register_custom_op, get_dtype_size
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
@@ -72,147 +65,27 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
-_ATOM_ATTENTION_ENABLED = (
-    current_platform.is_rocm()
-    and os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION", "0") == "1"
-)
-_ATOM_ATTENTION_RATIOS = frozenset(
-    part.strip()
-    for part in os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION_RATIOS", "").split(",")
-    if part.strip()
-)
-_ATOM_ATTENTION_LAYERS = frozenset(
-    part.strip()
-    for part in os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION_LAYERS", "").split(",")
-    if part.strip()
-)
-_ATOM_ROCM_DSV4_ENABLED = current_platform.is_rocm() and (
-    _ATOM_ATTENTION_ENABLED
-    or os.environ.get("VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR", "0") == "1"
-    or os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV", "0") == "1"
-)
-_ATOM_UNIFIED_KV_FROM_VLLM_ENABLED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM", "0") == "1"
-)
-_ATOM_MIXED_KV_ENABLED = os.environ.get("VLLM_ROCM_DSV4_ATOM_MIXED_KV", "0") == "1"
-_ATOM_INDEXER_FASTPATH_ENABLED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_INDEXER_FASTPATH", "0") == "1"
-)
-_ATOM_INDEXER_DISPATCH_ENABLED = (
-    current_platform.is_rocm()
-    and os.environ.get("VLLM_ROCM_DSV4_ATOM_INDEXER_DISPATCH", "0") == "1"
-)
-_ATOM_INDEXER_SEQUENCE_ENABLED = (
-    current_platform.is_rocm()
-    and os.environ.get("VLLM_ROCM_DSV4_ATOM_INDEXER_SEQUENCE", "0") == "1"
-)
-_ATOM_INDEXER_FASTPATH_NEEDS_SENTINEL_FILL = not (
-    _ATOM_ATTENTION_ENABLED
-    and _ATOM_UNIFIED_KV_FROM_VLLM_ENABLED
-    and not _ATOM_ATTENTION_RATIOS
-    and not _ATOM_ATTENTION_LAYERS
-)
-_ATOM_USE_INDEX_CACHE_OVERRIDE = os.environ.get("VLLM_ROCM_DSV4_ATOM_USE_INDEX_CACHE")
-_ATOM_INDEX_TOPK_FREQ_OVERRIDE = os.environ.get("VLLM_ROCM_DSV4_ATOM_INDEX_TOPK_FREQ")
-_ATOM_INDEX_TOPK_PATTERN_OVERRIDE = os.environ.get(
-    "VLLM_ROCM_DSV4_ATOM_INDEX_TOPK_PATTERN"
-)
-_ATOM_INDEXER_DISPATCH_REGISTRY: dict[str, Any] = {}
-_ATOM_AITER_FALLBACK_LIB = Library("aiter", "FRAGMENT")
 
 
 def _atom_attention_enabled_for_ratio(ratio: int) -> bool:
-    if not _ATOM_ATTENTION_ENABLED:
-        return False
-    if not _ATOM_ATTENTION_RATIOS:
-        return True
-    return str(max(1, int(ratio))) in _ATOM_ATTENTION_RATIOS
+    return current_platform.is_rocm() and ratio > 1
 
 
 def _atom_attention_enabled_for_layer_id(layer_id: int | None) -> bool:
-    if not _ATOM_ATTENTION_LAYERS:
-        return True
-    if layer_id is None:
-        return False
-    return str(int(layer_id)) in _ATOM_ATTENTION_LAYERS
-
-
-def _atom_torch_op_exists(namespace: str, op_name: str) -> bool:
-    try:
-        namespace_obj = getattr(torch.ops, namespace)
-        getattr(namespace_obj, op_name)
-    except AttributeError:
-        return False
     return True
 
 
-def _atom_indexer_score_topk(
-    q_fp8: torch.Tensor,
-    weights: torch.Tensor,
-    layer_name: str,
-    topk: int,
-) -> torch.Tensor:
-    indexer = _ATOM_INDEXER_DISPATCH_REGISTRY[layer_name]
-    return indexer.indexer_score_topk(q_fp8, weights, topk)
-
-
-def _atom_indexer_score_topk_fake(
-    q_fp8: torch.Tensor,
-    weights: torch.Tensor,
-    layer_name: str,
-    topk: int,
-) -> torch.Tensor:
-    return torch.empty(
-        (q_fp8.shape[0], topk),
-        dtype=torch.int32,
-        device=q_fp8.device,
-    )
-
-
-if not _atom_torch_op_exists("aiter", "indexer_score_topk"):
-    direct_register_custom_op(
-        op_name="indexer_score_topk",
-        op_func=_atom_indexer_score_topk,
-        mutates_args=[],
-        fake_impl=_atom_indexer_score_topk_fake,
-        target_lib=_ATOM_AITER_FALLBACK_LIB,
-        tags=(torch.Tag.needs_fixed_stride_order,),
-    )
-
-
-def _atom_parse_index_topk_pattern() -> str | list[str] | None:
-    pattern = _ATOM_INDEX_TOPK_PATTERN_OVERRIDE
-    if pattern is None:
-        return None
-    pattern = pattern.strip()
-    if not pattern:
-        return None
-    if "," in pattern:
-        return [part.strip() for part in pattern.split(",")]
-    return pattern
-
-
 def _atom_use_index_cache(config: Any) -> bool:
-    if not (_ATOM_ROCM_DSV4_ENABLED and current_platform.is_rocm()):
-        return False
-    if _ATOM_USE_INDEX_CACHE_OVERRIDE is not None:
-        return _ATOM_USE_INDEX_CACHE_OVERRIDE == "1"
-    return bool(getattr(config, "use_index_cache", False))
+    return current_platform.is_rocm() and bool(
+        getattr(config, "use_index_cache", False)
+    )
 
 
 def _atom_index_topk_freq(config: Any) -> int:
-    if _ATOM_INDEX_TOPK_FREQ_OVERRIDE is not None:
-        try:
-            return int(_ATOM_INDEX_TOPK_FREQ_OVERRIDE)
-        except ValueError:
-            return 1
     return int(getattr(config, "index_topk_freq", 1))
 
 
 def _atom_index_topk_pattern(config: Any) -> Any | None:
-    override = _atom_parse_index_topk_pattern()
-    if override is not None:
-        return override
     return getattr(config, "index_topk_pattern", None)
 
 
@@ -807,19 +680,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         spec_dtype = torch.uint8 if is_flashmla else self.kv_cache_torch_dtype
         spec_cache_dtype = self.kv_cache_dtype
         spec_alignment = 576 if is_flashmla else None
-        atom_vllm_owned_kv = (
-            current_platform.is_rocm()
-            and _ATOM_UNIFIED_KV_FROM_VLLM_ENABLED
-            and _atom_attention_enabled_for_ratio(self.compress_ratio)
-            and _atom_attention_enabled_for_layer_id(getattr(self, "layer_id", None))
-        )
+        atom_vllm_owned_kv = current_platform.is_rocm()
         atom_block_size = int(vllm_config.cache_config.block_size)
-        if (
-            _ATOM_ROCM_DSV4_ENABLED or atom_vllm_owned_kv
-        ) and atom_block_size % 128 != 0:
+        if atom_vllm_owned_kv and atom_block_size != 128:
             raise ValueError(
-                "ROCm DeepSeek-V4 ATOM kernels require --block-size to be a "
-                "multiple of lcm(4,128)=128 so CSA/HCA compressed entries fit "
+                "ROCm DeepSeek-V4 ATOM kernels require --block-size 128 so "
+                "CSA/HCA compressed entries fit "
                 f"inside each KV block; got {atom_block_size}."
             )
         if atom_vllm_owned_kv:
@@ -837,28 +703,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.atom_vllm_compressed_scale_bytes_per_page = 0
             self.atom_vllm_compressed_layout = "dense"
             spec_cls = DeepseekV4AtomMLAAttentionSpec
-            if _ATOM_MIXED_KV_ENABLED:
-                if self.head_dim != 512:
-                    raise ValueError(
-                        "ROCm DeepSeek-V4 ATOM packed FP8 KV requires "
-                        f"head_dim=512, got {self.head_dim}."
-                    )
-                # ATOM's documented DSV4 FP8 KV slot is the packed
-                # fp8_ds_mla format: 448 FP8 NoPE bytes + 64 BF16 RoPE
-                # values (128 bytes) + 8 UE8M0 scale bytes = 584 bytes per
-                # compressed token. Do not expose the earlier all-FP8+fp32
-                # sidecar experiment as the default mixed layout.
-                spec_dtype = torch.uint8
-                spec_cache_dtype = "fp8_ds_mla"
-                atom_scale_bytes_per_page = 0
-                self.atom_vllm_compressed_layout = "fp8_ds_mla"
-            else:
-                # Existing ATOM ROCm kernels take one homogeneous unified KV
-                # tensor. Use model dtype for the compressed tail in this
-                # vLLM-owned-storage slice by default.
-                spec_dtype = atom_swa_dtype
-                spec_cache_dtype = "bf16"
-                atom_scale_bytes_per_page = 0
+            # The validated ATOM kernels use a homogeneous model-dtype cache
+            # for both the SWA prefix and compressed tail.
+            spec_dtype = atom_swa_dtype
+            spec_cache_dtype = "bf16"
+            atom_scale_bytes_per_page = 0
             spec_alignment = None
             extra_kwargs = {
                 "atom_swa_prefix_bytes": atom_swa_prefix_bytes,
@@ -894,7 +743,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         """
         if (
             not current_platform.is_rocm()
-            or not _ATOM_UNIFIED_KV_FROM_VLLM_ENABLED
             or self.compress_ratio <= 1
             or not hasattr(self, "atom_vllm_unified_kv_prefix_bytes")
         ):
@@ -972,6 +820,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             win_with_spec,
             self.head_dim,
         )
+        # This capability is stronger than merely having an ``atom_swa_kv``
+        # tensor. It proves that the per-request ring is a view of storage
+        # allocated and profiled by vLLM, so an ATOM decode can make that ring
+        # authoritative without also updating the legacy block-table SWA
+        # cache. ModelState may rebind the same view after allocation and
+        # preserves this ownership marker.
+        self.atom_direct_swa_bound = True
         self.atom_win_with_spec = win_with_spec
         self.atom_swa_pages = swa_pages
         self.atom_compressed_kv_cache = kv_cache
@@ -1188,170 +1043,6 @@ class DeepseekV4Indexer(nn.Module):
             torch.cuda.Event(),
             torch.cuda.Event(),
         ]
-        _ATOM_INDEXER_DISPATCH_REGISTRY[self.prefix] = self
-
-    def _maybe_atom_decode_indexer_fastpath(
-        self,
-        hidden_states: torch.Tensor,
-        q_fp8: torch.Tensor,
-        weights: torch.Tensor,
-    ) -> torch.Tensor | None:
-        """ATOM-style CSA indexer decode path over ModelState metadata.
-
-        This intentionally starts as a narrow opt-in path: pure decode,
-        one token per sequence, no padding. It bypasses the generic
-        SparseAttnIndexer custom-op wrapper while reusing the same aiter
-        paged-logits/top-k kernels.
-        """
-        if (
-            not _ATOM_INDEXER_FASTPATH_ENABLED
-            or not current_platform.is_rocm()
-            or self.use_fp4_kv
-            or self.topk_indices_buffer is None
-        ):
-            return None
-
-        attn_metadata = get_forward_context().attn_metadata
-        if not isinstance(attn_metadata, dict):
-            return None
-
-        from vllm.models.deepseek_v4.amd.model_state import (
-            get_deepseek_v4_rocm_atom_state,
-        )
-        from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-            _top_k_per_row_decode,
-            rocm_fp8_paged_mqa_logits,
-        )
-
-        parent_prefix = self.prefix.rsplit(".indexer", 1)[0]
-        swa_metadata = attn_metadata.get(f"{parent_prefix}.swa_cache")
-        atom_state = get_deepseek_v4_rocm_atom_state(swa_metadata)
-        if atom_state is None:
-            return None
-
-        block_table = atom_state.indexer_decode_block_table
-        schedule_metadata = atom_state.indexer_decode_schedule_metadata
-        if (
-            atom_state.indexer_decode_requires_padding
-            or block_table is None
-            or schedule_metadata is None
-        ):
-            return None
-
-        num_decode_tokens = int(atom_state.indexer_decode_num_tokens)
-        num_reqs = int(atom_state.num_actual_reqs)
-        if (
-            num_reqs <= 0
-            or num_decode_tokens <= 0
-            or num_decode_tokens != num_reqs
-            or int(atom_state.num_actual_tokens) != num_decode_tokens
-            or hidden_states.shape[0] < num_decode_tokens
-        ):
-            return None
-
-        q_decode = q_fp8[:num_decode_tokens].reshape(
-            num_reqs,
-            1,
-            self.n_head,
-            self.head_dim,
-        )
-        kv_cache = self.k_cache.kv_cache.unsqueeze(-2)
-        n_committed = atom_state.n_committed_csa_per_seq[:num_reqs]
-
-        if _ATOM_INDEXER_FASTPATH_NEEDS_SENTINEL_FILL:
-            self.topk_indices_buffer[: hidden_states.shape[0]] = -1
-        logits = rocm_fp8_paged_mqa_logits(
-            q_decode,
-            kv_cache,
-            weights[:num_decode_tokens],
-            n_committed,
-            block_table[:num_reqs],
-            schedule_metadata,
-            max_model_len=self.max_model_len,
-        )
-        topk_indices = self.topk_indices_buffer[:num_decode_tokens, : self.topk_tokens]
-        _top_k_per_row_decode(
-            logits,
-            1,
-            n_committed,
-            topk_indices,
-            logits.shape[0],
-            logits.stride(0),
-            logits.stride(1),
-            self.topk_tokens,
-        )
-        return self.topk_indices_buffer
-
-    def _maybe_atom_indexer_sequence(
-        self,
-        q: torch.Tensor,
-        indexer_weights: torch.Tensor,
-        positions: torch.Tensor,
-        rotary_emb: nn.Module,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """ATOM-style explicit indexer Q quant + weight scale sequence.
-
-        The default vLLM path fuses RoPE, FP8 quantization, and weight scaling
-        into ``fused_indexer_q_rope_quant``. ATOM keeps the weight scaling as
-        an explicit ``scale_indexer_weights`` op before indexer scoring. Keep
-        this as an opt-in preview path so the exact op boundary can be
-        benchmarked without changing the validated default.
-        """
-        if not _ATOM_INDEXER_SEQUENCE_ENABLED or self.use_fp4_kv:
-            return None
-
-        ops.rotary_embedding(
-            positions,
-            q,
-            None,
-            self.head_dim,
-            rotary_emb.cos_sin_cache,
-            False,
-            self.head_dim - self.rope_dim,
-            False,
-        )
-        q_fp8, q_scale = per_token_group_quant_fp8(
-            q.view(-1, self.head_dim).contiguous(),
-            self.head_dim,
-            use_ue8m0=True,
-        )
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1).contiguous()
-        weights = scale_indexer_weights(
-            indexer_weights.contiguous(),
-            q_scale,
-            self.softmax_scale * self.n_head**-0.5,
-        )
-        return q_fp8, weights
-
-    def indexer_score_topk(
-        self,
-        q_fp8: torch.Tensor,
-        weights: torch.Tensor,
-        topk: int,
-    ) -> torch.Tensor:
-        """ATOM-compatible indexer dispatch target.
-
-        ATOM calls ``torch.ops.aiter.indexer_score_topk(q_fp8, weights,
-        prefix, topk)`` after the compressor has already written indexer K to
-        the cache. vLLM keeps that cache and metadata in this module, so the
-        local fallback op dispatches back here.
-        """
-        if topk != self.topk_tokens:
-            raise ValueError(
-                f"Unexpected indexer topk {topk}; expected {self.topk_tokens}."
-            )
-        if self.use_fp4_kv:
-            raise RuntimeError("ATOM indexer dispatch is only enabled for FP8 cache.")
-
-        atom_topk = self._maybe_atom_decode_indexer_fastpath(
-            q_fp8,
-            q_fp8,
-            weights,
-        )
-        if atom_topk is not None:
-            return atom_topk
-        return self.indexer_op(q_fp8, q_fp8, None, weights)
 
     def forward(
         self,
@@ -1368,14 +1059,6 @@ class DeepseekV4Indexer(nn.Module):
             # ReplicatedLinear returns (output, bias); bias is None.
             q, _ = self.wq_b(qr)
             q = q.view(-1, self.n_head, self.head_dim)
-            atom_sequence = self._maybe_atom_indexer_sequence(
-                q,
-                indexer_weights,
-                positions,
-                rotary_emb,
-            )
-            if atom_sequence is not None:
-                return atom_sequence
             return fused_indexer_q_rope_quant(
                 positions,
                 q,
@@ -1395,18 +1078,4 @@ class DeepseekV4Indexer(nn.Module):
             self.ln_events[1],
             self.aux_stream,
         )
-        if _ATOM_INDEXER_DISPATCH_ENABLED and not self.use_fp4_kv:
-            return torch.ops.aiter.indexer_score_topk(
-                q_quant,
-                weights,
-                self.prefix,
-                self.topk_tokens,
-            )
-        atom_topk = self._maybe_atom_decode_indexer_fastpath(
-            hidden_states,
-            q_quant,
-            weights,
-        )
-        if atom_topk is not None:
-            return atom_topk
         return self.indexer_op(hidden_states, q_quant, k, weights)

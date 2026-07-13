@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
-import time
+import functools
 from dataclasses import dataclass
 from typing import Any, ClassVar, cast
 
 import torch
-import triton
-import triton.language as tl
 from torch import nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -38,112 +35,22 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
 )
 
-_ATOM_ATTENTION_ENABLED = os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION", "0") == "1"
-_ATOM_MAIN_COMPRESSOR_ENABLED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR", "0") == "1"
-)
-_ATOM_INDEXER_COMPRESSOR_ENABLED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_INDEXER_COMPRESSOR", "0") == "1"
-)
-_ATOM_UNIFIED_KV_ENABLED = os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV", "0") == "1"
-_ATOM_UNIFIED_KV_FROM_VLLM = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM", "0") == "1"
-)
-_ATOM_MIXED_KV_ENABLED = os.environ.get("VLLM_ROCM_DSV4_ATOM_MIXED_KV", "0") == "1"
-_ATOM_SKIP_PAGED_PREFILL = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_SKIP_PAGED_PREFILL", "1") == "1"
-)
-_ATOM_PREFILL_ALLOW_MIXED = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED", "0") == "1"
-)
-_ATOM_ROCM_DSV4_ENABLED = current_platform.is_rocm() and (
-    _ATOM_ATTENTION_ENABLED or _ATOM_MAIN_COMPRESSOR_ENABLED or _ATOM_UNIFIED_KV_ENABLED
-)
-_ATOM_ATTENTION_RATIOS = frozenset(
-    part.strip()
-    for part in os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION_RATIOS", "").split(",")
-    if part.strip()
-)
-_ATOM_ATTENTION_LAYERS = frozenset(
-    part.strip()
-    for part in os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION_LAYERS", "").split(",")
-    if part.strip()
-)
-_ATOM_FORCE_NATIVE_FALLBACK = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_RETURN_FALSE_AT_ENTRY", "0") == "1"
-    or os.environ.get("VLLM_ROCM_DSV4_ATOM_PROBE_INDICES_ONLY", "0") == "1"
-)
-_ATOM_SKIP_FUSED_COMPRESS = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_SKIP_FUSED_COMPRESS", "0") == "1"
-)
-# Diagnostic only: short O128 decode benefits from skipping empty compress
-# plans, but full O1024 graph replay hit HIP illegal access. Keep the stable
-# ATOM/vLLM launch contract by default.
-_ATOM_SKIP_EMPTY_FUSED_COMPRESS = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_SKIP_EMPTY_FUSED_COMPRESS", "0") == "1"
-)
-_ATOM_SKIP_COMPRESS_STATE_UPDATE = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_SKIP_COMPRESS_STATE_UPDATE", "0") == "1"
-)
-_ATOM_NATIVE_AFTER_MAIN_COMPRESSOR = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_NATIVE_AFTER_MAIN_COMPRESSOR", "0") == "1"
-)
-_ATOM_HCA_FLAT_CACHE = os.environ.get("VLLM_ROCM_DSV4_ATOM_HCA_FLAT_CACHE", "0") == "1"
-_ATOM_PROFILE_COMPRESSOR = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR", "0") == "1"
-)
 
-
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        return float(value)
-    except ValueError:
-        return default
-
-
-_ATOM_PROFILE_COMPRESSOR_EVERY = max(
-    1, _env_int("VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_EVERY", 200)
-)
-_ATOM_PROFILE_COMPRESSOR_LAYER = _env_int(
-    "VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_LAYER", 0
-)
-_ATOM_PROFILE_COMPRESSOR_START_AFTER = max(
-    0, _env_int("VLLM_ROCM_DSV4_ATOM_PROFILE_COMPRESSOR_START_AFTER", 0)
-)
-_ATOM_MIXED_KV_FP8_MAX = _env_float("VLLM_ROCM_DSV4_ATOM_MIXED_KV_FP8_MAX", 224.0)
-_ATOM_RUNTIME_HELPERS: tuple[Any, Any, Any] | None = None
-
-
+@functools.cache
 def _get_atom_runtime_helpers() -> tuple[Any, Any, Any]:
-    global _ATOM_RUNTIME_HELPERS
-    if _ATOM_RUNTIME_HELPERS is None:
-        from vllm.models.deepseek_v4.amd.model_state import (
-            get_deepseek_v4_rocm_atom_state,
-        )
-        from vllm.models.deepseek_v4.amd.v4_kernels import (
-            fused_compress_attn,
-            update_compressor_states,
-        )
+    from vllm.models.deepseek_v4.amd.model_state import (
+        get_deepseek_v4_rocm_atom_state,
+    )
+    from vllm.models.deepseek_v4.amd.v4_kernels import (
+        fused_compress_attn,
+        update_compressor_states,
+    )
 
-        _ATOM_RUNTIME_HELPERS = (
-            get_deepseek_v4_rocm_atom_state,
-            fused_compress_attn,
-            update_compressor_states,
-        )
-    return _ATOM_RUNTIME_HELPERS
+    return (
+        get_deepseek_v4_rocm_atom_state,
+        fused_compress_attn,
+        update_compressor_states,
+    )
 
 
 def _validate_atom_packed_fp8_kv_cache(
@@ -168,88 +75,12 @@ def _validate_atom_packed_fp8_kv_cache(
         )
 
 
-@triton.jit
-def _atom_flatten_hca_block_table_kernel(
-    src_block_table,
-    src_stride: tl.constexpr,
-    dst_block_table,
-    dst_stride: tl.constexpr,
-    flat_cols: tl.constexpr,
-    k_per_block: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    row = tl.program_id(0)
-    block = tl.program_id(1)
-    offsets = block * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = offsets < flat_cols
-    src_cols = offsets // k_per_block
-    slot_offsets = offsets - src_cols * k_per_block
-    physical_blocks = tl.load(
-        src_block_table + row * src_stride + src_cols,
-        mask=mask,
-        other=0,
-    )
-    flat_slots = physical_blocks * k_per_block + slot_offsets
-    tl.store(dst_block_table + row * dst_stride + offsets, flat_slots, mask=mask)
-
-
 def _atom_attention_enabled_for_ratio(ratio: int) -> bool:
-    if not _ATOM_ATTENTION_ENABLED:
-        return False
-    if not _ATOM_ATTENTION_RATIOS:
-        return True
-    return str(max(1, int(ratio))) in _ATOM_ATTENTION_RATIOS
+    return current_platform.is_rocm() and ratio > 1
 
 
 def _atom_attention_enabled_for_layer(prefix: str) -> bool:
-    if not _ATOM_ATTENTION_LAYERS:
-        return True
-    try:
-        layer_id = extract_layer_index(prefix)
-    except ValueError:
-        return False
-    return str(int(layer_id)) in _ATOM_ATTENTION_LAYERS
-
-
-def _atom_attention_forces_native_fallback() -> bool:
-    return _ATOM_FORCE_NATIVE_FALLBACK
-
-
-def _atom_profile_can_sync() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    try:
-        return not torch.cuda.is_current_stream_capturing()
-    except RuntimeError:
-        return False
-
-
-def _atom_profile_layer_matches(layer_id: int | None) -> bool:
-    return (
-        _ATOM_PROFILE_COMPRESSOR_LAYER < 0 or layer_id == _ATOM_PROFILE_COMPRESSOR_LAYER
-    )
-
-
-def _atom_profile_should_print(
-    obj: object,
-    counter_name: str,
-    *,
-    layer_id: int | None,
-) -> bool:
-    if not _atom_profile_can_sync():
-        return False
-    if not _atom_profile_layer_matches(layer_id):
-        return False
-    count = int(getattr(obj, counter_name, 0)) + 1
-    setattr(obj, counter_name, count)
-    if count <= _ATOM_PROFILE_COMPRESSOR_START_AFTER:
-        return False
-    printed_count = count - _ATOM_PROFILE_COMPRESSOR_START_AFTER
-    return printed_count <= 3 or printed_count % _ATOM_PROFILE_COMPRESSOR_EVERY == 0
-
-
-def _atom_profile_sync() -> None:
-    torch.cuda.synchronize()
+    return True
 
 
 class CompressorBackend(AttentionBackend):
@@ -526,52 +357,6 @@ class DeepseekCompressor(nn.Module):
         self._atom_split_cos_sin_cache = (cache_key, cos_cache, sin_cache)
         return cos_cache, sin_cache
 
-    def _maybe_flatten_hca_cache_table(
-        self,
-        kv_cache: torch.Tensor,
-        block_tables: torch.Tensor,
-        k_per_block: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        if self.compress_ratio != 128 or k_per_block <= 1 or not _ATOM_HCA_FLAT_CACHE:
-            return kv_cache, block_tables, k_per_block
-
-        # Diagnostic-only path. The fused compressor already resolves packed
-        # HCA slots as block_table[ci // k_per_block] + ci % k_per_block.
-        # A transient flattened block table was not stable under vLLM FULL
-        # cudagraph replay, so production keeps packed addressing by default.
-        flat_cols = block_tables.shape[1] * k_per_block
-        flat_table = self._atom_hca_flat_block_table
-        if (
-            flat_table is None
-            or flat_table.shape[0] != block_tables.shape[0]
-            or flat_table.shape[1] != flat_cols
-            or flat_table.device != block_tables.device
-        ):
-            flat_table = torch.empty(
-                (block_tables.shape[0], flat_cols),
-                dtype=block_tables.dtype,
-                device=block_tables.device,
-            )
-            self._atom_hca_flat_block_table = flat_table
-
-        block_n = 256
-        _atom_flatten_hca_block_table_kernel[
-            (block_tables.shape[0], triton.cdiv(flat_cols, block_n))
-        ](
-            block_tables,
-            block_tables.stride(0),
-            flat_table,
-            flat_table.stride(0),
-            flat_cols=flat_cols,
-            k_per_block=k_per_block,
-            BLOCK_N=block_n,
-        )
-        return (
-            kv_cache.reshape(kv_cache.shape[0] * k_per_block, 1, self.head_dim),
-            flat_table,
-            1,
-        )
-
     def _maybe_atom_main_compressor_forward(
         self,
         kv: torch.Tensor,
@@ -580,14 +365,6 @@ class DeepseekCompressor(nn.Module):
         rotary_emb,
         attn_metadata: dict[str, Any],
     ) -> bool:
-        if not _ATOM_MAIN_COMPRESSOR_ENABLED:
-            return False
-        if _atom_attention_forces_native_fallback():
-            # The ATOM compressor writes the unified ROCm cache. If a
-            # diagnostic attention flag intentionally falls back to native
-            # sparse attention, the native compressed KV cache must still be
-            # updated below.
-            return False
         if not _atom_attention_enabled_for_ratio(
             self.compress_ratio
         ) or not _atom_attention_enabled_for_layer(self.prefix):
@@ -597,30 +374,12 @@ class DeepseekCompressor(nn.Module):
             return False
         if not current_platform.is_rocm() or self.head_dim not in (128, 512):
             return False
-        if self.head_dim == 128 and (
-            not _ATOM_INDEXER_COMPRESSOR_ENABLED or self.use_fp4_cache
-        ):
+        if self.head_dim == 128:
             # The ATOM fused-compress path added here matches the FP8 indexer
             # cache contract. Keep it separately gated until the large-batch
             # lmeval OOM/JIT pressure is resolved; MXFP4 keeps using vLLM's
             # native writer.
             return False
-
-        profile = _ATOM_PROFILE_COMPRESSOR and _atom_profile_should_print(
-            self,
-            "_atom_profile_compressor_count",
-            layer_id=self._atom_layer_id,
-        )
-        if profile:
-            _atom_profile_sync()
-            total_start = time.perf_counter()
-            segment_start = total_start
-        else:
-            total_start = 0.0
-            segment_start = 0.0
-        prep_ms = 0.0
-        fused_ms = 0.0
-        state_ms = 0.0
 
         (
             get_deepseek_v4_rocm_atom_state,
@@ -632,9 +391,8 @@ class DeepseekCompressor(nn.Module):
         atom_state = get_deepseek_v4_rocm_atom_state(state_metadata)
         if atom_state is None or atom_state.compress_plans is None:
             raise RuntimeError(
-                "VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR=1 requires "
-                "VLLM_ROCM_DSV4_ATOM_STATE=1 and "
-                "VLLM_ROCM_DSV4_ATOM_COMPRESS_PLAN=1."
+                "ROCm DeepSeek-V4 requires ModelState compressor plans for "
+                "the ATOM main compressor."
             )
         plan = atom_state.compress_plans.get(self.compress_ratio)
         if plan is None:
@@ -660,13 +418,7 @@ class DeepseekCompressor(nn.Module):
         atom_kv_scales = getattr(self, "atom_kv_scales", None)
         atom_kv_layout = getattr(self, "atom_kv_layout", "dense")
         packed_fp8_ds_mla = atom_kv_layout == "fp8_ds_mla"
-        mixed_tail_quant = (
-            _ATOM_MIXED_KV_ENABLED
-            and self.head_dim == 512
-            and kv_cache is not None
-            and kv_cache.dtype == torch.float8_e4m3fnuz
-            and atom_kv_scales is not None
-        )
+        mixed_tail_quant = False
         quant = self.head_dim == 128 or mixed_tail_quant
         quant_group_size = None
         preshuffle = True
@@ -726,7 +478,7 @@ class DeepseekCompressor(nn.Module):
             block_tables = k_cache_metadata.block_table
             k_per_block = k_cache_metadata.block_size // self.compress_ratio
             cache_scale = atom_kv_scales
-            fp8_max = _ATOM_MIXED_KV_FP8_MAX
+            fp8_max = 224.0
             quant_group_size = 64
             preshuffle = False
             # The sidecar is fp32, so keep raw amax/fp8 scales for the first
@@ -746,181 +498,55 @@ class DeepseekCompressor(nn.Module):
                 )
             block_tables = k_cache_metadata.block_table
             k_per_block = k_cache_metadata.block_size // self.compress_ratio
-            kv_cache, block_tables, k_per_block = self._maybe_flatten_hca_cache_table(
-                kv_cache,
-                block_tables,
-                k_per_block,
-            )
         kv_atom = kv if kv.dtype == torch.bfloat16 else kv.to(torch.bfloat16)
         score_atom = (
             score if score.dtype == torch.bfloat16 else score.to(torch.bfloat16)
         )
         cos_cache, sin_cache = self._atom_rotary_cos_sin(rotary_emb, kv_atom.dtype)
-        if profile:
-            _atom_profile_sync()
-            prep_ms = (time.perf_counter() - segment_start) * 1000.0
-            segment_start = time.perf_counter()
-        run_fused_compress = not _ATOM_SKIP_FUSED_COMPRESS and not (
-            _ATOM_SKIP_EMPTY_FUSED_COMPRESS and plan.num_compress == 0
+        fused_compress_attn(
+            kv_in=kv_atom,
+            score_in=score_atom,
+            kv_state=kv_state,
+            score_state=score_state,
+            plan=plan,
+            state_slot_mapping=atom_state.state_slot_mapping,
+            ape=self.ape,
+            rms_weight=self.norm.weight,
+            rms_eps=self.rms_norm_eps,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            k_per_block=k_per_block,
+            overlap=self.overlap,
+            ratio=self.compress_ratio,
+            head_dim=self.head_dim,
+            rope_head_dim=self.rope_head_dim,
+            quant=quant,
+            cache_scale=cache_scale,
+            use_ue8m0=use_ue8m0,
+            quant_group_size=quant_group_size,
+            preshuffle=preshuffle,
+            fp8_max=fp8_max,
+            kv_slot_mapping=kv_slot_mapping,
+            packed_fp8_ds_mla=packed_fp8_ds_mla,
         )
-        if run_fused_compress:
-            fused_compress_attn(
-                kv_in=kv_atom,
-                score_in=score_atom,
-                kv_state=kv_state,
-                score_state=score_state,
-                plan=plan,
-                state_slot_mapping=atom_state.state_slot_mapping,
-                ape=self.ape,
-                rms_weight=self.norm.weight,
-                rms_eps=self.rms_norm_eps,
-                cos_cache=cos_cache,
-                sin_cache=sin_cache,
-                kv_cache=kv_cache,
-                block_tables=block_tables,
-                k_per_block=k_per_block,
-                overlap=self.overlap,
-                ratio=self.compress_ratio,
-                head_dim=self.head_dim,
-                rope_head_dim=self.rope_head_dim,
-                quant=quant,
-                cache_scale=cache_scale,
-                use_ue8m0=use_ue8m0,
-                quant_group_size=quant_group_size,
-                preshuffle=preshuffle,
-                fp8_max=fp8_max,
-                kv_slot_mapping=kv_slot_mapping,
-                packed_fp8_ds_mla=packed_fp8_ds_mla,
-            )
-        if profile:
-            _atom_profile_sync()
-            fused_ms = (time.perf_counter() - segment_start) * 1000.0
-            segment_start = time.perf_counter()
-        if not _ATOM_SKIP_COMPRESS_STATE_UPDATE:
-            update_compressor_states(
-                kv_atom,
-                score_atom,
-                self.ape,
-                kv_state,
-                score_state,
-                write_plan=plan.write_plan_gpu,
-                num_write=plan.num_write,
-                state_slot_mapping=atom_state.state_slot_mapping,
-                ratio=self.compress_ratio,
-                overlap=self.overlap,
-            )
-        if profile:
-            _atom_profile_sync()
-            state_ms = (time.perf_counter() - segment_start) * 1000.0
-            segment_start = time.perf_counter()
+        update_compressor_states(
+            kv_atom,
+            score_atom,
+            self.ape,
+            kv_state,
+            score_state,
+            write_plan=plan.write_plan_gpu,
+            num_write=plan.num_write,
+            state_slot_mapping=atom_state.state_slot_mapping,
+            ratio=self.compress_ratio,
+            overlap=self.overlap,
+        )
         swa_metadata = attn_metadata.get(f"{self.k_cache_prefix}.swa_cache")
         num_prefills = int(getattr(swa_metadata, "num_prefills", 0) or 0)
         if num_prefills > 0:
-            if _ATOM_UNIFIED_KV_FROM_VLLM:
-                if _ATOM_SKIP_PAGED_PREFILL:
-                    raise RuntimeError(
-                        "VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1 cannot "
-                        "share the compressed KV tail with native prefill. "
-                        "Set VLLM_ROCM_DSV4_ATOM_SKIP_PAGED_PREFILL=0 so "
-                        "prefill reads the same ATOM unified KV layout that "
-                        "ATOM decode reads."
-                    )
-                if not _ATOM_PREFILL_ALLOW_MIXED:
-                    raise RuntimeError(
-                        "VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1 requires "
-                        "VLLM_ROCM_DSV4_ATOM_PREFILL_ALLOW_MIXED=1. Without "
-                        "mixed ATOM prefill, vLLM can fall back to native "
-                        "prefill and overwrite the shared ATOM compressed "
-                        "tail with a cache/state contract that ATOM decode "
-                        "does not own."
-                    )
-                if _ATOM_NATIVE_AFTER_MAIN_COMPRESSOR:
-                    raise RuntimeError(
-                        "VLLM_ROCM_DSV4_ATOM_NATIVE_AFTER_MAIN_COMPRESSOR=1 "
-                        "is incompatible with "
-                        "VLLM_ROCM_DSV4_ATOM_UNIFIED_KV_FROM_VLLM=1 because "
-                        "the native compressor would overwrite the shared "
-                        "ATOM compressed KV tail."
-                    )
-                if profile:
-                    _atom_profile_sync()
-                    tail_ms = (time.perf_counter() - segment_start) * 1000.0
-                    total_ms = (time.perf_counter() - total_start) * 1000.0
-                    print(
-                        "ATOM_PROFILE_COMPRESSOR "
-                        f"layer={self._atom_layer_id} ratio={self.compress_ratio} "
-                        f"path=atom_prefill tokens={kv.shape[0]} "
-                        f"num_prefills={num_prefills} "
-                        f"num_compress={plan.num_compress} "
-                        f"num_write={plan.num_write} "
-                        f"k_per_block={k_per_block} "
-                        f"prep_ms={prep_ms:.3f} fused_ms={fused_ms:.3f} "
-                        f"state_ms={state_ms:.3f} tail_ms={tail_ms:.3f} "
-                        f"total_ms={total_ms:.3f}",
-                        flush=True,
-                    )
-                return True
-            # ATOM decode reads the unified KV cache, but this ROCm adapter
-            # still uses vLLM's native sparse-attention prefill path. Keep both
-            # caches populated until the ATOM paged-prefill path is wired.
-            if profile:
-                _atom_profile_sync()
-                tail_ms = (time.perf_counter() - segment_start) * 1000.0
-                total_ms = (time.perf_counter() - total_start) * 1000.0
-                print(
-                    "ATOM_PROFILE_COMPRESSOR "
-                    f"layer={self._atom_layer_id} ratio={self.compress_ratio} "
-                    f"path=native_prefill_fallback tokens={kv.shape[0]} "
-                    f"num_prefills={num_prefills} "
-                    f"num_compress={plan.num_compress} "
-                    f"num_write={plan.num_write} "
-                    f"k_per_block={k_per_block} "
-                    f"prep_ms={prep_ms:.3f} fused_ms={fused_ms:.3f} "
-                    f"state_ms={state_ms:.3f} tail_ms={tail_ms:.3f} "
-                    f"total_ms={total_ms:.3f}",
-                    flush=True,
-                )
-            return False
-        if _ATOM_NATIVE_AFTER_MAIN_COMPRESSOR:
-            # Diagnostic / transition mode: run ATOM compressor side effects,
-            # then keep vLLM's native compressor populated. This isolates
-            # ATOM kernel faults from missing native cache/state side effects
-            # while the ROCm unified attention path is incomplete.
-            if profile:
-                _atom_profile_sync()
-                tail_ms = (time.perf_counter() - segment_start) * 1000.0
-                total_ms = (time.perf_counter() - total_start) * 1000.0
-                print(
-                    "ATOM_PROFILE_COMPRESSOR "
-                    f"layer={self._atom_layer_id} ratio={self.compress_ratio} "
-                    f"path=native_after_atom tokens={kv.shape[0]} "
-                    f"num_prefills={num_prefills} "
-                    f"num_compress={plan.num_compress} "
-                    f"num_write={plan.num_write} "
-                    f"k_per_block={k_per_block} "
-                    f"prep_ms={prep_ms:.3f} fused_ms={fused_ms:.3f} "
-                    f"state_ms={state_ms:.3f} tail_ms={tail_ms:.3f} "
-                    f"total_ms={total_ms:.3f}",
-                    flush=True,
-                )
-            return False
-        if profile:
-            _atom_profile_sync()
-            tail_ms = (time.perf_counter() - segment_start) * 1000.0
-            total_ms = (time.perf_counter() - total_start) * 1000.0
-            print(
-                "ATOM_PROFILE_COMPRESSOR "
-                f"layer={self._atom_layer_id} ratio={self.compress_ratio} "
-                f"path=atom_decode tokens={kv.shape[0]} "
-                f"num_prefills={num_prefills} "
-                f"num_compress={plan.num_compress} "
-                f"num_write={plan.num_write} "
-                f"k_per_block={k_per_block} "
-                f"prep_ms={prep_ms:.3f} fused_ms={fused_ms:.3f} "
-                f"state_ms={state_ms:.3f} tail_ms={tail_ms:.3f} "
-                f"total_ms={total_ms:.3f}",
-                flush=True,
-            )
+            return True
         return True
 
     def forward(

@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek-V4 FlashMLA sparse backend, metadata, and metadata builder."""
 
-import os
-import time
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -31,59 +29,12 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
 # Pad C128A topk width to this alignment. 128 covers both h_q=64 (B_TOPK=64) and
 # h_q=128 (B_TOPK=128). FlashMLA decode asserts extra_topk % B_TOPK == 0;
 # unaligned widths (e.g. 17 = ceil(2136/128)) crash the sm100 head64 kernel.
 # Padded slots stay -1 and decode_lens caps them via topk_length, so the pad is a
 # no-op at kernel level. Mirrors _SPARSE_PREFILL_TOPK_ALIGNMENT in cache_utils.py.
 _C128A_TOPK_ALIGNMENT = 128
-_ATOM_ROCM_DSV4_ENABLED = current_platform.is_rocm() and (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION", "0") == "1"
-    or os.environ.get("VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR", "0") == "1"
-    or os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV", "0") == "1"
-)
-_ATOM_ATTENTION_ENABLED = (
-    current_platform.is_rocm()
-    and os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION", "0") == "1"
-)
-_ATOM_ATTENTION_RATIOS = frozenset(
-    part.strip()
-    for part in os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION_RATIOS", "").split(",")
-    if part.strip()
-)
-_ATOM_ATTENTION_LAYERS = frozenset(
-    part.strip()
-    for part in os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION_LAYERS", "").split(",")
-    if part.strip()
-)
-_ATOM_HCA_NATIVE_INDICES = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_HCA_NATIVE_INDICES", "0") == "1"
-)
-_ATOM_RETURN_FALSE_AT_ENTRY = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_RETURN_FALSE_AT_ENTRY", "0") == "1"
-)
-_ATOM_SKIP_DECODE_INDEX_WRITE = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_SKIP_DECODE_INDEX_WRITE", "0") == "1"
-)
-_ATOM_PROFILE_METADATA = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA", "0") == "1"
-)
-_ATOM_PROFILE_METADATA_EVERY = max(
-    1, _env_int("VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_EVERY", 128)
-)
-_ATOM_PROFILE_METADATA_START_AFTER = max(
-    0, _env_int("VLLM_ROCM_DSV4_ATOM_PROFILE_METADATA_START_AFTER", 0)
-)
 
 
 def _atom_can_skip_legacy_decode_metadata() -> bool:
@@ -95,14 +46,7 @@ def _atom_can_skip_legacy_decode_metadata() -> bool:
     bridge. Keep the skip conservative so filtered/debug experiments still
     exercise the old metadata path.
     """
-    return (
-        _ATOM_ATTENTION_ENABLED
-        and not _ATOM_ATTENTION_RATIOS
-        and not _ATOM_ATTENTION_LAYERS
-        and not _ATOM_HCA_NATIVE_INDICES
-        and not _ATOM_RETURN_FALSE_AT_ENTRY
-        and not _ATOM_SKIP_DECODE_INDEX_WRITE
-    )
+    return current_platform.is_rocm()
 
 
 class DeepseekV4FlashMLABackend(AttentionBackend):
@@ -124,7 +68,7 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        if _ATOM_ROCM_DSV4_ENABLED:
+        if current_platform.is_rocm():
             return [128, 256]
         return [256]
 
@@ -268,20 +212,6 @@ class DeepseekV4FlashMLAMetadataBuilder(
                 dtype=torch.int32,
                 device=device,
             )
-        self._metadata_profile_calls = 0
-
-    def _profile_metadata_this_call(self) -> tuple[bool, int]:
-        if not _ATOM_PROFILE_METADATA:
-            return False, 0
-        self._metadata_profile_calls += 1
-        call = self._metadata_profile_calls
-        if call <= _ATOM_PROFILE_METADATA_START_AFTER:
-            return False, call
-        printed_count = call - _ATOM_PROFILE_METADATA_START_AFTER
-        return (
-            printed_count <= 16 or printed_count % _ATOM_PROFILE_METADATA_EVERY == 0,
-            call,
-        )
 
     def build(
         self,
@@ -289,11 +219,8 @@ class DeepseekV4FlashMLAMetadataBuilder(
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> DeepseekV4FlashMLAMetadata:
-        profile, profile_call = self._profile_metadata_this_call()
-        t0 = time.perf_counter() if profile else 0.0
         cm = common_attn_metadata
         req_id_per_token = cm.token_to_req_indices(self.req_id_per_token_buffer)
-        t1 = time.perf_counter() if profile else 0.0
 
         slot_mapping = cm.slot_mapping
         if self.compress_ratio > 1:
@@ -306,14 +233,12 @@ class DeepseekV4FlashMLAMetadataBuilder(
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
-        t2 = time.perf_counter() if profile else 0.0
 
         c128a_fields: dict[str, torch.Tensor | None] = {}
         if self.compress_ratio == 128:
             c128a_fields = self._build_c128a_metadata(cm, req_id_per_token)
-        t3 = time.perf_counter() if profile else 0.0
 
-        metadata = DeepseekV4FlashMLAMetadata(
+        return DeepseekV4FlashMLAMetadata(
             num_reqs=cm.num_reqs,
             max_query_len=cm.max_query_len,
             max_seq_len=cm.max_seq_len,
@@ -330,24 +255,6 @@ class DeepseekV4FlashMLAMetadataBuilder(
             c128a_decode_topk_lens=c128a_fields.get("c128a_decode_topk_lens"),
             c128a_prefill_topk_indices=c128a_fields.get("c128a_prefill_topk_indices"),
         )
-        if profile:
-            t4 = time.perf_counter()
-            logger.info(
-                "ROCm DSV4 sparse MLA metadata profile call=%d "
-                "ratio=%d reqs=%d tokens=%d max_query=%d req_ids=%.3fms "
-                "slot=%.3fms c128a=%.3fms dataclass=%.3fms total=%.3fms",
-                profile_call,
-                self.compress_ratio,
-                cm.num_reqs,
-                cm.num_actual_tokens,
-                cm.max_query_len,
-                (t1 - t0) * 1000.0,
-                (t2 - t1) * 1000.0,
-                (t3 - t2) * 1000.0,
-                (t4 - t3) * 1000.0,
-                (t4 - t0) * 1000.0,
-            )
-        return metadata
 
     def _build_c128a_metadata(
         self,

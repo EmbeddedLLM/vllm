@@ -314,6 +314,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
+        if isinstance(self.speculator, DraftModelSpeculator):
+            register_atom_model = getattr(
+                self.model_state, "register_atom_model", None
+            )
+            if register_atom_model is not None:
+                register_atom_model(self.speculator.model)
 
         self.decode_query_len = (
             self.num_speculative_steps
@@ -475,6 +481,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculator.set_attn(
                 self.model_state, self.kv_cache_config, self.block_tables
             )
+            if hasattr(self.model_state, "register_atom_model"):
+                # The DeepSeek-V4 MTP layer mutates a ModelState-owned ATOM
+                # SWA ring. Keep only the draft proposal eager; target model
+                # graphs remain enabled and provide the dominant speedup.
+                self.speculator.init_cudagraph_manager(CUDAGraphMode.NONE)
 
         self.kv_caches: list[torch.Tensor] = []
         kv_caches_dict = init_kv_cache(

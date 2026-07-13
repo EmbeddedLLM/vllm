@@ -220,7 +220,7 @@ def _reshape_attention_kv_cache(
             .view(dtype)
             .view(kv_cache_shape)
         )
-    elif kv_cache_spec.page_size_padded is not None:
+    elif kv_cache_spec.requires_strided_kv_cache_view:
         # Use a strided view to skip the padding between physical pages.
         #
         # Only num-blocks-first layouts are supported (the block dimension is
@@ -240,6 +240,9 @@ def _reshape_attention_kv_cache(
         num_blocks_dim = inv_order[0]
         strides = list(torch.empty(permuted_kv_cache_shape).stride())
         strides[num_blocks_dim] = page_stride
+        inner_block_stride_bytes = kv_cache_spec.inner_block_stride_bytes
+        if inner_block_stride_bytes is not None:
+            strides[inv_order[1]] = inner_block_stride_bytes // dtype_size
 
         kv_cache = torch.as_strided(
             kv_raw_tensor.view(dtype),
@@ -313,14 +316,11 @@ def _reshape_kv_cache(
                 # Skipped layers (--kv-cache-dtype-skip-layers) keep the
                 # unquantized shape; only the quantized primary uses the
                 # quantized cache dtype's (possibly packed) layout.
-                layer_cache_dtype = (
-                    getattr(kv_cache_spec, "cache_dtype_str", None)
-                    or (
-                        "auto"
-                        if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
-                        and not isinstance(kv_cache_spec, TQFullAttentionSpec)
-                        else cache_dtype
-                    )
+                layer_cache_dtype = getattr(kv_cache_spec, "cache_dtype_str", None) or (
+                    "auto"
+                    if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+                    and not isinstance(kv_cache_spec, TQFullAttentionSpec)
+                    else cache_dtype
                 )
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,

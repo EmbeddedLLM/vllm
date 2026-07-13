@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -14,45 +13,6 @@ try:
     from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 except Exception:
     fused_clamp_act_mul = None
-
-_ATOM_USE_AITER_FUSED_CLAMP_ACT_MUL = (
-    os.environ.get("ATOM_USE_AITER_FUSED_CLAMP_ACT_MUL", "0") == "1"
-)
-_ROCM_DSV4_ATOM_STATE_ENABLED = os.environ.get("VLLM_ROCM_DSV4_ATOM_STATE", "0") == "1"
-_ROCM_DSV4_USE_AITER_MHC = os.environ.get("VLLM_ROCM_DSV4_USE_AITER_MHC", "0") == "1"
-_ROCM_DSV4_USE_AITER_MHC_FUSE_NORM = (
-    os.environ.get("VLLM_ROCM_DSV4_USE_AITER_MHC_FUSE_NORM", "0") == "1"
-)
-_ROCM_DSV4_USE_AITER_MHC_PRE = (
-    os.environ.get(
-        "VLLM_ROCM_DSV4_USE_AITER_MHC_PRE",
-        str(int(_ROCM_DSV4_USE_AITER_MHC)),
-    )
-    == "1"
-)
-_ROCM_DSV4_USE_AITER_MHC_PRE_ATTN = (
-    os.environ.get(
-        "VLLM_ROCM_DSV4_USE_AITER_MHC_PRE_ATTN",
-        str(int(_ROCM_DSV4_USE_AITER_MHC_PRE)),
-    )
-    == "1"
-)
-_ROCM_DSV4_USE_AITER_MHC_PRE_FFN = (
-    os.environ.get(
-        "VLLM_ROCM_DSV4_USE_AITER_MHC_PRE_FFN",
-        str(int(_ROCM_DSV4_USE_AITER_MHC_PRE)),
-    )
-    == "1"
-)
-_ROCM_DSV4_AITER_MHC_PRE_ATTN_MAX_LAYER = int(
-    os.environ.get("VLLM_ROCM_DSV4_AITER_MHC_PRE_ATTN_MAX_LAYER", "-1")
-)
-_ROCM_DSV4_AITER_MHC_PRE_FFN_MAX_LAYER = int(
-    os.environ.get("VLLM_ROCM_DSV4_AITER_MHC_PRE_FFN_MAX_LAYER", "-1")
-)
-_ROCM_DSV4_AITER_MHC_FUSE_NORM_MAX_TOKENS = int(
-    os.environ.get("VLLM_ROCM_DSV4_AITER_MHC_FUSE_NORM_MAX_TOKENS", "64")
-)
 
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -144,9 +104,7 @@ class DeepseekV4MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else 0.0
-        self.use_fused_clamp_act_mul = (
-            _ATOM_USE_AITER_FUSED_CLAMP_ACT_MUL and fused_clamp_act_mul is not None
-        )
+        self.use_fused_clamp_act_mul = fused_clamp_act_mul is not None
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
@@ -263,23 +221,37 @@ class DeepseekV4MoE(nn.Module):
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 
-        org_shape = hidden_states.shape
-        if self.experts.is_internal_router:
-            # In this case, the gate/router runs inside the FusedMoE class
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=hidden_states,
-                input_ids=input_ids,
-            )
-        else:
-            router_logits, _ = self.gate(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
+        def run_moe(
+            states: torch.Tensor,
+            token_ids: torch.Tensor | None,
+        ) -> torch.Tensor:
+            if self.experts.is_internal_router:
+                # In this case, the gate/router runs inside the FusedMoE class.
+                return self.experts(
+                    hidden_states=states,
+                    router_logits=states,
+                    input_ids=token_ids,
+                )
+            router_logits, _ = self.gate(states)
+            return self.experts(
+                hidden_states=states,
                 router_logits=router_logits,
-                input_ids=input_ids,
+                input_ids=token_ids,
             )
 
-        return final_hidden_states.view(org_shape)
+        # mHC collapses its streams before the FFN, so target verification with
+        # num_speculative_tokens=2 reaches AITER's MXFP4 MoE as [3, hidden].
+        # That row count produces non-finite output in the AITER kernel. Pad it
+        # to the supported four-row tile with a repeated independent token and
+        # discard the repeated output.
+        if hidden_states.dim() == 2 and hidden_states.shape[0] == 3:
+            padded_states = torch.cat((hidden_states, hidden_states[-1:]), dim=0)
+            padded_ids = None
+            if input_ids is not None:
+                padded_ids = torch.cat((input_ids, input_ids[-1:]), dim=0)
+            return run_moe(padded_states, padded_ids)[:3]
+
+        return run_moe(hidden_states, input_ids)
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -297,7 +269,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         import vllm.model_executor.layers.mhc  # noqa: F401
 
         config = vllm_config.model_config.hf_config
-        self.layer_id = extract_layer_index(prefix)
         self.hidden_size = config.hidden_size
 
         self.rms_norm_eps = config.rms_norm_eps
@@ -309,23 +280,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
 
-        mhc_norm_dtype = (
-            torch.bfloat16
-            if (
-                _ROCM_DSV4_USE_AITER_MHC_FUSE_NORM
-                and (
-                    _ROCM_DSV4_USE_AITER_MHC_PRE_ATTN
-                    or _ROCM_DSV4_USE_AITER_MHC_PRE_FFN
-                )
-            )
-            else None
-        )
-        self.attn_norm = RMSNorm(
-            self.hidden_size, self.rms_norm_eps, dtype=mhc_norm_dtype
-        )
-        self.ffn_norm = RMSNorm(
-            self.hidden_size, self.rms_norm_eps, dtype=mhc_norm_dtype
-        )
+        self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
+        self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
@@ -387,12 +343,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
-        norm_weight: torch.Tensor | None = None,
-        norm_eps: float = 0.0,
-        use_aiter_pre: bool = False,
     ):
-        mhc_pre = torch.ops.vllm.mhc_pre_aiter if use_aiter_pre else self.mhc_pre
-        post_mix, res_mix, layer_input = mhc_pre(
+        post_mix, res_mix, layer_input = self.mhc_pre(
             residual=x,
             fn=hc_fn,
             hc_scale=hc_scale,
@@ -402,8 +354,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             hc_sinkhorn_eps=self.hc_eps,
             hc_post_mult_value=self.hc_post_alpha,
             sinkhorn_repeat=self.hc_sinkhorn_iters,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
         )
         return layer_input, post_mix, res_mix
 
@@ -480,50 +430,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
     ]:
         residual = x
-        num_hc_tokens = x.numel() // (self.hc_mult * self.hidden_size)
-        use_fused_mhc_norm = (
-            HAS_AITER_MHC
-            and _ROCM_DSV4_USE_AITER_MHC_FUSE_NORM
-            and (
-                _ROCM_DSV4_AITER_MHC_FUSE_NORM_MAX_TOKENS < 0
-                or num_hc_tokens <= _ROCM_DSV4_AITER_MHC_FUSE_NORM_MAX_TOKENS
-            )
-        )
-        if use_fused_mhc_norm:
-            use_aiter_attn_pre = _ROCM_DSV4_USE_AITER_MHC_PRE_ATTN and (
-                _ROCM_DSV4_AITER_MHC_PRE_ATTN_MAX_LAYER < 0
-                or self.layer_id < _ROCM_DSV4_AITER_MHC_PRE_ATTN_MAX_LAYER
-            )
-            use_aiter_ffn_pre = _ROCM_DSV4_USE_AITER_MHC_PRE_FFN and (
-                _ROCM_DSV4_AITER_MHC_PRE_FFN_MAX_LAYER < 0
-                or self.layer_id < _ROCM_DSV4_AITER_MHC_PRE_FFN_MAX_LAYER
-            )
-            x, post, comb = self.hc_pre(
-                x,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.attn_norm.weight,
-                self.rms_norm_eps,
-                use_aiter_pre=use_aiter_attn_pre,
-            )
-            x = self.attn(positions, x, None)
-            x = self.hc_post(x, residual, post, comb)
-
-            residual = x
-            x, post, comb = self.hc_pre(
-                x,
-                self.hc_ffn_fn,
-                self.hc_ffn_scale,
-                self.hc_ffn_base,
-                self.ffn_norm.weight,
-                self.rms_norm_eps,
-                use_aiter_pre=use_aiter_ffn_pre,
-            )
-            x = self.ffn(x, input_ids)
-            x = self.hc_post(x, residual, post, comb)
-            return x, None, None, None
-
         x, post, comb = self.hc_pre(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
@@ -563,6 +469,12 @@ class DeepseekV4DecoderLayer(nn.Module):
 class DeepseekV4Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+
+        if not vllm_config.use_v2_model_runner:
+            raise ValueError(
+                "ROCm DeepSeek-V4 requires Model Runner V2 because its ATOM "
+                "request and KV-cache lifecycle is implemented by ModelState."
+            )
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
@@ -944,7 +856,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
 
     @staticmethod
     def get_model_state_cls():
-        if current_platform.is_rocm() and _ROCM_DSV4_ATOM_STATE_ENABLED:
+        if current_platform.is_rocm():
             from vllm.models.deepseek_v4.amd.model_state import (
                 DeepseekV4RocmAtomModelState,
             )

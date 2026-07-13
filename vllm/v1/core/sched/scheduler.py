@@ -30,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.platforms import current_platform
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -229,6 +230,13 @@ class Scheduler(SchedulerInterface):
         )
 
         speculative_config = vllm_config.speculative_config
+        self.disable_dsv4_mtp_on_prefill = bool(
+            current_platform.is_rocm()
+            and speculative_config is not None
+            and speculative_config.method == "mtp"
+            and getattr(vllm_config.model_config.hf_config, "model_type", None)
+            == "deepseek_v4"
+        )
         self.use_eagle = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
@@ -1022,6 +1030,13 @@ class Scheduler(SchedulerInterface):
                 self.prefill_capacity_bound = bool(self.waiting)
 
         # Check if the scheduling constraints are satisfied.
+        if self.disable_dsv4_mtp_on_prefill and (
+            prefill_scheduled or scheduled_new_reqs or scheduled_resumed_reqs
+        ):
+            for request_id, spec_token_ids in scheduled_spec_decode_tokens.items():
+                num_scheduled_tokens[request_id] -= len(spec_token_ids)
+            scheduled_spec_decode_tokens.clear()
+
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
 

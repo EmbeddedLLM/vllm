@@ -53,13 +53,10 @@ from `unified_kv` (Main) or the FP8 indexer pool, not from the kernel
 return).
 """
 
-import os
-
 import torch
-import triton
-import triton.language as tl
 
 from vllm.models.deepseek_v4.amd.v4_kernels.compress_plan import CompressPlan
+from vllm.triton_utils import tl, triton
 
 # Optional flydsl path (aiter ROCm kernels). Falls back to Triton when
 # unavailable. HCA = compress + norm_rope_scatter 2-kernel split for
@@ -72,11 +69,6 @@ try:
 except Exception:
     flydsl_fused_compress_attn = None
     flydsl_hca_compress_attn = None
-
-_ATOM_FUSED_COMPRESS_FLYDSL_MODE = os.environ.get(
-    "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
-)
-_ATOM_HCA_FLAT_CACHE = os.environ.get("VLLM_ROCM_DSV4_ATOM_HCA_FLAT_CACHE", "0") == "1"
 
 # Supported (head_dim, rope_head_dim, ratio, overlap) tuples for the flydsl
 # kernel — matches V4-Pro Main (D=512) and Indexer-inner (D=128) compressors.
@@ -339,7 +331,6 @@ def _fused_compress_attn_kernel(
             # but scales are block-packed after all token data, not in
             # kv_cache[block, slot, 576:584].
             TOKEN_FP8_DIM: tl.constexpr = 448
-            TOKEN_BF16_DIM: tl.constexpr = 64
             TOKEN_DATA_SIZE: tl.constexpr = 576
             TOKEN_SCALE_DIM: tl.constexpr = 8
             token_data_base = (
@@ -595,18 +586,12 @@ def fused_compress_attn(
     _hca_flat_layout = _shape_key == (512, 64, 128, False) and k_per_block == 1
     _flydsl_use = (
         flydsl_fused_compress_attn is not None
-        and _ATOM_FUSED_COMPRESS_FLYDSL_MODE in ("auto", "always")
         and _flydsl_shape_ok
         and not _hca_flat_layout
         and kv_slot_mapping is None
         and not packed_fp8_ds_mla
         and (not quant or (_effective_quant_group_size == head_dim and preshuffle))
     )
-    if _ATOM_FUSED_COMPRESS_FLYDSL_MODE == "always" and not _flydsl_shape_ok:
-        raise RuntimeError(
-            f"ATOM_FUSED_COMPRESS_USE_FLYDSL=always but shape "
-            f"{_shape_key} is not in supported set {_FLYDSL_SUPPORTED}"
-        )
     # HCA 2-kernel-split: BF16-only on V4-Pro HCA Main shape
     # (D=512 ratio=128 overlap=False). HCA wins single-kernel at all N
     # (1.06-3.7×) post slice_size + VEC=8 refactor.

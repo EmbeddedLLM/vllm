@@ -793,6 +793,12 @@ def max_memory_usage_bytes(
     return sum(spec.max_memory_usage_bytes(vllm_config) for spec in kv_cache_specs)
 
 
+def _representative_scheduler_spec(group_spec: UniformTypeKVCacheSpecs) -> KVCacheSpec:
+    """Collapse per-layer specs without dropping fixed-prefix metadata."""
+    specs = tuple(group_spec.kv_cache_specs.values())
+    return next((spec for spec in specs if spec.fixed_prefix_size_bytes > 0), specs[0])
+
+
 def estimate_max_model_len(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -922,6 +928,13 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
         # Encoder-only models do not have KV cache, kv_cache_type can be
         # regarded as uniform.
         return True
+    has_fixed_prefix = any(
+        spec.fixed_prefix_size_bytes > 0 for spec in kv_cache_spec.values()
+    )
+    if has_fixed_prefix and not all(
+        spec.fixed_prefix_size_bytes > 0 for spec in kv_cache_spec.values()
+    ):
+        return False
     try:
         kv_cache_spec_values = list(kv_cache_spec.values())
         _ = kv_cache_spec_values[0].merge(kv_cache_spec_values)
@@ -930,12 +943,55 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
     return True
 
 
+def _iter_group_layer_specs(group: KVCacheGroupSpec) -> Iterator[KVCacheSpec]:
+    group_spec = group.kv_cache_spec
+    if isinstance(group_spec, UniformTypeKVCacheSpecs):
+        for layer_name in group.layer_names:
+            yield group_spec.kv_cache_specs[layer_name]
+    else:
+        yield group_spec
+
+
+def _contains_fixed_prefix_spec(kv_cache_config: KVCacheConfig) -> bool:
+    return any(
+        spec.fixed_prefix_size_bytes > 0
+        for group in kv_cache_config.kv_cache_groups
+        for spec in _iter_group_layer_specs(group)
+    )
+
+
+def _get_fixed_prefix_max_concurrency(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> float:
+    max_blocks_per_request = 0
+    for group in kv_cache_config.kv_cache_groups:
+        if not group.layer_names:
+            continue
+        max_blocks_per_request = max(
+            max_blocks_per_request,
+            max(
+                cdiv(
+                    spec.max_memory_usage_bytes(vllm_config)
+                    - spec.fixed_prefix_size_bytes,
+                    spec.page_size_bytes,
+                )
+                for spec in _iter_group_layer_specs(group)
+            ),
+        )
+    if max_blocks_per_request <= 0:
+        return 0.0
+    return kv_cache_config.num_blocks / max_blocks_per_request
+
+
 def get_max_concurrency_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> float:
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
+    if _contains_fixed_prefix_spec(kv_cache_config):
+        return _get_fixed_prefix_max_concurrency(vllm_config, kv_cache_config)
+
     num_layer_per_group = max(
         len(group.layer_names) for group in kv_cache_config.kv_cache_groups
     )
@@ -970,7 +1026,21 @@ def _pool_bytes_per_block(
     `available_memory` into `num_blocks`. Used to compute the effective KV cache
     capacity once `num_gpu_blocks_override` is applied.
     """
-    if len(kv_cache_groups) == 1 and isinstance(
+    if any(
+        spec.fixed_prefix_size_bytes
+        for group in kv_cache_groups
+        for spec in (
+            group.kv_cache_spec.kv_cache_specs.values()
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else (group.kv_cache_spec,)
+        )
+    ):
+        regular_groups, prefix_layers = _split_fixed_prefix_layers(kv_cache_groups)
+        buckets = _bucket_layers_by_page_size(regular_groups)
+        return sum(ps * len(slots) for ps, slots in buckets.items()) + sum(
+            spec.page_size_bytes for _, spec in prefix_layers
+        )
+    elif len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         return kv_cache_groups[0].kv_cache_spec.page_size_bytes
@@ -1423,7 +1493,19 @@ def get_kv_cache_config_from_groups(
         )
 
     # Determine how model runners should initialize the KV cache tensors.
-    if len(kv_cache_groups) == 1 and isinstance(
+    if any(
+        spec.fixed_prefix_size_bytes
+        for group in kv_cache_groups
+        for spec in (
+            group.kv_cache_spec.kv_cache_specs.values()
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else (group.kv_cache_spec,)
+        )
+    ):
+        num_blocks, kv_cache_tensors = _get_kv_cache_config_fixed_prefix(
+            vllm_config, kv_cache_groups, available_memory
+        )
+    elif len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         # Special case: all layers have the same type of KV cache but with
@@ -1441,18 +1523,6 @@ def get_kv_cache_config_from_groups(
             )
             for layer_name in kv_cache_groups[0].layer_names
         ]
-    elif any(
-        spec.fixed_prefix_size_bytes
-        for group in kv_cache_groups
-        for spec in (
-            group.kv_cache_spec.kv_cache_specs.values()
-            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-            else (group.kv_cache_spec,)
-        )
-    ):
-        num_blocks, kv_cache_tensors = _get_kv_cache_config_fixed_prefix(
-            vllm_config, kv_cache_groups, available_memory
-        )
     elif _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
         # DeepSeek V4 uses the packed layout by default. Other multi-group
         # layouts can opt in with --enable-cross-layers.
@@ -1884,11 +1954,7 @@ def generate_scheduler_kv_cache_config(
     cfg = copy.deepcopy(kv_cache_configs[0])
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
-            # All layers in the UniformTypeKVCacheSpecs have the same type,
-            # so use an arbitrary one to initialize the scheduler.
-            group.kv_cache_spec = next(
-                iter(group.kv_cache_spec.kv_cache_specs.values())
-            )
+            group.kv_cache_spec = _representative_scheduler_spec(group.kv_cache_spec)
     return cfg
 
 
@@ -2188,12 +2254,17 @@ def get_kv_cache_configs(
                 adjusted_memory.append(avail_mem)
                 continue
             bytes_per_block = _pool_bytes_per_block(vllm_config, groups)
+            _, prefix_layers = _split_fixed_prefix_layers(groups)
+            fixed_prefix_bytes = sum(
+                spec.fixed_prefix_size_bytes for _, spec in prefix_layers
+            )
+            scalable_memory = max(0, avail_mem - fixed_prefix_bytes)
             logger.info(
                 "Overriding num_gpu_blocks=%d with num_gpu_blocks_override=%d",
-                avail_mem // bytes_per_block,
+                scalable_memory // bytes_per_block,
                 override,
             )
-            adjusted_memory.append(override * bytes_per_block)
+            adjusted_memory.append(fixed_prefix_bytes + override * bytes_per_block)
         available_memory = adjusted_memory
 
     if vllm_config.model_config.original_max_model_len == -1:

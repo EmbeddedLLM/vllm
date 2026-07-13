@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 from dataclasses import dataclass
 from typing import ClassVar, cast
 
@@ -10,6 +9,7 @@ from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -32,31 +32,12 @@ from vllm.v1.kv_cache_interface import (
 _LAYER_TYPE_SWAONLY = "swaonly"
 _LAYER_TYPE_C4A = "c4a"
 _LAYER_TYPE_C128A = "c128a"
-_ATOM_ROCM_DSV4_ENABLED = current_platform.is_rocm() and (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION", "0") == "1"
-    or os.environ.get("VLLM_ROCM_DSV4_ATOM_MAIN_COMPRESSOR", "0") == "1"
-    or os.environ.get("VLLM_ROCM_DSV4_ATOM_UNIFIED_KV", "0") == "1"
-)
-_ATOM_ATTENTION_ENABLED = (
-    current_platform.is_rocm()
-    and os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION", "0") == "1"
-)
-_ATOM_ATTENTION_RATIOS = frozenset(
-    part.strip()
-    for part in os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION_RATIOS", "").split(",")
-    if part.strip()
-)
-_ATOM_ATTENTION_LAYERS = frozenset(
-    part.strip()
-    for part in os.environ.get("VLLM_ROCM_DSV4_ATOM_ATTENTION_LAYERS", "").split(",")
-    if part.strip()
-)
-_ATOM_RETURN_FALSE_AT_ENTRY = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_RETURN_FALSE_AT_ENTRY", "0") == "1"
-)
-_ATOM_SKIP_DECODE_INDEX_WRITE = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_SKIP_DECODE_INDEX_WRITE", "0") == "1"
-)
+_ATOM_ROCM_DSV4_ENABLED = current_platform.is_rocm()
+_ATOM_ATTENTION_ENABLED = current_platform.is_rocm()
+_ATOM_ATTENTION_RATIOS: frozenset[str] = frozenset()
+_ATOM_ATTENTION_LAYERS: frozenset[str] = frozenset()
+_ATOM_RETURN_FALSE_AT_ENTRY = False
+_ATOM_SKIP_DECODE_INDEX_WRITE = False
 
 
 def _atom_can_skip_legacy_decode_metadata() -> bool:

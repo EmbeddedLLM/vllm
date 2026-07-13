@@ -10,7 +10,6 @@ import torch
 from vllm.v1.kv_cache_interface import (
     DeepseekV4AtomMLAAttentionSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
     KVCacheTensor,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
@@ -191,9 +190,6 @@ def test_deepseek_v4_kv_cache_spec_stays_regular_mla_off_rocm(
 
     default_vllm_config.cache_config.block_size = 128
     monkeypatch.setattr(attention_mod.current_platform, "is_rocm", lambda: False)
-    monkeypatch.setattr(attention_mod, "_ATOM_ROCM_DSV4_ENABLED", False)
-    monkeypatch.setattr(attention_mod, "_ATOM_UNIFIED_KV_FROM_VLLM_ENABLED", True)
-    monkeypatch.setattr(attention_mod, "_ATOM_MIXED_KV_ENABLED", True)
     attn = _deepseek_v4_attn_stub()
 
     spec = DeepseekV4Attention.get_kv_cache_spec(attn, default_vllm_config)
@@ -203,7 +199,7 @@ def test_deepseek_v4_kv_cache_spec_stays_regular_mla_off_rocm(
     assert not hasattr(attn, "atom_vllm_unified_kv_prefix_bytes")
 
 
-def test_deepseek_v4_kv_cache_spec_uses_atom_mla_only_for_rocm_unified(
+def test_deepseek_v4_kv_cache_spec_always_uses_atom_mla_on_rocm(
     default_vllm_config, monkeypatch
 ):
     from vllm.models.deepseek_v4 import attention as attention_mod
@@ -213,9 +209,6 @@ def test_deepseek_v4_kv_cache_spec_uses_atom_mla_only_for_rocm_unified(
     default_vllm_config.scheduler_config.max_num_seqs = 2
     default_vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)
     monkeypatch.setattr(attention_mod.current_platform, "is_rocm", lambda: True)
-    monkeypatch.setattr(attention_mod, "_ATOM_ROCM_DSV4_ENABLED", True)
-    monkeypatch.setattr(attention_mod, "_ATOM_UNIFIED_KV_FROM_VLLM_ENABLED", True)
-    monkeypatch.setattr(attention_mod, "_ATOM_MIXED_KV_ENABLED", True)
     attn = _deepseek_v4_attn_stub()
 
     spec = DeepseekV4Attention.get_kv_cache_spec(attn, default_vllm_config)
@@ -223,8 +216,8 @@ def test_deepseek_v4_kv_cache_spec_uses_atom_mla_only_for_rocm_unified(
     expected_swa_pages = default_vllm_config.scheduler_config.max_num_seqs * 128
     expected_prefix_bytes = expected_swa_pages * attn.head_dim * torch.bfloat16.itemsize
     assert isinstance(spec, DeepseekV4AtomMLAAttentionSpec)
-    assert spec.cache_dtype_str == "fp8_ds_mla"
-    assert spec.atom_compressed_layout == "fp8_ds_mla"
+    assert spec.cache_dtype_str == "bf16"
+    assert spec.atom_compressed_layout == "dense"
     assert spec.atom_swa_pages == expected_swa_pages
     assert spec.atom_swa_prefix_bytes == expected_prefix_bytes
     assert attn.atom_vllm_unified_kv_prefix_bytes == expected_prefix_bytes
@@ -239,8 +232,6 @@ def test_deepseek_v4_vllm_owned_atom_kv_enforces_block_size(
     default_vllm_config.cache_config.block_size = 256
     default_vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)
     monkeypatch.setattr(attention_mod.current_platform, "is_rocm", lambda: True)
-    monkeypatch.setattr(attention_mod, "_ATOM_ROCM_DSV4_ENABLED", False)
-    monkeypatch.setattr(attention_mod, "_ATOM_UNIFIED_KV_FROM_VLLM_ENABLED", True)
     attn = _deepseek_v4_attn_stub()
 
     with pytest.raises(ValueError, match="--block-size 128"):
@@ -253,61 +244,29 @@ def test_deepseek_v4_model_state_cls_stays_default_off_rocm(monkeypatch):
     from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
     monkeypatch.setattr(model_mod.current_platform, "is_rocm", lambda: False)
-    monkeypatch.setattr(model_mod, "_ROCM_DSV4_ATOM_STATE_ENABLED", True)
 
     assert DeepseekV4ForCausalLM.get_model_state_cls() is DefaultModelState
 
 
-def test_deepseek_v4_model_state_cls_stays_default_without_atom_state(
-    monkeypatch,
-):
-    from vllm.models.deepseek_v4.amd import model as model_mod
-    from vllm.models.deepseek_v4.amd.model import DeepseekV4ForCausalLM
-    from vllm.v1.worker.gpu.model_states.default import DefaultModelState
-
-    monkeypatch.setattr(model_mod.current_platform, "is_rocm", lambda: True)
-    monkeypatch.setattr(model_mod, "_ROCM_DSV4_ATOM_STATE_ENABLED", False)
-
-    assert DeepseekV4ForCausalLM.get_model_state_cls() is DefaultModelState
-
-
-def test_deepseek_v4_model_state_cls_uses_atom_state_only_for_rocm_atom(
-    monkeypatch,
-):
+def test_deepseek_v4_model_state_cls_always_uses_atom_state_on_rocm(monkeypatch):
     from vllm.models.deepseek_v4.amd import model as model_mod
     from vllm.models.deepseek_v4.amd.model import DeepseekV4ForCausalLM
     from vllm.models.deepseek_v4.amd.model_state import DeepseekV4RocmAtomModelState
 
     monkeypatch.setattr(model_mod.current_platform, "is_rocm", lambda: True)
-    monkeypatch.setattr(model_mod, "_ROCM_DSV4_ATOM_STATE_ENABLED", True)
 
     assert DeepseekV4ForCausalLM.get_model_state_cls() is DeepseekV4RocmAtomModelState
 
 
-def test_deepseek_v4_split_only_kv_decode_auto_selects_split_path(monkeypatch):
+def test_deepseek_v4_split_only_kv_decode_auto_selects_split_path():
     from vllm.models.deepseek_v4.amd import rocm as rocm_mod
 
     unified = torch.zeros((1, 8), dtype=torch.bfloat16)
     split_swa = torch.zeros((1, 1, 8), dtype=torch.bfloat16)
     split_tail = torch.zeros((1, 4, 584), dtype=torch.uint8)
 
-    monkeypatch.setattr(rocm_mod, "_ATOM_DECODE_KV_SPLITS", 0)
-    monkeypatch.setattr(rocm_mod, "_ATOM_SPLIT_KV_DECODE", False)
-
     assert rocm_mod._should_use_atom_split_kv_decode(None, split_swa, split_tail)
     assert not rocm_mod._should_use_atom_split_kv_decode(unified, split_swa, split_tail)
-
-    monkeypatch.setattr(rocm_mod, "_ATOM_SPLIT_KV_DECODE", True)
-
-    assert not rocm_mod._should_use_atom_split_kv_decode(unified, split_swa, split_tail)
-
-    monkeypatch.setattr(rocm_mod, "_ATOM_DECODE_KV_SPLITS", 1)
-
-    assert rocm_mod._should_use_atom_split_kv_decode(unified, split_swa, split_tail)
-
-    monkeypatch.setattr(rocm_mod, "_ATOM_DECODE_KV_SPLITS", 2)
-
-    assert rocm_mod._should_use_atom_split_kv_decode(None, split_swa, split_tail)
 
 
 def test_deepseek_v4_atom_kv_views_prefer_metadata_bundle():
@@ -630,7 +589,6 @@ def test_deepseek_v4_post_bind_stays_noop_off_rocm(monkeypatch):
     from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 
     monkeypatch.setattr(attention_mod.current_platform, "is_rocm", lambda: False)
-    monkeypatch.setattr(attention_mod, "_ATOM_UNIFIED_KV_FROM_VLLM_ENABLED", True)
     attn = SimpleNamespace(
         compress_ratio=4,
         atom_vllm_unified_kv_prefix_bytes=1024,
@@ -656,7 +614,6 @@ def test_deepseek_v4_post_bind_stays_noop_for_swa_layer(monkeypatch):
     from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 
     monkeypatch.setattr(attention_mod.current_platform, "is_rocm", lambda: True)
-    monkeypatch.setattr(attention_mod, "_ATOM_UNIFIED_KV_FROM_VLLM_ENABLED", True)
     attn = SimpleNamespace(
         compress_ratio=1,
         atom_vllm_unified_kv_prefix_bytes=1024,
@@ -682,7 +639,6 @@ def test_deepseek_v4_post_bind_exposes_mixed_atom_split_views(monkeypatch):
     from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 
     monkeypatch.setattr(attention_mod.current_platform, "is_rocm", lambda: True)
-    monkeypatch.setattr(attention_mod, "_ATOM_UNIFIED_KV_FROM_VLLM_ENABLED", True)
 
     head_dim = 64
     swa_pages = 1
@@ -738,7 +694,6 @@ def test_deepseek_v4_post_bind_rejects_unknown_atom_layout(monkeypatch):
     from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 
     monkeypatch.setattr(attention_mod.current_platform, "is_rocm", lambda: True)
-    monkeypatch.setattr(attention_mod, "_ATOM_UNIFIED_KV_FROM_VLLM_ENABLED", True)
     attn = SimpleNamespace(
         compress_ratio=4,
         atom_vllm_unified_kv_prefix_bytes=128,
@@ -762,7 +717,6 @@ def test_deepseek_v4_post_bind_exposes_packed_atom_split_view(monkeypatch):
     from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 
     monkeypatch.setattr(attention_mod.current_platform, "is_rocm", lambda: True)
-    monkeypatch.setattr(attention_mod, "_ATOM_UNIFIED_KV_FROM_VLLM_ENABLED", True)
 
     head_dim = 512
     swa_pages = 1
@@ -879,7 +833,6 @@ def test_deepseek_v4_model_state_binds_sidecar_vllm_owned_kv(monkeypatch):
     from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 
     monkeypatch.setattr(attention_mod.current_platform, "is_rocm", lambda: True)
-    monkeypatch.setattr(attention_mod, "_ATOM_UNIFIED_KV_FROM_VLLM_ENABLED", True)
 
     head_dim = 64
     swa_pages = 1
@@ -959,8 +912,6 @@ def test_deepseek_v4_model_state_refuses_vllm_owned_kv_fallback():
     )
 
     state = DeepseekV4RocmAtomModelState.__new__(DeepseekV4RocmAtomModelState)
-    state._enable_atom_unified_kv = True
-    state._enable_atom_unified_kv_from_vllm = True
     state._atom_unified_kv_buffers = None
     state._try_bind_atom_unified_kv_from_vllm = lambda _config: False
     kv_cache_config = KVCacheConfig(
@@ -969,7 +920,7 @@ def test_deepseek_v4_model_state_refuses_vllm_owned_kv_fallback():
         kv_cache_groups=[],
     )
 
-    with pytest.raises(RuntimeError, match="Refusing to fall back"):
+    with pytest.raises(RuntimeError, match="requires ATOM KV views"):
         state._maybe_allocate_atom_unified_kv(kv_cache_config)
 
 
@@ -1046,155 +997,3 @@ def test_deepseek_v4_legacy_metadata_carries_unified_kv_layout_bundle():
     assert metadata.unified_kv_buffers.compressed_kv_cache[0] is tail
     assert metadata.unified_kv_buffers.compressed_kv_scales[0] is None
     assert metadata.unified_kv_buffers.compressed_kv_layout[0] == "fp8_ds_mla"
-
-
-def test_deepseek_v4_bind_split_only_unified_kv_bundle():
-    from vllm.models.deepseek_v4.amd.model_state import (
-        DeepseekV4RocmAtomModelState,
-        DeepseekV4RocmAtomUnifiedKVBuffers,
-    )
-
-    swa = torch.zeros((1, 1, 8), dtype=torch.bfloat16)
-    tail = torch.zeros((1, 4, 584), dtype=torch.uint8)
-    compressor = SimpleNamespace()
-    attn = SimpleNamespace(atom_swa_kv=swa, compressor=compressor)
-    buffers = DeepseekV4RocmAtomUnifiedKVBuffers(
-        unified_kv=(),
-        unified_kv_by_layer={},
-        compressed_kv_cache={0: tail},
-        compressed_kv_scales={0: None},
-        compressed_kv_layout={0: "fp8_ds_mla"},
-        active_layer_ids=(0,),
-        num_blocks=1,
-        swa_pages=1,
-        k1_csa=4,
-        k2_hca=1,
-    )
-    state = DeepseekV4RocmAtomModelState.__new__(DeepseekV4RocmAtomModelState)
-    state.max_num_reqs = 1
-    state.win_with_spec = 1
-    state.head_dim = 8
-    state._iter_active_attn_modules = lambda: [(0, attn)]
-
-    state._bind_atom_unified_kv_buffers(buffers)
-
-    assert not hasattr(attn, "atom_unified_kv")
-    assert attn.atom_split_kv_swa is swa
-    assert attn.atom_split_kv_compressed is tail
-    assert attn.atom_split_kv_scales is None
-    assert attn.atom_split_kv_layout == "fp8_ds_mla"
-    assert compressor.atom_kv_cache is tail
-    assert compressor.atom_kv_scales is None
-    assert compressor.atom_kv_layout == "fp8_ds_mla"
-
-
-def test_deepseek_v4_bind_mixed_split_and_homogeneous_bundle():
-    from vllm.models.deepseek_v4.amd.model_state import (
-        DeepseekV4RocmAtomModelState,
-        DeepseekV4RocmAtomUnifiedKVBuffers,
-    )
-
-    split_swa = torch.zeros((1, 1, 8), dtype=torch.bfloat16)
-    split_tail = torch.zeros((1, 4, 584), dtype=torch.uint8)
-    dense_unified = torch.zeros((5, 8), dtype=torch.bfloat16)
-    dense_unified[0, 0] = 17
-    dense_tail = dense_unified[1:].view(1, 4, 8)
-    split_compressor = SimpleNamespace()
-    dense_compressor = SimpleNamespace()
-    split_attn = SimpleNamespace(atom_swa_kv=split_swa, compressor=split_compressor)
-    dense_attn = SimpleNamespace(compressor=dense_compressor)
-    buffers = DeepseekV4RocmAtomUnifiedKVBuffers(
-        unified_kv=(dense_unified,),
-        unified_kv_by_layer={1: dense_unified},
-        compressed_kv_cache={0: split_tail, 1: dense_tail},
-        compressed_kv_scales={0: None, 1: None},
-        compressed_kv_layout={0: "fp8_ds_mla", 1: "dense"},
-        active_layer_ids=(0, 1),
-        num_blocks=1,
-        swa_pages=1,
-        k1_csa=4,
-        k2_hca=1,
-    )
-    state = DeepseekV4RocmAtomModelState.__new__(DeepseekV4RocmAtomModelState)
-    state.max_num_reqs = 1
-    state.win_with_spec = 1
-    state.head_dim = 8
-    state._iter_active_attn_modules = lambda: [(0, split_attn), (1, dense_attn)]
-
-    state._bind_atom_unified_kv_buffers(buffers)
-
-    assert not hasattr(split_attn, "atom_unified_kv")
-    assert split_attn.atom_split_kv_layout == "fp8_ds_mla"
-    assert split_attn.atom_split_kv_compressed is split_tail
-    assert split_compressor.atom_kv_layout == "fp8_ds_mla"
-    assert dense_attn.atom_unified_kv is dense_unified
-    assert dense_attn.atom_swa_kv.shape == (1, 1, 8)
-    assert float(dense_attn.atom_swa_kv[0, 0, 0]) == 17
-    assert dense_attn.atom_split_kv_layout == "dense"
-    assert dense_attn.atom_split_kv_compressed is dense_tail
-    assert dense_compressor.atom_kv_cache is dense_tail
-
-
-def test_deepseek_v4_model_state_side_allocates_when_not_vllm_owned():
-    from vllm.models.deepseek_v4.amd.model_state import (
-        DeepseekV4RocmAtomModelState,
-        DeepseekV4RocmAtomUnifiedKVBuffers,
-    )
-
-    head_dim = 8
-    num_blocks = 2
-    k_per_block = 4
-    compressor = SimpleNamespace()
-    attn = SimpleNamespace(compress_ratio=4, compressor=compressor)
-    state = DeepseekV4RocmAtomModelState.__new__(DeepseekV4RocmAtomModelState)
-    state._enable_atom_unified_kv = True
-    state._enable_atom_unified_kv_from_vllm = False
-    state._atom_unified_kv_buffers = None
-    state._try_bind_atom_unified_kv_from_vllm = lambda _config: False
-    state._iter_active_attn_modules = lambda: [(0, attn)]
-    state.device = torch.device("cpu")
-    state.max_num_reqs = 1
-    state.win_with_spec = 2
-    state.swa_pages = 2
-    state.head_dim = head_dim
-    state.dtype = torch.bfloat16
-    state.k1_csa = k_per_block
-    state.k2_hca = 1
-    spec = DeepseekV4AtomMLAAttentionSpec(
-        block_size=16,
-        num_kv_heads=1,
-        head_size=head_dim,
-        dtype=torch.bfloat16,
-        compress_ratio=4,
-    )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(["atom"], spec)],
-    )
-
-    state._maybe_allocate_atom_unified_kv(kv_cache_config)
-
-    buffers = state._atom_unified_kv_buffers
-    assert isinstance(buffers, DeepseekV4RocmAtomUnifiedKVBuffers)
-    assert buffers.active_layer_ids == (0,)
-    assert buffers.num_blocks == num_blocks
-    assert buffers.swa_pages == state.swa_pages
-    assert buffers.compressed_kv_cache[0].shape == (
-        num_blocks,
-        k_per_block,
-        head_dim,
-    )
-    assert buffers.compressed_kv_scales[0] is None
-    assert buffers.compressed_kv_layout[0] == "dense"
-    assert buffers.unified_kv_by_layer[0] is attn.atom_unified_kv
-    assert attn.atom_unified_kv.shape == (
-        state.swa_pages + num_blocks * k_per_block,
-        head_dim,
-    )
-    assert attn.atom_swa_kv.shape == (1, 2, head_dim)
-    assert attn.atom_split_kv_compressed is buffers.compressed_kv_cache[0]
-    assert attn.atom_split_kv_layout == "dense"
-    assert compressor.atom_kv_cache is buffers.compressed_kv_cache[0]
-    assert compressor.atom_kv_scales is None
-    assert compressor.atom_kv_layout == "dense"

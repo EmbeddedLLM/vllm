@@ -53,15 +53,9 @@ LAST `actual_count` tokens of seq `i` in `kv` / `positions`, no shared
 GPU index buffer needed (no DMA race window).
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
-
-_ATOM_VARIABLE_STATE_UPDATE = (
-    os.environ.get("VLLM_ROCM_DSV4_ATOM_VARIABLE_STATE_UPDATE", "0") == "1"
-)
 
 
 @triton.jit
@@ -402,10 +396,7 @@ def update_compressor_states(
     # `position=-1` (filled host-side in `make_compress_plans`); the kernel
     # bails on those, so this is functionally identical to the variable-grid
     # version while keeping the launch CUDAGraph-capturable.
-    if _ATOM_VARIABLE_STATE_UPDATE:
-        grid_size = int(num_write)
-    else:
-        grid_size = write_plan.shape[0]
+    grid_size = write_plan.shape[0]
     if grid_size == 0:
         return
 

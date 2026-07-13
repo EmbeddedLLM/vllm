@@ -1,20 +1,169 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+import vllm.models.deepseek_v4.amd.rocm as rocm_module
 import vllm.models.deepseek_v4.amd.v4_kernels.paged_decode as paged_decode_module
 import vllm.models.deepseek_v4.amd.v4_kernels.paged_prefill as paged_prefill_module
 from vllm.models.deepseek_v4.amd.v4_kernels import (
     sparse_attn_v4_paged_decode_split_kv,
     sparse_attn_v4_paged_prefill_split_kv,
 )
+from vllm.models.deepseek_v4.amd.v4_kernels.paged_decode import (
+    sparse_attn_v4_paged_decode_split_kv_reference,
+)
 
 _PACKED_TOKEN_DATA_SIZE = 576
 _PACKED_TOKEN_SCALE_SIZE = 8
 _PACKED_NOPE_BYTES = 448
 _PACKED_ROPE_BYTES = 128
+
+
+@pytest.mark.parametrize(
+    ("bound", "num_prefills", "num_decodes", "tokens", "reqs", "expected"),
+    [
+        (True, 0, 32, 32, 32, True),
+        (False, 0, 32, 32, 32, False),
+        (True, 1, 31, 32, 32, False),
+        (True, 0, 0, 0, 0, False),
+        (True, 0, 32, 64, 32, False),
+    ],
+)
+def test_atom_direct_swa_authority_contract(
+    bound: bool,
+    num_prefills: int,
+    num_decodes: int,
+    tokens: int,
+    reqs: int,
+    expected: bool,
+):
+    attn = SimpleNamespace(
+        atom_direct_swa_bound=bound,
+        compress_ratio=4,
+        _atom_layer_id=0,
+    )
+    metadata = SimpleNamespace(
+        num_prefills=num_prefills,
+        num_decodes=num_decodes,
+    )
+    state = SimpleNamespace(
+        num_actual_tokens=tokens,
+        num_actual_reqs=reqs,
+    )
+
+    assert (
+        rocm_module._atom_direct_swa_is_authoritative(
+            attn,
+            metadata,
+            state,
+            torch.empty(1),
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("direct_swa_bound", "expected_fused", "expected_native_inserts"),
+    [(True, True, 0), (False, False, 1)],
+)
+def test_atom_direct_swa_decode_write_dispatch(
+    monkeypatch,
+    direct_swa_bound: bool,
+    expected_fused: bool,
+    expected_native_inserts: int,
+):
+    tokens, heads, dim, rope_dim = 2, 1, 4, 2
+    state = SimpleNamespace(
+        num_actual_tokens=tokens,
+        num_actual_reqs=tokens,
+        batch_id_per_token=torch.arange(tokens, dtype=torch.int32),
+        state_slot_mapping=torch.arange(tokens, dtype=torch.int32),
+        win_with_spec=8,
+    )
+    metadata = SimpleNamespace(
+        num_prefills=0,
+        num_decodes=tokens,
+        slot_mapping=torch.arange(tokens, dtype=torch.int64),
+        block_size=128,
+    )
+    attn = SimpleNamespace(
+        n_local_heads=heads,
+        padded_heads=heads,
+        head_dim=dim,
+        rope_head_dim=rope_dim,
+        eps=1.0e-6,
+        compress_ratio=4,
+        _atom_layer_id=0,
+        atom_direct_swa_bound=direct_swa_bound,
+        atom_swa_kv=torch.empty(tokens, 8, dim),
+        kv_norm=SimpleNamespace(
+            weight=SimpleNamespace(data=torch.ones(dim)),
+        ),
+        swa_cache_layer=SimpleNamespace(
+            prefix="swa",
+            kv_cache=torch.empty(1, 1, 584, dtype=torch.uint8),
+        ),
+        _atom_rotary_cos_sin=lambda dtype: (
+            torch.ones(8, 1, 1, rope_dim // 2, dtype=dtype),
+            torch.zeros(8, 1, 1, rope_dim // 2, dtype=dtype),
+        ),
+    )
+    native_insert_calls = 0
+    fused_calls = 0
+
+    def fake_fused(q, kv, *args, **kwargs):
+        nonlocal fused_calls
+        fused_calls += 1
+        return q.view(tokens, heads, dim)
+
+    def fake_qk_norm(q, kv, *args, **kwargs):
+        return q.view(tokens, heads, dim), kv, None, None
+
+    def fake_native_insert(*args, **kwargs):
+        nonlocal native_insert_calls
+        native_insert_calls += 1
+
+    monkeypatch.setattr(
+        rocm_module,
+        "get_deepseek_v4_rocm_atom_state",
+        lambda _: state,
+    )
+    monkeypatch.setattr(
+        rocm_module,
+        "fused_reduce_qk_norm_rope_swa_write",
+        fake_fused,
+    )
+    monkeypatch.setattr(
+        rocm_module,
+        "qk_norm_rope_maybe_quant",
+        fake_qk_norm,
+    )
+    monkeypatch.setattr(
+        rocm_module,
+        "quantize_and_insert_k_cache",
+        fake_native_insert,
+    )
+
+    q = torch.randn(tokens, heads, dim)
+    kv = torch.randn(tokens, dim)
+    positions = torch.arange(tokens, dtype=torch.int64)
+    output = rocm_module.DeepseekV4ROCMAiterMLAAttention._fused_qnorm_rope_kv_insert(
+        attn,
+        q,
+        kv,
+        positions,
+        {"swa": metadata},
+    )
+
+    assert output.shape == q.shape
+    assert attn._atom_direct_swa_authoritative is direct_swa_bound
+    assert attn._atom_swa_write_fused is expected_fused
+    assert fused_calls == int(expected_fused)
+    assert native_insert_calls == expected_native_inserts
 
 
 def _packed_block_bytes(packed_tail: torch.Tensor) -> torch.Tensor:
@@ -415,24 +564,76 @@ def test_split_kv_decode_ordered_packed_fp8_matches_reference_rocm():
         csa_window_size=128,
     )
 
-    old = paged_decode_module._ATOM_USE_TRITON_ATTN
-    paged_decode_module._ATOM_USE_TRITON_ATTN = False
-    try:
-        out_ref = sparse_attn_v4_paged_decode_split_kv(
-            q,
-            swa_kv,
-            packed_tail,
-            kv_indices,
-            kv_indptr,
-            attn_sink,
-            1.0,
-            swa_pages=4,
-            compressed_kv_layout="fp8_ds_mla",
-            csa_positions=positions,
-            csa_window_size=128,
-        )
-    finally:
-        paged_decode_module._ATOM_USE_TRITON_ATTN = old
+    out_ref = sparse_attn_v4_paged_decode_split_kv_reference(
+        q,
+        swa_kv,
+        packed_tail,
+        kv_indices,
+        kv_indptr,
+        attn_sink,
+        1.0,
+        swa_pages=4,
+        compressed_kv_layout="fp8_ds_mla",
+    )
 
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_kernel, out_ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("prefix_len", [4, 20])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is None,
+    reason="ROCm GPU required for Triton unified-KV prefill",
+)
+def test_unified_prefill_tuned_paths_match_reference_rocm(prefix_len: int):
+    """Exercise the short-HCA and long-prefix CSA launch specializations."""
+    device = "cuda"
+    torch.manual_seed(prefix_len)
+    tokens, heads, dim = 2, 2, 512
+    q = torch.randn(
+        (tokens, heads, dim), device=device, dtype=torch.bfloat16
+    ) * 0.01
+    unified_kv = torch.randn((64, dim), device=device, dtype=torch.bfloat16) * 0.01
+    extend_kv = torch.randn((4, dim), device=device, dtype=torch.bfloat16) * 0.01
+    prefix_indices = torch.arange(
+        tokens * prefix_len, device=device, dtype=torch.int32
+    ) % unified_kv.shape[0]
+    prefix_indptr = torch.arange(
+        0,
+        (tokens + 1) * prefix_len,
+        prefix_len,
+        device=device,
+        dtype=torch.int32,
+    )
+    extend_indices = torch.tensor([0, 1, 2, 3], device=device, dtype=torch.int32)
+    extend_indptr = torch.tensor([0, 2, 4], device=device, dtype=torch.int32)
+    attn_sink = torch.zeros((heads,), device=device, dtype=torch.float32)
+    out_buffer = torch.empty_like(q)
+
+    out_kernel = paged_prefill_module._sparse_attn_v4_paged_prefill_triton(
+        q,
+        unified_kv,
+        prefix_indices,
+        prefix_indptr,
+        extend_kv,
+        extend_indices,
+        extend_indptr,
+        attn_sink,
+        dim**-0.5,
+        out=out_buffer,
+    )
+    out_ref = paged_prefill_module.sparse_attn_v4_paged_prefill_reference(
+        q,
+        unified_kv,
+        prefix_indices,
+        prefix_indptr,
+        extend_kv,
+        extend_indices,
+        extend_indptr,
+        attn_sink,
+        dim**-0.5,
+    )
+
+    assert out_kernel.data_ptr() == out_buffer.data_ptr()
     torch.cuda.synchronize()
     torch.testing.assert_close(out_kernel, out_ref, atol=2e-2, rtol=2e-2)

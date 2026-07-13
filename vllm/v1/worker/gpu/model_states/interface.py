@@ -11,7 +11,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.tasks import GenerationTask
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
 from vllm.v1.worker.gpu.states import RequestState
@@ -164,6 +164,23 @@ class ModelState(ABC):
         for_capture: bool = False,
     ) -> dict[str, Any]:
         raise NotImplementedError
+
+    def augment_draft_decode_attn_metadata(
+        self,
+        attn_metadata: dict[str, Any],
+        *,
+        num_reqs: int,
+        num_reqs_padded: int,
+        num_tokens_padded: int,
+        input_buffers: InputBuffers,
+        idx_mapping: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        kv_cache_config: KVCacheConfig,
+    ) -> dict[str, Any]:
+        """Add model-specific state to autoregressive draft-decode metadata."""
+        return attn_metadata
 
     def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
         """Wrap or replace the default sampler.

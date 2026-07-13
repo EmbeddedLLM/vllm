@@ -232,7 +232,18 @@ class DraftModelSpeculator(BaseSpeculator):
             kv_cache_config=self.kv_cache_config,
             causal=causal,
         )
-        return attn_metadata
+        return self.model_state.augment_draft_decode_attn_metadata(
+            attn_metadata,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            num_tokens_padded=num_tokens_padded,
+            input_buffers=self.input_buffers,
+            idx_mapping=self.idx_mapping,
+            attn_groups=self.attn_groups,
+            block_tables=tuple(block_tables),
+            slot_mappings=slot_mappings,
+            kv_cache_config=self.kv_cache_config,
+        )
 
     def _validate_local_argmax_reduction(self) -> None:
         if not self.use_local_argmax_reduction:
