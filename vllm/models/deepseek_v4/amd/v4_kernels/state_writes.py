@@ -10,14 +10,10 @@ Inputs are flat batched tensors; per-token slot/position lookups happen
 inside the kernel — no `.item()` syncs.
 
 Currently implemented:
-- `swa_write`: writes the LAST `min(tok_n_b, write_per_batch)` tokens of
-  every seq `b ∈ [0, bs)` into `swa_kv[state_slot_per_seq[b],
-  positions[src] % cache_size, :] = kv[src, :]`. `src_id` is derived inside
-  the kernel from `cu_seqlens_q + row_in_batch` — no shared per-token
-  `write_indices` GPU buffer (which had a DMA-tear race when the next fwd's
-  CPU rewrite landed mid-H2D). `cache_size = window_size + max_spec_steps`
-  — for non-MTP this reduces to `window_size`; for MTP-k draft tokens get
-  their own ring slots separate from the verified token's slot.
+- `swa_write`: writes through either the legacy request-ring address or the
+  vLLM-owned SWA block table. The paged address is
+  `swa_kv[block_tables[b, pos // block_size], pos % block_size, :]`, which is
+  content-addressed and prefix-cache compatible.
 - `update_compressor_states`: unified in-place update of Compressor's
   per-request `kv_state` + `score_state` ring buffers, covering both prefill
   (B-side overlap context + tail) and decode (every token at `pos % STATE_SIZE`
@@ -61,6 +57,7 @@ import triton.language as tl
 @triton.jit
 def _swa_write_kernel(
     kv_ptr,  # [T, head_dim]
+    kv_row_stride,
     positions_ptr,  # [T] int — full positions
     cu_seqlens_q_ptr,  # [bs+1] int — per-seq cumulative seqlens
     state_slot_per_seq_ptr,  # [bs] int — state_slot_mapping_gpu_i32
@@ -113,13 +110,70 @@ def _swa_write_kernel(
     d_mask = d_offsets < head_dim
 
     src = tl.load(
-        kv_ptr + src_id * head_dim + d_offsets,
+        kv_ptr + src_id * kv_row_stride + d_offsets,
         mask=d_mask,
     )
     dst = (
         swa_kv_ptr
         + slot * swa_kv_slot_stride
         + ring_idx * swa_kv_pos_stride
+        + d_offsets
+    )
+    tl.store(dst, src, mask=d_mask)
+
+
+@triton.jit
+def _paged_swa_write_kernel(
+    kv_ptr,
+    kv_row_stride,
+    positions_ptr,
+    cu_seqlens_q_ptr,
+    block_tables_ptr,
+    block_tables_stride,
+    swa_kv_ptr,
+    swa_kv_block_stride,
+    swa_kv_pos_stride,
+    num_blocks,
+    total_tokens,
+    head_dim,
+    block_size,
+    WRITE_PER_BATCH: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Write the last tokens of each request through a vLLM block table."""
+    batch_idx = tl.program_id(0)
+    row_in_batch = tl.program_id(1)
+
+    cu_start = tl.load(cu_seqlens_q_ptr + batch_idx)
+    cu_end = tl.load(cu_seqlens_q_ptr + batch_idx + 1)
+    tok_n = cu_end - cu_start
+    if tok_n <= 0:
+        return
+    write_n = tl.minimum(tok_n, WRITE_PER_BATCH)
+    if row_in_batch >= write_n:
+        return
+
+    src_id = cu_end - write_n + row_in_batch
+    if src_id < 0 or src_id >= total_tokens:
+        return
+
+    pos = tl.load(positions_ptr + src_id)
+    logical_block = pos // block_size
+    physical_block = tl.load(
+        block_tables_ptr + batch_idx * block_tables_stride + logical_block
+    )
+    if physical_block < 0 or physical_block >= num_blocks:
+        return
+    physical_block_i64 = physical_block.to(tl.int64)
+    offset_in_block = pos % block_size
+
+    d_offsets = tl.arange(0, BLOCK_D)
+    d_mask = d_offsets < head_dim
+    src = tl.load(kv_ptr + src_id * kv_row_stride + d_offsets, mask=d_mask)
+    dst = (
+        swa_kv_ptr
+        + physical_block_i64 * swa_kv_block_stride
+        + offset_in_block * swa_kv_pos_stride
         + d_offsets
     )
     tl.store(dst, src, mask=d_mask)
@@ -133,9 +187,16 @@ def swa_write(
     swa_kv: torch.Tensor,
     cache_size: int,
     write_per_batch: int,
+    *,
+    block_tables: torch.Tensor | None = None,
+    block_size: int | None = None,
 ) -> None:
-    """In-place write `swa_kv[state_slot_per_seq[b], pos % cache_size, :] = kv[r, :]`
-    for the last `min(tok_n_b, write_per_batch)` tokens of every seq
+    """Write the last tokens of every sequence into its SWA cache.
+
+    With ``block_tables``, writes are content-addressed through vLLM's pager.
+    Without it, the legacy request-ring address remains available as a
+    compatibility fallback. Writes the last `min(tok_n_b, write_per_batch)` rows
+    of every seq
     `b ∈ [0, bs)` this fwd, where `tok_n_b = cu_seqlens_q[b+1] - cu_seqlens_q[b]`.
     `bs = state_slot_per_seq.shape[0]`.
 
@@ -150,7 +211,8 @@ def swa_write(
         cu_seqlens_q: [bs+1] int — exact size (`bs == state_slot_per_seq.shape[0]`).
         state_slot_per_seq: [bs] int — per-seq state cache slot. Its
             `shape[0]` is the grid X dim and source-of-truth for `bs`.
-        swa_kv: [num_slots, cache_size, head_dim] ring buffer.
+        swa_kv: Paged ``[num_blocks, block_size, head_dim]`` cache or legacy
+            ``[num_slots, cache_size, head_dim]`` ring.
         cache_size: ring-slot count = `window_size + max_spec_steps`.
         write_per_batch: `min(max_q_len, cache_size)` — max tokens written
             per seq this fwd (grid y dim, kernel `constexpr`).
@@ -160,14 +222,24 @@ def swa_write(
     assert state_slot_per_seq.dim() == 1
     bs = state_slot_per_seq.shape[0]
     assert cu_seqlens_q.dim() == 1 and cu_seqlens_q.shape[0] >= bs + 1
-    assert swa_kv.dim() == 3, f"swa_kv must be [S, C, D], got {swa_kv.shape}"
+    assert swa_kv.dim() == 3, f"swa_kv must be 3-D, got {swa_kv.shape}"
     T, head_dim = kv.shape
     assert positions.shape[0] >= T, f"positions {positions.shape[0]} < kv T={T}"
-    assert swa_kv.shape[1] == cache_size, (
-        f"swa_kv ring dim {swa_kv.shape[1]} != cache_size {cache_size}"
-    )
+    if block_tables is None:
+        assert swa_kv.shape[1] == cache_size, (
+            f"swa_kv ring dim {swa_kv.shape[1]} != cache_size {cache_size}"
+        )
+    else:
+        assert block_tables.dim() == 2
+        assert block_tables.dtype == torch.int32
+        assert block_tables.shape[0] >= bs
+        assert block_size is not None and block_size > 0
+        assert swa_kv.shape[1] == block_size
     assert swa_kv.shape[2] == head_dim
-    assert kv.is_contiguous() and swa_kv.is_contiguous()
+    assert kv.stride(-1) == 1 and swa_kv.stride(-1) == 1, (
+        f"kv/SWA rows must be dense; got kv.stride={kv.stride()}, "
+        f"swa_kv.stride={swa_kv.stride()}"
+    )
     assert bs > 0 and write_per_batch > 0, (
         f"bs={bs}, write_per_batch={write_per_batch} must be positive"
     )
@@ -177,21 +249,41 @@ def swa_write(
     BLOCK_D = triton.next_power_of_2(head_dim)
     grid = (bs, write_per_batch)
 
-    _swa_write_kernel[grid](
-        kv,
-        positions,
-        cu_seqlens_q,
-        state_slot_per_seq,
-        swa_kv,
-        swa_kv.stride(0),
-        swa_kv.stride(1),
-        swa_kv.shape[0],
-        T,
-        head_dim,
-        cache_size,
-        WRITE_PER_BATCH=write_per_batch,
-        BLOCK_D=BLOCK_D,
-    )
+    if block_tables is not None:
+        _paged_swa_write_kernel[grid](
+            kv,
+            kv.stride(0),
+            positions,
+            cu_seqlens_q,
+            block_tables,
+            block_tables.stride(0),
+            swa_kv,
+            swa_kv.stride(0),
+            swa_kv.stride(1),
+            swa_kv.shape[0],
+            T,
+            head_dim,
+            block_size,
+            WRITE_PER_BATCH=write_per_batch,
+            BLOCK_D=BLOCK_D,
+        )
+    else:
+        _swa_write_kernel[grid](
+            kv,
+            kv.stride(0),
+            positions,
+            cu_seqlens_q,
+            state_slot_per_seq,
+            swa_kv,
+            swa_kv.stride(0),
+            swa_kv.stride(1),
+            swa_kv.shape[0],
+            T,
+            head_dim,
+            cache_size,
+            WRITE_PER_BATCH=write_per_batch,
+            BLOCK_D=BLOCK_D,
+        )
 
 
 def swa_write_reference(
@@ -202,6 +294,9 @@ def swa_write_reference(
     swa_kv: torch.Tensor,
     cache_size: int,
     write_per_batch: int,
+    *,
+    block_tables: torch.Tensor | None = None,
+    block_size: int | None = None,
 ) -> None:
     """Pure-PyTorch reference equivalent of `swa_write`. For tests / dump-bisect.
 
@@ -225,9 +320,16 @@ def swa_write_reference(
         )
         src_kv = kv[src_ids]
         src_pos = positions[src_ids]
-        slot = int(state_slot_per_seq[b].item())
-        ring_idx = src_pos % cache_size
-        swa_kv[slot, ring_idx] = src_kv
+        if block_tables is None:
+            slot = int(state_slot_per_seq[b].item())
+            ring_idx = src_pos % cache_size
+            swa_kv[slot, ring_idx] = src_kv
+        else:
+            assert block_size is not None
+            logical_blocks = torch.div(src_pos, block_size, rounding_mode="floor")
+            physical_blocks = block_tables[b, logical_blocks]
+            offsets = src_pos % block_size
+            swa_kv[physical_blocks, offsets] = src_kv
 
 
 # === Unified Compressor state save (plan path) ==========================

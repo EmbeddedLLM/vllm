@@ -7,9 +7,8 @@
 prefix paged offsets into the three ragged-packed destination buffers
 (`kv_indices_swa` / `kv_indices_csa` / `kv_indices_hca`).
 
-The ring-index formula `ring = (pos - win + 1 + w) % cs` is computed inline
-inside the kernel from `positions[t]` — no `[T, win]` window_topk staging
-buffer, no separate CPU build + H2D copy.
+Each absolute position is translated through the SWA block table inside the
+kernel; no `[T, win]` staging buffer or CPU build + H2D copy is required.
 
 Layout: ragged-packed. Each token's slice holds an SWA prefix of length
 `n = min(positions[t]+1, win)` plus a per-buffer compress section; the
@@ -49,7 +48,9 @@ def _v4_paged_decode_indices_kernel(
     swa_indices_ptr,  # [swa_total] int32, output
     csa_indices_ptr,  # [csa_total] int32, output (writes SWA-prefix segment only)
     hca_indices_ptr,  # [hca_total] int32, output (writes SWA-prefix segment only)
-    cs,  # win_with_spec — stride into unified_kv SWA region (paper §3.6.1)
+    swa_block_tables_ptr,
+    swa_block_tables_stride,
+    cs,  # kept for the ring-compatible public ABI
     num_reqs,
     max_pages,
     max_swa_indices,
@@ -61,6 +62,7 @@ def _v4_paged_decode_indices_kernel(
     hca_swa_pages,
     hca_block_capacity: tl.constexpr,
     win: tl.constexpr,  # window_size — max SWA prefix slots
+    SWA_BLOCK_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # next_pow2(win)
     BLOCK_HCA: tl.constexpr,
     WRITE_HCA_HEAD: tl.constexpr,
@@ -98,12 +100,6 @@ def _v4_paged_decode_indices_kernel(
     if bid >= num_reqs:
         return  # CG-padded sentinel — leave outputs untouched
 
-    slot = tl.load(state_slot_per_seq_ptr + bid)
-    if slot < 0:
-        return
-    if slot * cs >= max_pages:
-        return
-
     pos = tl.load(positions_ptr + t)
     if pos < 0:
         return
@@ -129,9 +125,14 @@ def _v4_paged_decode_indices_kernel(
     i = tl.arange(0, BLOCK_N)
     mask = i < n
     abs_pos = pos - n + 1 + i  # ∈ [0, pos] for valid i
-    ring_idx = abs_pos % cs
-    paged = slot * cs + ring_idx
-    page_valid = paged < max_pages
+    logical_blocks = abs_pos // SWA_BLOCK_SIZE
+    physical_blocks = tl.load(
+        swa_block_tables_ptr + bid * swa_block_tables_stride + logical_blocks,
+        mask=mask,
+        other=-1,
+    )
+    paged = physical_blocks * SWA_BLOCK_SIZE + abs_pos % SWA_BLOCK_SIZE
+    page_valid = (physical_blocks >= 0) & (paged < max_pages)
 
     tl.store(
         swa_indices_ptr + safe_swa_start + i,
@@ -185,6 +186,8 @@ def write_v4_paged_decode_indices(
     swa_indices: torch.Tensor,
     csa_indices: torch.Tensor,
     hca_indices: torch.Tensor,
+    swa_block_tables: torch.Tensor,
+    swa_block_size: int,
     T: int,
     win: int,
     cs: int,
@@ -229,12 +232,8 @@ def write_v4_paged_decode_indices(
       cs:                  int — `win_with_spec = window_size + max_spec_steps`,
                                  stride into unified_kv SWA region per slot
                                  AND modulo for ring-index wrap.
-      max_pages:           optional int — number of valid SWA ring pages in
-                                 unified_kv.  This is normally
-                                 ``max_num_reqs * cs``.  It is intentionally
-                                 not derived from ``state_slot_per_seq`` length:
-                                 state_slot values are persistent request slots,
-                                 not dense active-batch row ids.
+      max_pages:           optional int — flattened row capacity of the paged
+                                 SWA tensor.
       hca_block_table / hca_n_committed_per_seq / hca_swa_pages /
       hca_block_capacity:
                                  optional ATOM HCA committed-head fill. When
@@ -253,6 +252,8 @@ def write_v4_paged_decode_indices(
     assert swa_indices.dim() == 1
     assert csa_indices.dim() == 1
     assert hca_indices.dim() == 1
+    assert swa_block_tables.dim() == 2
+    assert swa_block_tables.dtype == torch.int32
 
     BLOCK_N = triton.next_power_of_2(win)
     page_capacity = (
@@ -286,6 +287,8 @@ def write_v4_paged_decode_indices(
         swa_indices,
         csa_indices,
         hca_indices,
+        swa_block_tables,
+        swa_block_tables.stride(0),
         cs,
         state_slot_per_seq.shape[0],
         page_capacity,
@@ -298,6 +301,7 @@ def write_v4_paged_decode_indices(
         int(hca_swa_pages),
         hca_block_capacity=max(1, int(hca_block_capacity)),
         win=win,
+        SWA_BLOCK_SIZE=swa_block_size,
         BLOCK_N=BLOCK_N,
         BLOCK_HCA=128,
         WRITE_HCA_HEAD=write_hca_head,
@@ -315,6 +319,8 @@ def write_v4_paged_decode_indices_reference(
     swa_indices: torch.Tensor,
     csa_indices: torch.Tensor,
     hca_indices: torch.Tensor,
+    swa_block_tables: torch.Tensor,
+    swa_block_size: int,
     T: int,
     win: int,
     cs: int,
@@ -341,21 +347,18 @@ def write_v4_paged_decode_indices_reference(
     # n = min(pos+1, win) per token; clamp invalid rows to 0 to skip writes.
     n_per_tok = torch.minimum(pos_t + 1, torch.full_like(pos_t, win))
     n_per_tok = torch.where(valid, n_per_tok, torch.zeros_like(n_per_tok))
-    slot = torch.where(
-        valid, state_slot_per_seq[bid.clamp(min=0)].long(), torch.zeros_like(bid)
-    )
     for t in range(T):
         n = int(n_per_tok[t].item())
         if n == 0:
             continue
         p = int(pos_t[t].item())
-        s = int(slot[t].item())
-        if s < 0 or s * cs >= page_capacity:
-            continue
         i_arr = torch.arange(n, device=positions.device, dtype=torch.long)
         abs_pos = p - n + 1 + i_arr  # [n]
-        ring = abs_pos % cs
-        paged = (s * cs + ring).to(torch.int32)
+        logical_blocks = torch.div(abs_pos, swa_block_size, rounding_mode="floor")
+        physical_blocks = swa_block_tables[int(bid[t].item()), logical_blocks]
+        paged = (physical_blocks * swa_block_size + abs_pos % swa_block_size).to(
+            torch.int32
+        )
         if page_capacity > 0:
             page_valid = paged.to(torch.long) < page_capacity
             if not bool(page_valid.all().item()):

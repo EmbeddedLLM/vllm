@@ -169,11 +169,12 @@ def init_attn_backend(
     return attn_groups, attn_cg_support_info, kernel_block_sizes
 
 
-def _allocate_kv_cache(
-    kv_cache_config: KVCacheConfig, shared_layers: dict[str, str], device: torch.device
-):
+def _allocate_kv_cache_raw_tensors(
+    kv_cache_config: KVCacheConfig, device: torch.device
+) -> dict[str, torch.Tensor]:
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
     packed_backing: torch.Tensor | None = None
+    slab_backings: dict[int, torch.Tensor] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         if kv_cache_tensor.block_stride > 0:
             # Allocate once; all packed tensors alias the same backing.
@@ -182,10 +183,38 @@ def _allocate_kv_cache(
                     kv_cache_tensor.size, dtype=torch.int8, device=device
                 )
             tensor = packed_backing
+        elif kv_cache_tensor.allocation_id is not None:
+            allocation_id = kv_cache_tensor.allocation_id
+            allocation_size = kv_cache_tensor.allocation_size
+            if allocation_size <= 0:
+                raise ValueError("slab allocation size must be positive")
+            backing = slab_backings.get(allocation_id)
+            if backing is None:
+                backing = torch.zeros(allocation_size, dtype=torch.int8, device=device)
+                slab_backings[allocation_id] = backing
+            elif backing.numel() != allocation_size:
+                raise ValueError(
+                    f"allocation {allocation_id} has inconsistent sizes: "
+                    f"{backing.numel()} and {allocation_size}"
+                )
+            start = kv_cache_tensor.allocation_offset
+            if start < 0 or start + kv_cache_tensor.size > allocation_size:
+                raise ValueError(
+                    f"allocation {allocation_id} range [{start}, "
+                    f"{start + kv_cache_tensor.size}) exceeds {allocation_size}"
+                )
+            tensor = backing.narrow(0, start, kv_cache_tensor.size)
         else:
             tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
         for layer_name in kv_cache_tensor.shared_by:
             kv_cache_raw_tensors[layer_name] = tensor
+    return kv_cache_raw_tensors
+
+
+def _allocate_kv_cache(
+    kv_cache_config: KVCacheConfig, shared_layers: dict[str, str], device: torch.device
+):
+    kv_cache_raw_tensors = _allocate_kv_cache_raw_tensors(kv_cache_config, device)
 
     layer_names = set()
     for group in kv_cache_config.kv_cache_groups:

@@ -599,6 +599,15 @@ def test_human_readable_other_args():
     assert args.max_num_batched_tokens == 2**10 * 4
 
 
+@pytest.mark.parametrize("layout", ["auto", "packed", "separate", "slab"])
+def test_dsv4_kv_cache_layout_arg(layout):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser(exit_on_error=False))
+
+    args = parser.parse_args(["--dsv4-kv-cache-layout", layout])
+
+    assert args.dsv4_kv_cache_layout == layout
+
+
 def test_numa_bind_args():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args(

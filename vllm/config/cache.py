@@ -38,6 +38,7 @@ MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
+DeepseekV4KVCacheLayout = Literal["auto", "packed", "separate", "slab"]
 
 
 @config
@@ -188,6 +189,15 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    dsv4_kv_cache_layout: DeepseekV4KVCacheLayout = "packed"
+    """Physical KV-cache layout for DeepSeek-V4.
+
+    ``packed`` interleaves layer pages inside each physical block. ``separate``
+    uses one allocation per cache slot. ``slab`` uses one backing allocation
+    with a contiguous range per cache slot. ``auto`` selects ``slab`` only
+    when the installed AITER exposes the block-table-aware paged SWA ABI.
+    """
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -204,6 +214,7 @@ class CacheConfig:
             # Runtime/derived knobs that don't affect compiled graph shape
             "gpu_memory_utilization",
             "kv_cache_memory_bytes",
+            "dsv4_kv_cache_layout",
             "is_attention_free",
             "num_gpu_blocks_override",
             "enable_prefix_caching",

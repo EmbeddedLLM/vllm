@@ -13,7 +13,7 @@ for design rationale.
 
 Caller contract:
   unified_kv:        [total_pages, D] BF16 — prefix source. Same buffer as
-    decode kernel: SWA ring slots in `[0, swa_pages)`, compress pages in
+    decode kernel: paged SWA slots in `[0, swa_pages)`, compress pages in
     `[swa_pages, total_pages)`. For prefill, prefix indices select
     (a) prior-chunk SWA history, (b) CSA topk, (c) HCA all-committed.
   kv_indices_prefix: [total_prefix_indices] int32 — flat per-token slot
@@ -85,7 +85,22 @@ def _validate_split_kv_prefill_layout(
     swa_pages: int,
     compressed_kv_scales: torch.Tensor | None,
     compressed_kv_layout: str,
-) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, bool, bool]:
+) -> tuple[
+    torch.Tensor,
+    int,
+    int,
+    int,
+    int,
+    torch.Tensor,
+    int,
+    torch.Tensor,
+    bool,
+    bool,
+    int,
+    int,
+    int,
+    int,
+]:
     if q.dim() != 3:
         raise RuntimeError(
             f"sparse_attn_v4_paged_prefill_split_kv expects 3-D q, got {q.dim()}-D"
@@ -98,7 +113,32 @@ def _validate_split_kv_prefill_layout(
         raise RuntimeError(f"kv dtype mismatch: kv={kv.dtype}, q={q.dtype}")
 
     _, _, D = q.shape
-    swa_flat = swa_kv.reshape(-1, D)
+    if swa_kv.dim() == 3:
+        if swa_kv.shape[-1] != D or swa_kv.stride(-1) != 1:
+            raise RuntimeError(
+                f"paged swa_kv must have dense D={D} rows, got "
+                f"shape={tuple(swa_kv.shape)}, stride={swa_kv.stride()}"
+            )
+        swa_block_size = int(swa_kv.shape[1])
+        swa_block_stride = int(swa_kv.stride(0))
+        swa_pos_stride = int(swa_kv.stride(1))
+        swa_stride_d = int(swa_kv.stride(2))
+        swa_storage = swa_kv
+        swa_storage_pages = int(swa_kv.shape[0] * swa_kv.shape[1])
+    elif swa_kv.dim() == 2:
+        if swa_kv.shape[1] != D or swa_kv.stride(1) != 1:
+            raise RuntimeError(
+                f"flat swa_kv must be [pages, {D}] with dense rows, got "
+                f"shape={tuple(swa_kv.shape)}, stride={swa_kv.stride()}"
+            )
+        swa_block_size = 1
+        swa_block_stride = int(swa_kv.stride(0))
+        swa_pos_stride = int(swa_kv.stride(0))
+        swa_stride_d = int(swa_kv.stride(1))
+        swa_storage = swa_kv
+        swa_storage_pages = int(swa_kv.shape[0])
+    else:
+        raise RuntimeError(f"swa_kv must be 2-D or 3-D, got {swa_kv.dim()}-D")
     packed_tail = compressed_kv_layout == _PACKED_FP8_DS_MLA
     if compressed_kv_layout not in ("dense", _PACKED_FP8_DS_MLA):
         raise RuntimeError(f"Unsupported compressed_kv_layout={compressed_kv_layout!r}")
@@ -116,26 +156,56 @@ def _validate_split_kv_prefill_layout(
                 "packed fp8_ds_mla tail expects [num_blocks, k_per_block, 584], "
                 f"got {tuple(compressed_kv.shape)}"
             )
-        compressed_flat = compressed_kv
+        compressed_storage = compressed_kv
         compressed_pages = compressed_kv.shape[0] * compressed_kv.shape[1]
     else:
-        compressed_flat = compressed_kv.reshape(-1, D)
-        compressed_pages = compressed_flat.shape[0]
-    if swa_pages <= 0 or swa_flat.shape[0] != swa_pages:
+        if compressed_kv.dim() == 3:
+            if compressed_kv.shape[-1] != D or compressed_kv.stride(-1) != 1:
+                raise RuntimeError(
+                    f"dense compressed_kv must have dense D={D} rows, got "
+                    f"shape={tuple(compressed_kv.shape)}, "
+                    f"stride={compressed_kv.stride()}"
+                )
+            compressed_storage = compressed_kv
+            compressed_pages = compressed_kv.shape[0] * compressed_kv.shape[1]
+        elif compressed_kv.dim() == 2:
+            if compressed_kv.shape[1] != D or compressed_kv.stride(1) != 1:
+                raise RuntimeError(
+                    f"flat compressed_kv must be [pages, {D}] with dense rows, "
+                    f"got shape={tuple(compressed_kv.shape)}, "
+                    f"stride={compressed_kv.stride()}"
+                )
+            compressed_storage = compressed_kv
+            compressed_pages = compressed_kv.shape[0]
+        else:
+            raise RuntimeError(
+                f"dense compressed_kv must be 2-D or 3-D, got {compressed_kv.dim()}-D"
+            )
+    if compressed_storage.dim() == 3:
+        tail_block_size = int(compressed_storage.shape[1])
+        tail_block_stride = int(compressed_storage.stride(0))
+        tail_pos_stride = int(compressed_storage.stride(1))
+        tail_stride_d = int(compressed_storage.stride(2))
+    else:
+        tail_block_size = 1
+        tail_block_stride = int(compressed_storage.stride(0))
+        tail_pos_stride = int(compressed_storage.stride(0))
+        tail_stride_d = int(compressed_storage.stride(1))
+    if swa_pages <= 0 or swa_storage_pages != swa_pages:
         raise RuntimeError(
             f"Invalid split KV SWA geometry: swa_pages={swa_pages}, "
-            f"swa_flat_pages={swa_flat.shape[0]}"
+            f"swa_storage_pages={swa_storage_pages}"
         )
-    if swa_flat.dtype != q.dtype:
+    if swa_storage.dtype != q.dtype:
         raise RuntimeError(
-            f"swa_kv dtype {swa_flat.dtype} does not match q dtype {q.dtype}"
+            f"swa_kv dtype {swa_storage.dtype} does not match q dtype {q.dtype}"
         )
     quant_tail = compressed_kv_scales is not None
     if quant_tail:
-        if compressed_flat.dtype != _FP8_DTYPE:
+        if compressed_storage.dtype != _FP8_DTYPE:
             raise RuntimeError(
                 "compressed_kv_scales supplied but compressed_kv is "
-                f"{compressed_flat.dtype}, expected {_FP8_DTYPE}"
+                f"{compressed_storage.dtype}, expected {_FP8_DTYPE}"
             )
         if compressed_kv_scales.dtype != torch.float32:
             raise RuntimeError(
@@ -152,20 +222,28 @@ def _validate_split_kv_prefill_layout(
         if tail_scales.stride(-1) != 1:
             tail_scales = tail_scales.contiguous()
     else:
-        if not packed_tail and compressed_flat.dtype != q.dtype:
+        if not packed_tail and compressed_storage.dtype != q.dtype:
             raise RuntimeError(
                 "compressed_kv dtype must match q when scales are absent: "
-                f"compressed={compressed_flat.dtype}, q={q.dtype}"
+                f"compressed={compressed_storage.dtype}, q={q.dtype}"
             )
         tail_scales = q.new_empty(1, dtype=torch.float32)
 
     return (
-        swa_flat,
-        compressed_flat,
+        swa_storage,
+        swa_block_size,
+        swa_block_stride,
+        swa_pos_stride,
+        swa_stride_d,
+        compressed_storage,
         compressed_pages,
         tail_scales,
         quant_tail,
         packed_tail,
+        tail_block_size,
+        tail_block_stride,
+        tail_pos_stride,
+        tail_stride_d,
     )
 
 
@@ -262,11 +340,7 @@ def _sparse_attn_v4_paged_prefill_kernel(
                 mask=in_range,
                 other=-1,
             )
-            valid = (
-                in_range & (slot >= 0)
-                if CHECK_NEG_ONE_SENTINEL
-                else in_range
-            )
+            valid = in_range & (slot >= 0) if CHECK_NEG_ONE_SENTINEL else in_range
 
             kv_ptrs = (
                 unified_kv_ptr
@@ -283,9 +357,7 @@ def _sparse_attn_v4_paged_prefill_kernel(
                 )
 
             scores = tl.dot(q, tl.trans(kv)) * qk_scale
-            scores = tl.where(
-                h_mask[:, None] & valid[None, :], scores, neg_large
-            )
+            scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
 
             m_block = tl.max(scores, axis=1)
             m_new = tl.maximum(m_i, m_block)
@@ -311,17 +383,9 @@ def _sparse_attn_v4_paged_prefill_kernel(
             mask=in_range,
             other=-1,
         )
-        valid = (
-            in_range & (slot >= 0)
-            if CHECK_NEG_ONE_SENTINEL
-            else in_range
-        )
+        valid = in_range & (slot >= 0) if CHECK_NEG_ONE_SENTINEL else in_range
 
-        kv_ptrs = (
-            kv_ptr
-            + slot[:, None] * ekv_stride_n
-            + d_offs[None, :] * ekv_stride_d
-        )
+        kv_ptrs = kv_ptr + slot[:, None] * ekv_stride_n + d_offs[None, :] * ekv_stride_d
         if FULL_D:
             kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0)
         else:
@@ -352,9 +416,7 @@ def _sparse_attn_v4_paged_prefill_kernel(
     # rescale BOTH l_i (for denom) AND acc (for numerator) by alpha to switch
     # to m_final frame. The sink itself adds exp(sink - m_final) to l_final
     # but contributes 0 to acc since V_sink = 0.
-    sink = tl.load(
-        attn_sink_ptr + h_offs, mask=h_mask, other=neg_large
-    ).to(tl.float32)
+    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
     sink = sink * 1.4426950408889634
     m_final = tl.maximum(m_i, sink)
     alpha = tl.exp2(m_i - m_final)
@@ -455,9 +517,7 @@ def _sparse_attn_v4_paged_prefill_csa_kernel(
         )
 
         scores = tl.dot(q, tl.trans(kv)) * qk_scale
-        scores = tl.where(
-            h_mask[:, None] & valid[None, :], scores, neg_large
-        )
+        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
         m_block = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_block)
         alpha = tl.exp2(m_i - m_new)
@@ -481,17 +541,13 @@ def _sparse_attn_v4_paged_prefill_csa_kernel(
             other=0,
         )
         kv = tl.load(
-            kv_ptr
-            + slot[:, None] * ekv_stride_n
-            + d_offs[None, :] * ekv_stride_d,
+            kv_ptr + slot[:, None] * ekv_stride_n + d_offs[None, :] * ekv_stride_d,
             mask=valid[:, None],
             other=0.0,
         )
 
         scores = tl.dot(q, tl.trans(kv)) * qk_scale
-        scores = tl.where(
-            h_mask[:, None] & valid[None, :], scores, neg_large
-        )
+        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
         m_block = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_block)
         alpha = tl.exp2(m_i - m_new)
@@ -501,9 +557,7 @@ def _sparse_attn_v4_paged_prefill_csa_kernel(
         acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
         m_i = m_new
 
-    sink = tl.load(
-        attn_sink_ptr + h_offs, mask=h_mask, other=neg_large
-    ).to(tl.float32)
+    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
     sink = sink * 1.4426950408889634
     m_final = tl.maximum(m_i, sink)
     alpha = tl.exp2(m_i - m_final)
@@ -527,7 +581,7 @@ def _sparse_attn_v4_paged_prefill_csa_kernel(
 @triton.jit
 def _sparse_attn_v4_paged_prefill_split_kv_kernel(
     q_ptr,  # [N, H, D]
-    swa_kv_ptr,  # [swa_pages, D] bf16/fp16
+    swa_kv_ptr,  # [blocks, block_size, D] or flat [swa_pages, D]
     compressed_kv_ptr,  # dense tail or packed [blocks, slots, 584] uint8
     compressed_scales_ptr,  # [tail_pages, NUM_GROUPS] fp32 when QUANT_TAIL
     kv_indices_prefix_ptr,  # [total_prefix_indices] int32, unified slot ids
@@ -540,9 +594,10 @@ def _sparse_attn_v4_paged_prefill_split_kv_kernel(
     q_stride_t: tl.constexpr,
     q_stride_h: tl.constexpr,
     q_stride_d: tl.constexpr,
-    swa_stride_n,
+    swa_block_stride,
+    swa_pos_stride,
     swa_stride_d,
-    tail_stride_n,
+    tail_pos_stride,
     tail_stride_d,
     tail_block_stride,
     ts_stride_n,
@@ -557,6 +612,7 @@ def _sparse_attn_v4_paged_prefill_split_kv_kernel(
     H: tl.constexpr,
     D: tl.constexpr,
     softmax_scale: tl.constexpr,
+    SWA_BLOCK_SIZE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -614,15 +670,18 @@ def _sparse_attn_v4_paged_prefill_split_kv_kernel(
         swa_valid = slot_valid & is_swa
         tail_valid = slot_valid & (~is_swa)
 
+        swa_block = (safe_swa_slot // SWA_BLOCK_SIZE).to(tl.int64)
+        swa_pos = safe_swa_slot % SWA_BLOCK_SIZE
         swa_kv = tl.load(
             swa_kv_ptr
-            + safe_swa_slot[:, None] * swa_stride_n
+            + swa_block[:, None] * swa_block_stride
+            + swa_pos[:, None] * swa_pos_stride
             + d_offs[None, :] * swa_stride_d,
             mask=swa_valid[:, None] & d_mask[None, :],
             other=0.0,
         )
         if PACKED_TAIL:
-            tail_block = safe_tail_slot // PACKED_BLOCK_SIZE
+            tail_block = (safe_tail_slot // PACKED_BLOCK_SIZE).to(tl.int64)
             tail_pos = safe_tail_slot % PACKED_BLOCK_SIZE
             packed_base = tail_block[:, None] * tail_block_stride
             token_data_base = packed_base + tail_pos[:, None] * 576
@@ -660,9 +719,12 @@ def _sparse_attn_v4_paged_prefill_split_kv_kernel(
             )
             tail_kv = tl.where(is_fp8_dim[None, :], fp8_dequant, bf16_tail)
         else:
+            tail_block = (safe_tail_slot // PACKED_BLOCK_SIZE).to(tl.int64)
+            tail_pos = safe_tail_slot % PACKED_BLOCK_SIZE
             tail_raw = tl.load(
                 compressed_kv_ptr
-                + safe_tail_slot[:, None] * tail_stride_n
+                + tail_block[:, None] * tail_block_stride
+                + tail_pos[:, None] * tail_pos_stride
                 + d_offs[None, :] * tail_stride_d,
                 mask=tail_valid[:, None] & d_mask[None, :],
                 other=0.0,
@@ -799,13 +861,9 @@ def _sparse_attn_v4_paged_prefill_triton(
     prefix_block_k = min(block_k, 16) if 0 < avg_prefix_len <= 16 else block_k
     check_neg_one_sentinel = not (0 < avg_prefix_len <= 16)
     has_prefix = kv_indices_prefix.numel() > 0
-    use_csa_fast_kernel = (
-        has_prefix and avg_prefix_len > 16 and D == 512 and full_d
-    )
+    use_csa_fast_kernel = has_prefix and avg_prefix_len > 16 and D == 512 and full_d
     if use_csa_fast_kernel:
-        _sparse_attn_v4_paged_prefill_csa_kernel[
-            (T, triton.cdiv(H, block_h))
-        ](
+        _sparse_attn_v4_paged_prefill_csa_kernel[(T, triton.cdiv(H, block_h))](
             q,
             unified_kv,
             kv_indices_prefix,
@@ -898,12 +956,20 @@ def sparse_attn_v4_paged_prefill_split_kv(
         )
     T, H, D = q.shape
     (
-        swa_flat,
-        compressed_flat,
+        swa_storage,
+        swa_block_size,
+        swa_block_stride,
+        swa_pos_stride,
+        swa_stride_d,
+        compressed_storage,
         compressed_pages,
         tail_scales,
         quant_tail,
         packed_tail,
+        tail_block_size,
+        tail_block_stride,
+        tail_pos_stride,
+        tail_stride_d,
     ) = _validate_split_kv_prefill_layout(
         q,
         swa_kv,
@@ -938,8 +1004,8 @@ def sparse_attn_v4_paged_prefill_split_kv(
     block_k = 16 if (D >= 256 or quant_tail or packed_tail) else 32
     _sparse_attn_v4_paged_prefill_split_kv_kernel[(T, triton.cdiv(H, block_h))](
         q,
-        swa_flat,
-        compressed_flat,
+        swa_storage,
+        compressed_storage,
         tail_scales,
         kv_indices_prefix,
         kv_indptr_prefix,
@@ -951,30 +1017,32 @@ def sparse_attn_v4_paged_prefill_split_kv(
         q.stride(0),
         q.stride(1),
         q.stride(2),
-        swa_flat.stride(0),
-        swa_flat.stride(1),
-        compressed_flat.stride(0),
-        compressed_flat.stride(1) if not packed_tail else 0,
-        compressed_flat.stride(0) if packed_tail else 0,
+        swa_block_stride,
+        swa_pos_stride,
+        swa_stride_d,
+        tail_pos_stride,
+        tail_stride_d,
+        tail_block_stride,
         tail_scales.stride(0),
         kv.stride(0),
         kv.stride(1),
         out.stride(0),
         out.stride(1),
         out.stride(2),
-        int(swa_flat.shape[0] + compressed_pages),
+        int(swa_pages + compressed_pages),
         int(swa_pages),
         int(compressed_pages),
         H,
         D,
         float(softmax_scale),
+        SWA_BLOCK_SIZE=swa_block_size,
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
         QUANT_TAIL=bool(quant_tail),
         PACKED_TAIL=bool(packed_tail),
         GROUP_SIZE=_FP8_GROUP_SIZE,
-        PACKED_BLOCK_SIZE=int(compressed_kv.shape[1]) if packed_tail else 1,
+        PACKED_BLOCK_SIZE=tail_block_size,
         num_warps=8,
     )
     return out

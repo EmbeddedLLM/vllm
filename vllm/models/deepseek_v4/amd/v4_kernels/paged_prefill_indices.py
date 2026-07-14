@@ -37,9 +37,9 @@ Per-token quantities (kernel-computed from inputs; mirror the formulas in
   extend_count[t]       = min(token_pos_in_chunk[t] + 1, win)
   prefix_swa_count[t]   = max(chunk_start[bid] - swa_low[t], 0)
 
-Per-token paged offset for SWA prefix entries (matches the stride/modulo
-used by `swa_write` and `_attach_v4_paged_decode_meta`):
-  paged[t,k] = state_slot[bid] * cs + ((swa_low[t] + k) % cs)
+Per-token SWA prefix offsets use the vLLM-owned SWA block table:
+  paged[t,k] = block_table[bid, pos // block_size] * block_size
+               + pos % block_size
 """
 
 import torch
@@ -54,9 +54,11 @@ def _v4_paged_prefill_indices_kernel(
     bid_per_token_ptr,  # [T] int — batch id per token (==`np.repeat(arange(bs), tnps)`)
     # Per-seq inputs (indexed by bid).
     chunk_start_per_seq_ptr,  # [bs] int — current chunk's absolute start position
-    cu_seqlens_q_per_seq_ptr,  # [bs] int — per-seq prefix sum start in per-fwd kv tensor
-    state_slot_per_seq_ptr,  # [bs] int — per-seq SWA ring slot
+    cu_seqlens_q_per_seq_ptr,  # [bs] int — per-seq start in per-fwd kv tensor
+    state_slot_per_seq_ptr,  # [bs] int — retained for the public ABI
     n_committed_hca_per_seq_ptr,  # [bs] int — per-seq HCA compress entry count
+    swa_block_tables_ptr,  # [bs, MAX_SWA_BLOCKS] int — SWA physical blocks
+    swa_bt_stride_bs,
     block_tables_ptr,  # [bs, MAX_BLOCKS] int — per-seq paged block ids
     bt_stride_bs,  # bytes between block_tables rows
     # Indptrs (already cumsum'd by caller, all length [T+1]).
@@ -71,9 +73,10 @@ def _v4_paged_prefill_indices_kernel(
     prefix_hca_indices_ptr,
     # Constants.
     win: tl.constexpr,
-    cs,  # win_with_spec — SWA ring stride (NOT constexpr because varies w/ mtp_k)
-    swa_pages,  # state_slot count * cs — boundary into HCA compress section
+    cs,  # retained for the public ABI
+    swa_pages,  # flattened SWA row count; boundary into compressed storage
     WRITE_HCA: tl.constexpr,
+    SWA_BLOCK_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # next_pow2(win) — covers SWA prefix and extend segments
 ):
     """One program per token. Writes four per-token segments:
@@ -94,8 +97,11 @@ def _v4_paged_prefill_indices_kernel(
     pos = tl.load(positions_ptr + t)
     chunk_start = tl.load(chunk_start_per_seq_ptr + bid)
     cu_q = tl.load(cu_seqlens_q_per_seq_ptr + bid)
-    state_slot = tl.load(state_slot_per_seq_ptr + bid)
     n_hca = tl.load(n_committed_hca_per_seq_ptr + bid)
+    # A prefill token may only see HCA entries whose source block has
+    # completed at or before that token. The per-request committed count also
+    # includes entries created later in the same scheduled chunk.
+    n_hca = tl.minimum(n_hca, (pos + 1) // 128)
 
     # Per-token derived quantities (single-pass arithmetic).
     token_pos_in_chunk = pos - chunk_start
@@ -113,14 +119,20 @@ def _v4_paged_prefill_indices_kernel(
     tl.store(extend_indices_ptr + ext_base + i, ext_start_row + i, mask=ext_mask)
 
     # ---- SWA prefix paged offsets: written to all three prefix buffers ----
-    # paged = state_slot * cs + ((swa_low + k) % cs), k in [0, prefix_swa_count)
+    # paged = swa_block_tables[bid, pos // block_size] * block_size
+    #         + pos % block_size
     swa_base_swa = tl.load(prefix_swa_indptr_ptr + t)
     swa_base_csa = tl.load(prefix_csa_indptr_ptr + t)
     swa_base_hca = tl.load(prefix_hca_indptr_ptr + t)
     swa_mask = i < prefix_swa_count
     global_pos = swa_low + i
-    ring_idx = global_pos - (global_pos // cs) * cs  # global_pos % cs
-    paged = state_slot * cs + ring_idx
+    logical_blocks = global_pos // SWA_BLOCK_SIZE
+    physical_blocks = tl.load(
+        swa_block_tables_ptr + bid * swa_bt_stride_bs + logical_blocks,
+        mask=swa_mask,
+        other=0,
+    )
+    paged = physical_blocks * SWA_BLOCK_SIZE + global_pos % SWA_BLOCK_SIZE
     tl.store(prefix_swa_indices_ptr + swa_base_swa + i, paged, mask=swa_mask)
     tl.store(prefix_csa_indices_ptr + swa_base_csa + i, paged, mask=swa_mask)
     tl.store(prefix_hca_indices_ptr + swa_base_hca + i, paged, mask=swa_mask)
@@ -150,6 +162,8 @@ def write_v4_paged_prefill_indices(
     cu_seqlens_q_per_seq: torch.Tensor,
     state_slot_per_seq: torch.Tensor,
     n_committed_hca_per_seq: torch.Tensor,
+    swa_block_tables: torch.Tensor,
+    swa_block_size: int,
     block_tables: torch.Tensor,
     extend_indptr: torch.Tensor,
     prefix_swa_indptr: torch.Tensor,
@@ -190,7 +204,7 @@ def write_v4_paged_prefill_indices(
                                             (NOT the full ``[bs+1]`` cumsum
                                             — caller passes the leading
                                             ``bs`` entries).
-      state_slot_per_seq:        ``[bs]``   int — per-seq SWA ring slot.
+      state_slot_per_seq:        ``[bs]``   int — retained for ABI compatibility.
       n_committed_hca_per_seq:   ``[bs]``   int — per-seq HCA compress count.
       block_tables:              ``[bs, mnbs]`` int — per-seq paged blocks.
       extend_indptr:             ``[T+1]``  int.
@@ -222,6 +236,8 @@ def write_v4_paged_prefill_indices(
     assert cu_seqlens_q_per_seq.dim() == 1
     assert state_slot_per_seq.dim() == 1
     assert n_committed_hca_per_seq.dim() == 1
+    assert swa_block_tables.dim() == 2
+    assert swa_block_tables.dtype == torch.int32
     assert block_tables.dim() == 2
     for idp in (extend_indptr, prefix_swa_indptr, prefix_csa_indptr, prefix_hca_indptr):
         assert idp.dim() == 1 and idp.shape[0] >= T + 1
@@ -241,6 +257,8 @@ def write_v4_paged_prefill_indices(
         cu_seqlens_q_per_seq,
         state_slot_per_seq,
         n_committed_hca_per_seq,
+        swa_block_tables,
+        swa_block_tables.stride(0),
         block_tables,
         block_tables.stride(0),
         extend_indptr,
@@ -255,6 +273,7 @@ def write_v4_paged_prefill_indices(
         cs=cs,
         swa_pages=swa_pages,
         WRITE_HCA=write_hca,
+        SWA_BLOCK_SIZE=swa_block_size,
         BLOCK_N=BLOCK_N,
     )
 
@@ -267,6 +286,8 @@ def write_v4_paged_prefill_indices_reference(
     cu_seqlens_q_per_seq: torch.Tensor,
     state_slot_per_seq: torch.Tensor,
     n_committed_hca_per_seq: torch.Tensor,
+    swa_block_tables: torch.Tensor,
+    swa_block_size: int,
     block_tables: torch.Tensor,
     extend_indptr: torch.Tensor,
     prefix_swa_indptr: torch.Tensor,
@@ -295,8 +316,8 @@ def write_v4_paged_prefill_indices_reference(
     pos_cpu = positions[:T].cpu().tolist()
     cs_per_seq_cpu = chunk_start_per_seq.cpu().tolist()
     cu_q_cpu = cu_seqlens_q_per_seq.cpu().tolist()
-    state_slot_cpu = state_slot_per_seq.cpu().tolist()
     n_hca_cpu = n_committed_hca_per_seq.cpu().tolist()
+    swa_block_tables_cpu = swa_block_tables.cpu()
     block_tables_cpu = block_tables.cpu()
     ext_indptr_cpu = extend_indptr.cpu().tolist()
     swa_indptr_cpu = prefix_swa_indptr.cpu().tolist()
@@ -309,8 +330,7 @@ def write_v4_paged_prefill_indices_reference(
         pos = pos_cpu[t]
         chunk_start = cs_per_seq_cpu[bid]
         cu_q = cu_q_cpu[bid]
-        state_slot = state_slot_cpu[bid]
-        n_hca = n_hca_cpu[bid]
+        n_hca = min(n_hca_cpu[bid], (pos + 1) // 128)
 
         token_pos_in_chunk = pos - chunk_start
         swa_low = max(pos - win + 1, 0)
@@ -339,7 +359,11 @@ def write_v4_paged_prefill_indices_reference(
                 device=device,
                 dtype=prefix_swa_indices.dtype,
             )
-            paged = state_slot * cs + (global_pos % cs)
+            logical_blocks = torch.div(
+                global_pos, swa_block_size, rounding_mode="floor"
+            )
+            physical_blocks = swa_block_tables_cpu[bid, logical_blocks.cpu()].to(device)
+            paged = physical_blocks * swa_block_size + global_pos % swa_block_size
             prefix_swa_indices[sb_swa : sb_swa + prefix_swa_count] = paged
             prefix_csa_indices[sb_csa : sb_csa + prefix_swa_count] = paged
             prefix_hca_indices[sb_hca : sb_hca + prefix_swa_count] = paged

@@ -12,9 +12,9 @@ indices, mirroring `aiter.mla.mla_decode_fwd`'s API style.
 
 Caller contract:
   unified_kv:       [total_pages, D] BF16  (page_size=1)
-    Conceptually merges the SWA ring buffer and the compressor paged cache
-    of a single V4 layer. Slots in `[0, swa_pages)` reference SWA entries
-    (state_slot * win + ring); slots in `[swa_pages, ...)` reference
+    Conceptually merges the paged SWA cache and compressor paged cache of a
+    single V4 layer. Slots in `[0, swa_pages)` reference block-table-addressed
+    SWA entries; slots in `[swa_pages, ...)` reference
     compressed-K entries (block_id * K_PER_BLOCK + slot_in_block).
   kv_indices: [total_indices] int32 — per-token slot lists, flat.
     Per-token entries live in
@@ -527,7 +527,7 @@ def _paged_decode_fused_kernel(
 @triton.jit
 def _paged_decode_split_kv_fused_kernel(
     q_ptr,  # [N, H, D]
-    swa_kv_ptr,  # [swa_pages, D] bf16/fp16
+    swa_kv_ptr,  # [blocks, block_size, D] or flat [swa_pages, D]
     compressed_kv_ptr,  # dense tail or packed [blocks, slots, 584] uint8
     compressed_scales_ptr,  # [tail_pages, NUM_GROUPS] fp32 when QUANT_TAIL
     kv_indices_ptr,  # [total_indices] int32, unified slot ids
@@ -541,9 +541,10 @@ def _paged_decode_split_kv_fused_kernel(
     q_stride_t,
     q_stride_h,
     q_stride_d,
-    swa_stride_n,
+    swa_block_stride,
+    swa_pos_stride,
     swa_stride_d,
-    tail_stride_n,
+    tail_pos_stride,
     tail_stride_d,
     tail_block_stride,
     ts_stride_n,
@@ -560,6 +561,7 @@ def _paged_decode_split_kv_fused_kernel(
     tail_pages: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
+    SWA_BLOCK_SIZE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -698,9 +700,12 @@ def _paged_decode_split_kv_fused_kernel(
         if tile_all_tail:
             swa_kv = tl.zeros((BLOCK_K, BLOCK_D), dtype=q.dtype)
         else:
+            swa_block = (safe_swa_slot // SWA_BLOCK_SIZE).to(tl.int64)
+            swa_pos = safe_swa_slot % SWA_BLOCK_SIZE
             swa_kv = tl.load(
                 swa_kv_ptr
-                + safe_swa_slot[:, None] * swa_stride_n
+                + swa_block[:, None] * swa_block_stride
+                + swa_pos[:, None] * swa_pos_stride
                 + d_offs[None, :] * swa_stride_d,
                 mask=swa_valid[:, None] & d_mask[None, :],
                 other=0.0,
@@ -710,7 +715,7 @@ def _paged_decode_split_kv_fused_kernel(
             if tile_all_swa:
                 tail_kv = tl.zeros((BLOCK_K, BLOCK_D), dtype=q.dtype)
             else:
-                tail_block = safe_tail_slot // PACKED_BLOCK_SIZE
+                tail_block = (safe_tail_slot // PACKED_BLOCK_SIZE).to(tl.int64)
                 tail_pos = safe_tail_slot % PACKED_BLOCK_SIZE
                 packed_base = tail_block[:, None] * tail_block_stride
                 token_data_base = packed_base + tail_pos[:, None] * 576
@@ -753,9 +758,12 @@ def _paged_decode_split_kv_fused_kernel(
             if tile_all_swa:
                 tail_kv = tl.zeros((BLOCK_K, BLOCK_D), dtype=q.dtype)
             else:
+                tail_block = (safe_tail_slot // PACKED_BLOCK_SIZE).to(tl.int64)
+                tail_pos = safe_tail_slot % PACKED_BLOCK_SIZE
                 tail_raw = tl.load(
                     compressed_kv_ptr
-                    + safe_tail_slot[:, None] * tail_stride_n
+                    + tail_block[:, None] * tail_block_stride
+                    + tail_pos[:, None] * tail_pos_stride
                     + d_offs[None, :] * tail_stride_d,
                     mask=tail_valid[:, None] & d_mask[None, :],
                     other=0.0,
@@ -812,7 +820,7 @@ def _paged_decode_split_kv_fused_kernel(
 @triton.jit
 def _paged_decode_split_kv_split_kernel(
     q_ptr,  # [N, H, D]
-    swa_kv_ptr,  # [swa_pages, D] bf16/fp16
+    swa_kv_ptr,  # [blocks, block_size, D] or flat [swa_pages, D]
     compressed_kv_ptr,  # dense tail or packed [blocks, slots, 584] uint8
     compressed_scales_ptr,  # [tail_pages, NUM_GROUPS] fp32 when QUANT_TAIL
     kv_indices_ptr,  # [total_indices] int32, unified slot ids
@@ -824,9 +832,10 @@ def _paged_decode_split_kv_split_kernel(
     q_stride_t,
     q_stride_h,
     q_stride_d,
-    swa_stride_n,
+    swa_block_stride,
+    swa_pos_stride,
     swa_stride_d,
-    tail_stride_n,
+    tail_pos_stride,
     tail_stride_d,
     tail_block_stride,
     ts_stride_n,
@@ -847,6 +856,7 @@ def _paged_decode_split_kv_split_kernel(
     H: tl.constexpr,
     D: tl.constexpr,
     KV_SPLITS: tl.constexpr,
+    SWA_BLOCK_SIZE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -939,9 +949,12 @@ def _paged_decode_split_kv_split_kernel(
         if tile_all_tail:
             swa_kv = tl.zeros((BLOCK_K, BLOCK_D), dtype=q.dtype)
         else:
+            swa_block = (safe_swa_slot // SWA_BLOCK_SIZE).to(tl.int64)
+            swa_pos = safe_swa_slot % SWA_BLOCK_SIZE
             swa_kv = tl.load(
                 swa_kv_ptr
-                + safe_swa_slot[:, None] * swa_stride_n
+                + swa_block[:, None] * swa_block_stride
+                + swa_pos[:, None] * swa_pos_stride
                 + d_offs[None, :] * swa_stride_d,
                 mask=swa_valid[:, None] & d_mask[None, :],
                 other=0.0,
@@ -951,7 +964,7 @@ def _paged_decode_split_kv_split_kernel(
             if tile_all_swa:
                 tail_kv = tl.zeros((BLOCK_K, BLOCK_D), dtype=q.dtype)
             else:
-                tail_block = safe_tail_slot // PACKED_BLOCK_SIZE
+                tail_block = (safe_tail_slot // PACKED_BLOCK_SIZE).to(tl.int64)
                 tail_pos = safe_tail_slot % PACKED_BLOCK_SIZE
                 packed_base = tail_block[:, None] * tail_block_stride
                 token_data_base = packed_base + tail_pos[:, None] * 576
@@ -994,9 +1007,12 @@ def _paged_decode_split_kv_split_kernel(
             if tile_all_swa:
                 tail_kv = tl.zeros((BLOCK_K, BLOCK_D), dtype=q.dtype)
             else:
+                tail_block = (safe_tail_slot // PACKED_BLOCK_SIZE).to(tl.int64)
+                tail_pos = safe_tail_slot % PACKED_BLOCK_SIZE
                 tail_raw = tl.load(
                     compressed_kv_ptr
-                    + safe_tail_slot[:, None] * tail_stride_n
+                    + tail_block[:, None] * tail_block_stride
+                    + tail_pos[:, None] * tail_pos_stride
                     + d_offs[None, :] * tail_stride_d,
                     mask=tail_valid[:, None] & d_mask[None, :],
                     other=0.0,
@@ -1081,7 +1097,9 @@ def _paged_decode_split_kernel(
     TOTAL_PAGES: tl.constexpr,
     TRUST_INDICES: tl.constexpr,
 ):
-    """3D split-K + exp2-softmax sparse paged-decode. Grid: (N, ceil(H/BLOCK_H), KV_SPLITS).
+    """3D split-K + exp2-softmax sparse paged-decode.
+
+    Grid: ``(N, ceil(H/BLOCK_H), KV_SPLITS)``.
 
     Emits pre-sink (m, l, acc) partials in fp32. The reduce kernel folds
     ``attn_sink`` and combines splits.
@@ -1876,7 +1894,32 @@ def sparse_attn_v4_paged_decode_split_kv(
         )
 
     T, H, D = q.shape
-    swa_flat = swa_kv.reshape(-1, D)
+    if swa_kv.dim() == 3:
+        if swa_kv.shape[-1] != D or swa_kv.stride(-1) != 1:
+            raise RuntimeError(
+                f"paged swa_kv must have dense D={D} rows, got "
+                f"shape={tuple(swa_kv.shape)}, stride={swa_kv.stride()}"
+            )
+        swa_block_size = int(swa_kv.shape[1])
+        swa_block_stride = int(swa_kv.stride(0))
+        swa_pos_stride = int(swa_kv.stride(1))
+        swa_stride_d = int(swa_kv.stride(2))
+        swa_storage = swa_kv
+        swa_storage_pages = int(swa_kv.shape[0] * swa_kv.shape[1])
+    elif swa_kv.dim() == 2:
+        if swa_kv.shape[1] != D or swa_kv.stride(1) != 1:
+            raise RuntimeError(
+                f"flat swa_kv must be [pages, {D}] with dense rows, got "
+                f"shape={tuple(swa_kv.shape)}, stride={swa_kv.stride()}"
+            )
+        swa_block_size = 1
+        swa_block_stride = int(swa_kv.stride(0))
+        swa_pos_stride = int(swa_kv.stride(0))
+        swa_stride_d = int(swa_kv.stride(1))
+        swa_storage = swa_kv
+        swa_storage_pages = int(swa_kv.shape[0])
+    else:
+        raise RuntimeError(f"swa_kv must be 2-D or 3-D, got {swa_kv.dim()}-D")
     packed_tail = compressed_kv_layout == _PACKED_FP8_DS_MLA
     if compressed_kv_layout not in ("dense", _PACKED_FP8_DS_MLA):
         raise RuntimeError(f"Unsupported compressed_kv_layout={compressed_kv_layout!r}")
@@ -1894,26 +1937,56 @@ def sparse_attn_v4_paged_decode_split_kv(
                 "packed fp8_ds_mla tail expects [num_blocks, k_per_block, 584], "
                 f"got {tuple(compressed_kv.shape)}"
             )
-        compressed_flat = compressed_kv
+        compressed_storage = compressed_kv
         compressed_pages = compressed_kv.shape[0] * compressed_kv.shape[1]
     else:
-        compressed_flat = compressed_kv.reshape(-1, D)
-        compressed_pages = compressed_flat.shape[0]
-    if swa_pages <= 0 or swa_flat.shape[0] != swa_pages:
+        if compressed_kv.dim() == 3:
+            if compressed_kv.shape[-1] != D or compressed_kv.stride(-1) != 1:
+                raise RuntimeError(
+                    f"dense compressed_kv must have dense D={D} rows, got "
+                    f"shape={tuple(compressed_kv.shape)}, "
+                    f"stride={compressed_kv.stride()}"
+                )
+            compressed_storage = compressed_kv
+            compressed_pages = compressed_kv.shape[0] * compressed_kv.shape[1]
+        elif compressed_kv.dim() == 2:
+            if compressed_kv.shape[1] != D or compressed_kv.stride(1) != 1:
+                raise RuntimeError(
+                    f"flat compressed_kv must be [pages, {D}] with dense rows, "
+                    f"got shape={tuple(compressed_kv.shape)}, "
+                    f"stride={compressed_kv.stride()}"
+                )
+            compressed_storage = compressed_kv
+            compressed_pages = compressed_kv.shape[0]
+        else:
+            raise RuntimeError(
+                f"dense compressed_kv must be 2-D or 3-D, got {compressed_kv.dim()}-D"
+            )
+    if compressed_storage.dim() == 3:
+        tail_block_size = int(compressed_storage.shape[1])
+        tail_block_stride = int(compressed_storage.stride(0))
+        tail_pos_stride = int(compressed_storage.stride(1))
+        tail_stride_d = int(compressed_storage.stride(2))
+    else:
+        tail_block_size = 1
+        tail_block_stride = int(compressed_storage.stride(0))
+        tail_pos_stride = int(compressed_storage.stride(0))
+        tail_stride_d = int(compressed_storage.stride(1))
+    if swa_pages <= 0 or swa_storage_pages != swa_pages:
         raise RuntimeError(
             f"Invalid split KV SWA geometry: swa_pages={swa_pages}, "
-            f"swa_flat_pages={swa_flat.shape[0]}"
+            f"swa_storage_pages={swa_storage_pages}"
         )
-    if swa_flat.dtype != q.dtype:
+    if swa_storage.dtype != q.dtype:
         raise RuntimeError(
-            f"swa_kv dtype {swa_flat.dtype} does not match q dtype {q.dtype}"
+            f"swa_kv dtype {swa_storage.dtype} does not match q dtype {q.dtype}"
         )
     quant_tail = compressed_kv_scales is not None
     if quant_tail:
-        if compressed_flat.dtype != _FP8_DTYPE:
+        if compressed_storage.dtype != _FP8_DTYPE:
             raise RuntimeError(
                 "compressed_kv_scales supplied but compressed_kv is "
-                f"{compressed_flat.dtype}, expected {_FP8_DTYPE}"
+                f"{compressed_storage.dtype}, expected {_FP8_DTYPE}"
             )
         if compressed_kv_scales.dtype != torch.float32:
             raise RuntimeError(
@@ -1933,10 +2006,10 @@ def sparse_attn_v4_paged_decode_split_kv(
         if tail_scales.stride(-1) != 1:
             tail_scales = tail_scales.contiguous()
     else:
-        if not packed_tail and compressed_flat.dtype != q.dtype:
+        if not packed_tail and compressed_storage.dtype != q.dtype:
             raise RuntimeError(
                 "compressed_kv dtype must match q when scales are absent: "
-                f"compressed={compressed_flat.dtype}, q={q.dtype}"
+                f"compressed={compressed_storage.dtype}, q={q.dtype}"
             )
         tail_scales = q.new_empty(1, dtype=torch.float32)
         num_groups = 1
@@ -2019,8 +2092,8 @@ def sparse_attn_v4_paged_decode_split_kv(
         )
         _paged_decode_split_kv_split_kernel[(T, n_head_blocks, kv_splits)](
             q,
-            swa_flat,
-            compressed_flat,
+            swa_storage,
+            compressed_storage,
             tail_scales,
             kv_indices,
             kv_indptr,
@@ -2031,11 +2104,12 @@ def sparse_attn_v4_paged_decode_split_kv(
             q.stride(0),
             q.stride(1),
             q.stride(2),
-            swa_flat.stride(0),
-            swa_flat.stride(1),
-            compressed_flat.stride(0),
-            compressed_flat.stride(1) if not packed_tail else 0,
-            compressed_flat.stride(0) if packed_tail else 0,
+            swa_block_stride,
+            swa_pos_stride,
+            swa_stride_d,
+            tail_pos_stride,
+            tail_stride_d,
+            tail_block_stride,
             tail_scales.stride(0),
             m_partial.stride(0),
             m_partial.stride(1),
@@ -2054,6 +2128,7 @@ def sparse_attn_v4_paged_decode_split_kv(
             H,
             D,
             kv_splits,
+            SWA_BLOCK_SIZE=swa_block_size,
             BLOCK_H=block_h,
             BLOCK_D=block_d,
             BLOCK_K=block_k,
@@ -2061,7 +2136,7 @@ def sparse_attn_v4_paged_decode_split_kv(
             PACKED_TAIL=packed_tail,
             GROUP_SIZE=_FP8_GROUP_SIZE,
             NUM_GROUPS=num_groups,
-            PACKED_BLOCK_SIZE=int(compressed_kv.shape[1]) if packed_tail else 1,
+            PACKED_BLOCK_SIZE=tail_block_size,
             ORDERED_SPLIT=ordered_split,
             CSA_WINDOW_SIZE=int(csa_window_size) if ordered_split else 1,
             TRUST_INDICES=True,
@@ -2110,8 +2185,8 @@ def sparse_attn_v4_paged_decode_split_kv(
 
     _paged_decode_split_kv_fused_kernel[(T, n_head_blocks)](
         q,
-        swa_flat,
-        compressed_flat,
+        swa_storage,
+        compressed_storage,
         tail_scales,
         kv_indices,
         kv_indptr,
@@ -2124,11 +2199,12 @@ def sparse_attn_v4_paged_decode_split_kv(
         q.stride(0),
         q.stride(1),
         q.stride(2),
-        swa_flat.stride(0),
-        swa_flat.stride(1),
-        compressed_flat.stride(0),
-        compressed_flat.stride(1) if not packed_tail else 0,
-        compressed_flat.stride(0) if packed_tail else 0,
+        swa_block_stride,
+        swa_pos_stride,
+        swa_stride_d,
+        tail_pos_stride,
+        tail_stride_d,
+        tail_block_stride,
         tail_scales.stride(0),
         csa_topk_local.stride(0),
         csa_block_tables.stride(0),
@@ -2143,6 +2219,7 @@ def sparse_attn_v4_paged_decode_split_kv(
         int(compressed_pages),
         H,
         D,
+        SWA_BLOCK_SIZE=swa_block_size,
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
@@ -2150,7 +2227,7 @@ def sparse_attn_v4_paged_decode_split_kv(
         PACKED_TAIL=packed_tail,
         GROUP_SIZE=_FP8_GROUP_SIZE,
         NUM_GROUPS=num_groups,
-        PACKED_BLOCK_SIZE=int(compressed_kv.shape[1]) if packed_tail else 1,
+        PACKED_BLOCK_SIZE=tail_block_size,
         FUSE_CSA_TOPK=fuse_csa_topk,
         ORDERED_SPLIT=ordered_split,
         CSA_INDEX_TOPK=csa_index_topk,

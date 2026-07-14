@@ -9,7 +9,7 @@ import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
-from functools import partial
+from functools import cache, partial
 from typing import Any, NewType, TypeAlias, cast, overload
 
 from vllm import envs
@@ -22,6 +22,7 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
+    DeepseekV4AtomMLAAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
@@ -794,9 +795,12 @@ def max_memory_usage_bytes(
 
 
 def _representative_scheduler_spec(group_spec: UniformTypeKVCacheSpecs) -> KVCacheSpec:
-    """Collapse per-layer specs without dropping fixed-prefix metadata."""
+    """Collapse per-layer specs without dropping specialized layout metadata."""
     specs = tuple(group_spec.kv_cache_specs.values())
-    return next((spec for spec in specs if spec.fixed_prefix_size_bytes > 0), specs[0])
+    return next(
+        (spec for spec in specs if isinstance(spec, DeepseekV4AtomMLAAttentionSpec)),
+        specs[0],
+    )
 
 
 def estimate_max_model_len(
@@ -928,6 +932,15 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
         # Encoder-only models do not have KV cache, kv_cache_type can be
         # regarded as uniform.
         return True
+    has_atom_mla = any(
+        isinstance(spec, DeepseekV4AtomMLAAttentionSpec)
+        for spec in kv_cache_spec.values()
+    )
+    if has_atom_mla and not all(
+        isinstance(spec, DeepseekV4AtomMLAAttentionSpec)
+        for spec in kv_cache_spec.values()
+    ):
+        return False
     has_fixed_prefix = any(
         spec.fixed_prefix_size_bytes > 0 for spec in kv_cache_spec.values()
     )
@@ -992,15 +1005,17 @@ def get_max_concurrency_for_kv_cache_config(
     if _contains_fixed_prefix_spec(kv_cache_config):
         return _get_fixed_prefix_max_concurrency(vllm_config, kv_cache_config)
 
-    num_layer_per_group = max(
-        len(group.layer_names) for group in kv_cache_config.kv_cache_groups
-    )
+    nonempty_groups = [
+        group for group in kv_cache_config.kv_cache_groups if group.layer_names
+    ]
+    if not nonempty_groups:
+        return 0.0
+    num_layer_per_group = max(len(group.layer_names) for group in nonempty_groups)
     max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
-        vllm_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
+        vllm_config, (group.kv_cache_spec for group in nonempty_groups)
     )
     memory_per_block = (
-        kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        * num_layer_per_group
+        nonempty_groups[0].kv_cache_spec.page_size_bytes * num_layer_per_group
     )
     num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
     max_concurrency = kv_cache_config.num_blocks / num_block_per_request
@@ -1044,7 +1059,9 @@ def _pool_bytes_per_block(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         return kv_cache_groups[0].kv_cache_spec.page_size_bytes
-    if _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
+    if _contains_dsv4_atom_spec(kv_cache_groups) or _use_packed_kv_cache_config(
+        vllm_config, kv_cache_groups
+    ):
         # buckets = {page_size: [[layer_names], [layer_names], ...]}
         buckets = _bucket_layers_by_page_size(kv_cache_groups)
         return sum(ps * len(slots) for ps, slots in buckets.items())
@@ -1366,7 +1383,51 @@ def _use_packed_kv_cache_config(
     enable_cross_layers = (
         str(extra_config.get("enable_cross_layers_blocks", "False")).lower() == "true"
     )
+    if _contains_dsv4_atom_spec(kv_cache_groups):
+        return _get_dsv4_kv_cache_layout(vllm_config, kv_cache_groups) == "packed"
     return is_dsv4 or (enable_cross_layers and len(kv_cache_groups) > 1)
+
+
+def _contains_dsv4_atom_spec(kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
+    return any(
+        isinstance(spec, DeepseekV4AtomMLAAttentionSpec)
+        for group in kv_cache_groups
+        for spec in (
+            group.kv_cache_spec.kv_cache_specs.values()
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else (group.kv_cache_spec,)
+        )
+    )
+
+
+def _get_dsv4_kv_cache_layout(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> str | None:
+    if not _contains_dsv4_atom_spec(kv_cache_groups):
+        return None
+    layout = vllm_config.cache_config.dsv4_kv_cache_layout
+    if layout == "auto":
+        return "slab" if _aiter_has_paged_swa_abi() else "packed"
+    return layout
+
+
+@cache
+def _aiter_has_paged_swa_abi() -> bool:
+    try:
+        import inspect
+
+        from aiter.ops.flydsl import flydsl_qk_norm_rope_quant
+
+        parameters = inspect.signature(flydsl_qk_norm_rope_quant).parameters
+        return {
+            "swa_kv",
+            "batch_id_per_token",
+            "swa_block_tables",
+            "swa_block_size",
+        }.issubset(parameters)
+    except Exception:
+        return False
 
 
 def _split_fixed_prefix_layers(
@@ -1467,6 +1528,70 @@ def _get_kv_cache_config_packed(
     return num_blocks, kv_cache_tensors
 
 
+def _get_kv_cache_config_layer_separated(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+    *,
+    consolidate: bool,
+) -> tuple[int, list[KVCacheTensor]]:
+    """Plan contiguous per-slot pools, optionally in one layer-major slab."""
+    buckets = _bucket_layers_by_page_size(kv_cache_groups)
+    bytes_per_block = sum(ps * len(slots) for ps, slots in buckets.items())
+    if bytes_per_block <= 0:
+        raise ValueError("DeepSeek-V4 KV cache requires a positive page size")
+
+    num_blocks = may_override_num_blocks(
+        vllm_config, available_memory // bytes_per_block
+    )
+    allocation_size = bytes_per_block * num_blocks
+    allocation_offset = 0
+    kv_cache_tensors: list[KVCacheTensor] = []
+    for page_size, slots in buckets.items():
+        tensor_size = page_size * num_blocks
+        for slot in slots:
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=tensor_size,
+                    shared_by=slot,
+                    allocation_id=0 if consolidate else None,
+                    allocation_size=allocation_size if consolidate else 0,
+                    allocation_offset=allocation_offset if consolidate else 0,
+                )
+            )
+            allocation_offset += tensor_size
+
+    assert allocation_offset == allocation_size
+    return num_blocks, kv_cache_tensors
+
+
+def _remove_layer_separated_page_padding(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> list[KVCacheGroupSpec]:
+    """Remove inter-group page padding that is unnecessary for flat pools."""
+    result: list[KVCacheGroupSpec] = []
+    for group in kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        if isinstance(group_spec, UniformTypeKVCacheSpecs):
+            layer_specs = {
+                layer_name: (
+                    replace(layer_spec, page_size_padded=None)
+                    if isinstance(layer_spec, AttentionSpec)
+                    and layer_spec.page_size_padded is not None
+                    else layer_spec
+                )
+                for layer_name, layer_spec in group_spec.kv_cache_specs.items()
+            }
+            group_spec = replace(group_spec, kv_cache_specs=layer_specs)
+        elif (
+            isinstance(group_spec, AttentionSpec)
+            and group_spec.page_size_padded is not None
+        ):
+            group_spec = replace(group_spec, page_size_padded=None)
+        result.append(replace(group, kv_cache_spec=group_spec))
+    return result
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1523,6 +1648,17 @@ def get_kv_cache_config_from_groups(
             )
             for layer_name in kv_cache_groups[0].layer_names
         ]
+    elif (dsv4_layout := _get_dsv4_kv_cache_layout(vllm_config, kv_cache_groups)) in {
+        "separate",
+        "slab",
+    }:
+        kv_cache_groups = _remove_layer_separated_page_padding(kv_cache_groups)
+        num_blocks, kv_cache_tensors = _get_kv_cache_config_layer_separated(
+            vllm_config,
+            kv_cache_groups,
+            available_memory,
+            consolidate=dsv4_layout == "slab",
+        )
     elif _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
         # DeepSeek V4 uses the packed layout by default. Other multi-group
         # layouts can opt in with --enable-cross-layers.

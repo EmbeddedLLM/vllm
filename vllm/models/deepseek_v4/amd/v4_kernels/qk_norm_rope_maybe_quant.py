@@ -34,8 +34,11 @@ Designed for the decode path only — prefill (large num_tokens) keeps the
 ops anyway.
 """
 
+import inspect
+
 import torch
 
+from vllm.models.deepseek_v4.amd.v4_kernels.state_writes import swa_write
 from vllm.triton_utils import tl, triton
 
 # Lazy-imported flydsl path (optional dependency). Set to None when flydsl
@@ -45,8 +48,18 @@ try:
     from aiter.ops.flydsl import flydsl_qk_norm_rope_quant
 
     _FLYDSL_AVAILABLE = True
+    _FLYDSL_PARAMETERS = inspect.signature(flydsl_qk_norm_rope_quant).parameters
+    _FLYDSL_HAS_SWA = "swa_kv" in _FLYDSL_PARAMETERS
+    _FLYDSL_HAS_PAGED_SWA = {
+        "swa_kv",
+        "batch_id_per_token",
+        "swa_block_tables",
+        "swa_block_size",
+    }.issubset(_FLYDSL_PARAMETERS)
 except Exception:
     _FLYDSL_AVAILABLE = False
+    _FLYDSL_HAS_SWA = False
+    _FLYDSL_HAS_PAGED_SWA = False
 
 
 # AMD MI3 native e4m3 variant. aiter's a8w8 path and the existing
@@ -90,6 +103,17 @@ def _qk_norm_rope_maybe_quant_kernel(
     kv_out_ptr,  # [T, D] bf16 or e4m3
     q_scale_ptr,  # [T, H] fp32 (only when QUANT_Q)
     kv_scale_ptr,  # [T] fp32 (only when QUANT_K)
+    swa_kv_ptr,  # [blocks, block_size, D] bf16 when WRITE_PAGED_SWA
+    batch_id_per_token_ptr,  # [T] int32 when WRITE_PAGED_SWA
+    swa_block_tables_ptr,  # [num_reqs, max_blocks] int32
+    swa_slot_mapping_ptr,  # [T] int64 when DIRECT_SWA_SLOT
+    swa_block_tables_stride,
+    swa_block_stride,
+    swa_pos_stride,
+    swa_num_blocks,
+    swa_num_reqs,
+    swa_max_blocks,
+    swa_block_size,
     eps: tl.constexpr,
     T,
     q_in_row_stride,
@@ -106,6 +130,8 @@ def _qk_norm_rope_maybe_quant_kernel(
     BLOCK_M: tl.constexpr,
     QUANT_Q: tl.constexpr,
     QUANT_K: tl.constexpr,
+    WRITE_PAGED_SWA: tl.constexpr,
+    DIRECT_SWA_SLOT: tl.constexpr,
 ):
     """Grid: ``(cdiv(T, BLOCK_M), H + 1)``.
 
@@ -304,6 +330,64 @@ def _qk_norm_rope_maybe_quant_kernel(
             mask=m_mask[:, None] & nope_d_mask[None, :],
         )
         tl.store(kv_out_base + NOPE + rd_offs[None, :], pe.to(ot), mask=m_mask[:, None])
+        if WRITE_PAGED_SWA:
+            if DIRECT_SWA_SLOT:
+                slot = tl.load(
+                    swa_slot_mapping_ptr + m_offs,
+                    mask=m_mask,
+                    other=-1,
+                ).to(tl.int64)
+                physical_block = slot // swa_block_size
+                block_offset = slot % swa_block_size
+                write_valid = (
+                    m_mask
+                    & (slot >= 0)
+                    & (physical_block >= 0)
+                    & (physical_block < swa_num_blocks)
+                )
+            else:
+                batch_id = tl.load(
+                    batch_id_per_token_ptr + m_offs,
+                    mask=m_mask,
+                    other=-1,
+                )
+                logical_block = pos // swa_block_size
+                table_valid = (
+                    m_mask
+                    & (batch_id >= 0)
+                    & (batch_id < swa_num_reqs)
+                    & (logical_block >= 0)
+                    & (logical_block < swa_max_blocks)
+                )
+                physical_block = tl.load(
+                    swa_block_tables_ptr
+                    + batch_id * swa_block_tables_stride
+                    + logical_block,
+                    mask=table_valid,
+                    other=-1,
+                )
+                write_valid = (
+                    table_valid
+                    & (physical_block >= 0)
+                    & (physical_block < swa_num_blocks)
+                )
+                block_offset = pos % swa_block_size
+            physical_block = physical_block.to(tl.int64)
+            swa_row = (
+                swa_kv_ptr
+                + physical_block[:, None] * swa_block_stride
+                + block_offset[:, None] * swa_pos_stride
+            )
+            tl.store(
+                swa_row + d_offs[None, :],
+                x_n,
+                mask=write_valid[:, None] & nope_d_mask[None, :],
+            )
+            tl.store(
+                swa_row + NOPE + rd_offs[None, :],
+                pe,
+                mask=write_valid[:, None],
+            )
 
 
 def qk_norm_rope_maybe_quant(
@@ -319,6 +403,15 @@ def qk_norm_rope_maybe_quant(
     eps: float,
     quant_q: bool = False,
     quant_k: bool = False,
+    swa_kv: torch.Tensor | None = None,
+    state_slot_mapping: torch.Tensor | None = None,
+    batch_id_per_token: torch.Tensor | None = None,
+    swa_cu_seqlens_q: torch.Tensor | None = None,
+    swa_cache_size: int | None = None,
+    swa_write_per_batch: int | None = None,
+    swa_block_tables: torch.Tensor | None = None,
+    swa_block_size: int | None = None,
+    swa_slot_mapping: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Fused per-token RMSNorm + GPT-J interleaved RoPE (+ optional FP8 quant).
 
@@ -393,14 +486,74 @@ def qk_norm_rope_maybe_quant(
     )
     kv_out = torch.empty((T, head_dim), dtype=kv_out_dtype, device=kv.device)
 
+    direct_slot_requested = (
+        swa_kv is not None
+        and swa_slot_mapping is not None
+        and swa_block_size is not None
+    )
+    block_table_requested = (
+        swa_kv is not None
+        and batch_id_per_token is not None
+        and swa_block_tables is not None
+        and swa_block_size is not None
+    )
+    paged_swa_requested = direct_slot_requested or block_table_requested
+    flydsl_can_fuse_paged_swa = (
+        block_table_requested
+        and _FLYDSL_HAS_PAGED_SWA
+        and swa_kv.dim() == 3
+        and swa_kv.is_contiguous()
+        and swa_kv.stride(2) == 1
+        and swa_kv.stride(1) == head_dim
+        and swa_kv.stride(0) == swa_kv.shape[1] * head_dim
+        and batch_id_per_token.dtype == torch.int32
+        and swa_block_tables.dim() == 2
+        and swa_block_tables.dtype == torch.int32
+    )
+    triton_fuse_paged_swa = paged_swa_requested and not flydsl_can_fuse_paged_swa
+    if triton_fuse_paged_swa:
+        assert not quant_k, "paged BF16 SWA fusion requires an unquantized K output"
+        assert swa_kv.dim() == 3 and swa_kv.shape[2] == head_dim
+        assert swa_kv.shape[1] == swa_block_size
+        assert swa_kv.stride(2) == 1
+        if direct_slot_requested:
+            assert swa_slot_mapping.shape[0] >= T
+            assert swa_slot_mapping.dtype == torch.int64
+        else:
+            assert batch_id_per_token.shape[0] >= T
+            assert swa_block_tables.dim() == 2
+            assert swa_block_tables.dtype == torch.int32
+
     # ------------------------------------------------------------------
     # flydsl dispatch (MVP hardcoded for V4-Pro decode shape). The combined
     # Q+KV single-launch kernel wins at all T (large for small T due to
     # halved launch overhead, large for big T due to better occupancy), so
     # "auto" picks flydsl whenever the shape matches.
     # ------------------------------------------------------------------
-    if _FLYDSL_AVAILABLE:
-        return flydsl_qk_norm_rope_quant(
+    if _FLYDSL_AVAILABLE and quant_q == quant_k and not triton_fuse_paged_swa:
+        fuse_paged_swa = flydsl_can_fuse_paged_swa
+        fuse_ring_swa = (
+            swa_kv is not None
+            and swa_block_tables is None
+            and state_slot_mapping is not None
+            and batch_id_per_token is not None
+            and _FLYDSL_HAS_SWA
+        )
+        flydsl_kwargs = {}
+        if fuse_paged_swa:
+            flydsl_kwargs = {
+                "swa_kv": swa_kv.view(-1, head_dim),
+                "batch_id_per_token": batch_id_per_token,
+                "swa_block_tables": swa_block_tables,
+                "swa_block_size": swa_block_size,
+            }
+        elif fuse_ring_swa:
+            flydsl_kwargs = {
+                "swa_kv": swa_kv,
+                "state_slot_mapping": state_slot_mapping,
+                "batch_id_per_token": batch_id_per_token,
+            }
+        result = flydsl_qk_norm_rope_quant(
             q,
             kv,
             kv_weight,
@@ -413,7 +566,30 @@ def qk_norm_rope_maybe_quant(
             quant=quant_q,
             q_out=q_out,
             kv_out=kv_out,
+            **flydsl_kwargs,
         )
+        if swa_kv is not None and not (fuse_paged_swa or fuse_ring_swa):
+            if (
+                swa_cu_seqlens_q is None
+                or swa_write_per_batch is None
+                or state_slot_mapping is None
+            ):
+                raise ValueError(
+                    "standalone SWA write requires cu_seqlens_q, "
+                    "write_per_batch, and state_slot_mapping"
+                )
+            swa_write(
+                result[1],
+                positions,
+                swa_cu_seqlens_q,
+                state_slot_mapping,
+                swa_kv,
+                swa_cache_size or swa_block_size or swa_kv.shape[1],
+                swa_write_per_batch,
+                block_tables=swa_block_tables,
+                block_size=swa_block_size,
+            )
+        return result
 
     q_scale = (
         torch.empty((T, n_local_heads), dtype=torch.float32, device=q.device)
@@ -431,6 +607,22 @@ def qk_norm_rope_maybe_quant(
     )
     kv_scale_arg = (
         kv_scale if kv_scale is not None else q.new_empty(1, dtype=torch.float32)
+    )
+    swa_kv_arg = swa_kv if triton_fuse_paged_swa else kv_out
+    batch_id_arg = (
+        batch_id_per_token
+        if triton_fuse_paged_swa and not direct_slot_requested
+        else positions.new_empty(1)
+    )
+    swa_block_tables_arg = (
+        swa_block_tables
+        if triton_fuse_paged_swa and not direct_slot_requested
+        else positions.new_empty(1)
+    )
+    swa_slot_mapping_arg = (
+        swa_slot_mapping
+        if triton_fuse_paged_swa and direct_slot_requested
+        else positions.new_empty(1)
     )
 
     # Tuned on V4-Pro decode shape (H=16, D=512, RD=64) on MI355. After
@@ -460,6 +652,29 @@ def qk_norm_rope_maybe_quant(
         kv_out,
         q_scale_arg,
         kv_scale_arg,
+        swa_kv_arg,
+        batch_id_arg,
+        swa_block_tables_arg,
+        swa_slot_mapping_arg,
+        (
+            swa_block_tables.stride(0)
+            if triton_fuse_paged_swa and not direct_slot_requested
+            else 0
+        ),
+        swa_kv.stride(0) if triton_fuse_paged_swa else 0,
+        swa_kv.stride(1) if triton_fuse_paged_swa else 0,
+        swa_kv.shape[0] if triton_fuse_paged_swa else 0,
+        (
+            swa_block_tables.shape[0]
+            if triton_fuse_paged_swa and not direct_slot_requested
+            else 0
+        ),
+        (
+            swa_block_tables.shape[1]
+            if triton_fuse_paged_swa and not direct_slot_requested
+            else 0
+        ),
+        swa_block_size if triton_fuse_paged_swa else 1,
         eps=float(eps),
         T=T,
         q_in_row_stride=q.stride(0),
@@ -476,9 +691,33 @@ def qk_norm_rope_maybe_quant(
         BLOCK_M=block_m,
         QUANT_Q=quant_q,
         QUANT_K=quant_k,
+        WRITE_PAGED_SWA=triton_fuse_paged_swa,
+        DIRECT_SWA_SLOT=direct_slot_requested,
         num_warps=num_warps,
         waves_per_eu=1,
     )
+    if swa_kv is not None and not triton_fuse_paged_swa:
+        if (
+            swa_cu_seqlens_q is None
+            or swa_write_per_batch is None
+            or state_slot_mapping is None
+        ):
+            raise ValueError(
+                "Triton SWA write requires cu_seqlens_q, write_per_batch, "
+                "and state_slot_mapping"
+            )
+        swa_write(
+            kv_out,
+            positions,
+            swa_cu_seqlens_q,
+            state_slot_mapping,
+            swa_kv,
+            swa_cache_size or swa_block_size or swa_kv.shape[1],
+            swa_write_per_batch,
+            block_tables=swa_block_tables,
+            block_size=swa_block_size,
+        )
+
     return q_out, kv_out, q_scale, kv_scale
 
 

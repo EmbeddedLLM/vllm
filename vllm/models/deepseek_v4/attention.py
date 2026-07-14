@@ -51,7 +51,6 @@ from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
 )
-from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
@@ -355,12 +354,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.use_flashmla_fp8_layout, cache_config.cache_dtype, cache_config
         )
 
+        atom_paged_swa = current_platform.is_rocm()
         self.swa_cache_layer = DeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,
-            dtype=self.kv_cache_torch_dtype,
+            dtype=torch.bfloat16 if atom_paged_swa else self.kv_cache_torch_dtype,
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
+            cache_dtype_str="auto" if atom_paged_swa else self.kv_cache_dtype,
         )
 
         # Register with compilation context for metadata lookup.
@@ -689,30 +690,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 f"inside each KV block; got {atom_block_size}."
             )
         if atom_vllm_owned_kv:
-            atom_swa_dtype = vllm_config.model_config.dtype
-            win_with_spec = self.window_size + int(
-                vllm_config.num_speculative_tokens or 0
-            )
-            atom_swa_pages = vllm_config.scheduler_config.max_num_seqs * win_with_spec
-            atom_swa_prefix_bytes = (
-                atom_swa_pages * self.head_dim * get_dtype_size(atom_swa_dtype)
-            )
-            self.atom_vllm_unified_kv_prefix_bytes = atom_swa_prefix_bytes
-            self.atom_vllm_unified_kv_swa_pages = atom_swa_pages
-            self.atom_vllm_unified_kv_swa_dtype = atom_swa_dtype
             self.atom_vllm_compressed_scale_bytes_per_page = 0
             self.atom_vllm_compressed_layout = "dense"
             spec_cls = DeepseekV4AtomMLAAttentionSpec
             # The validated ATOM kernels use a homogeneous model-dtype cache
             # for both the SWA prefix and compressed tail.
-            spec_dtype = atom_swa_dtype
+            spec_dtype = vllm_config.model_config.dtype
             spec_cache_dtype = "bf16"
             atom_scale_bytes_per_page = 0
             spec_alignment = None
             extra_kwargs = {
-                "atom_swa_prefix_bytes": atom_swa_prefix_bytes,
-                "atom_swa_pages": atom_swa_pages,
-                "atom_swa_dtype": atom_swa_dtype,
                 "atom_compressed_kv_dtype": spec_dtype,
                 "atom_compressed_layout": self.atom_vllm_compressed_layout,
                 "atom_compressed_scale_dtype": torch.float32
@@ -734,167 +721,22 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
 
     def post_bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        """Bind ROCm ATOM unified views as soon as vLLM KV storage exists.
-
-        ModelState also validates these views when it prepares attention
-        metadata, but CUDA/HIP graph capture can happen before that first real
-        metadata pass.  Creating the views at KV-cache bind time ensures graph
-        capture sees the same tensors replay will use.
-        """
-        if (
-            not current_platform.is_rocm()
-            or self.compress_ratio <= 1
-            or not hasattr(self, "atom_vllm_unified_kv_prefix_bytes")
-        ):
-            return
-        if kv_cache.numel() == 0:
-            return
-
-        atom_swa_dtype = getattr(
-            self, "atom_vllm_unified_kv_swa_dtype", self.kv_cache_torch_dtype
-        )
-        swa_pages = int(getattr(self, "atom_vllm_unified_kv_swa_pages", 0) or 0)
-        prefix_bytes = int(getattr(self, "atom_vllm_unified_kv_prefix_bytes", 0) or 0)
-        if swa_pages <= 0 or prefix_bytes <= 0:
+        """Bind the compressed half of ROCm's split paged KV layout."""
+        if not current_platform.is_rocm() or self.compress_ratio <= 1:
             return
         compressed_layout = getattr(self, "atom_vllm_compressed_layout", "dense")
-        if compressed_layout not in ("dense", "fp8_ds_mla"):
+        if compressed_layout not in {"dense", "fp8_ds_mla"}:
             raise RuntimeError(
-                "ROCm DSV4 ATOM vLLM-owned KV bind got unsupported compressed "
-                f"layout {compressed_layout!r} for {self.prefix}."
+                "ROCm DeepSeek-V4 received unsupported compressed layout "
+                f"{compressed_layout!r}."
             )
-        expected_tail_width = (
-            584 if compressed_layout == "fp8_ds_mla" else self.head_dim
-        )
-        if kv_cache.dim() != 3 or kv_cache.shape[-1] != expected_tail_width:
-            raise RuntimeError(
-                "ROCm DSV4 ATOM vLLM-owned KV bind expected compressed tail "
-                f"[num_blocks, k_per_block, {expected_tail_width}], got "
-                f"{tuple(kv_cache.shape)} for {self.prefix}."
-            )
-
-        num_blocks = int(kv_cache.shape[0])
-        k_per_block = int(kv_cache.shape[1])
-        tail_pages = num_blocks * k_per_block
-        scale_bytes_per_page = int(
-            getattr(self, "atom_vllm_compressed_scale_bytes_per_page", 0) or 0
-        )
-        if compressed_layout == "fp8_ds_mla":
-            if kv_cache.dtype != torch.uint8:
-                raise RuntimeError(
-                    "ROCm DSV4 ATOM packed FP8 KV expects compressed tail dtype "
-                    f"torch.uint8, got {kv_cache.dtype}."
-                )
-            tail_page_bytes = 584
-        else:
-            tail_page_bytes = self.head_dim * get_dtype_size(kv_cache.dtype)
-        expected_bytes = prefix_bytes + tail_pages * (
-            tail_page_bytes + scale_bytes_per_page
-        )
-        storage_bytes = kv_cache.untyped_storage().nbytes()
-        if storage_bytes < expected_bytes:
-            raise RuntimeError(
-                "ROCm DSV4 ATOM vLLM-owned KV storage is too small for "
-                f"{self.prefix}: storage_bytes={storage_bytes}, "
-                f"expected_bytes={expected_bytes}, swa_pages={swa_pages}, "
-                f"num_blocks={num_blocks}, k_per_block={k_per_block}, "
-                f"head_dim={self.head_dim}, tail_dtype={kv_cache.dtype}, "
-                f"scale_bytes_per_page={scale_bytes_per_page}."
-            )
-
-        swa_stride = torch.empty(
-            (swa_pages, self.head_dim),
-            dtype=atom_swa_dtype,
-            device=kv_cache.device,
-        ).stride()
-        swa_flat = torch.empty((), dtype=atom_swa_dtype, device=kv_cache.device)
-        swa_flat.set_(
-            kv_cache.untyped_storage(),
-            0,
-            (swa_pages, self.head_dim),
-            swa_stride,
-        )
-        win_with_spec = swa_pages // self.max_num_reqs
-        self.atom_swa_kv = swa_flat.view(
-            self.max_num_reqs,
-            win_with_spec,
-            self.head_dim,
-        )
-        # This capability is stronger than merely having an ``atom_swa_kv``
-        # tensor. It proves that the per-request ring is a view of storage
-        # allocated and profiled by vLLM, so an ATOM decode can make that ring
-        # authoritative without also updating the legacy block-table SWA
-        # cache. ModelState may rebind the same view after allocation and
-        # preserves this ownership marker.
-        self.atom_direct_swa_bound = True
-        self.atom_win_with_spec = win_with_spec
-        self.atom_swa_pages = swa_pages
         self.atom_compressed_kv_cache = kv_cache
-        self.atom_split_kv_swa = self.atom_swa_kv
         self.atom_split_kv_compressed = kv_cache
         self.atom_split_kv_scales = None
         self.atom_split_kv_layout = compressed_layout
-        if (
-            compressed_layout == "dense"
-            and kv_cache.dtype == atom_swa_dtype
-            and scale_bytes_per_page == 0
-        ):
-            total_pages = swa_pages + tail_pages
-            unified_stride = torch.empty(
-                (total_pages, self.head_dim),
-                dtype=atom_swa_dtype,
-                device=kv_cache.device,
-            ).stride()
-            unified = torch.empty((), dtype=atom_swa_dtype, device=kv_cache.device)
-            unified.set_(
-                kv_cache.untyped_storage(),
-                0,
-                (total_pages, self.head_dim),
-                unified_stride,
-            )
-            self.atom_unified_kv = unified
-        elif compressed_layout == "fp8_ds_mla":
-            # Packed tail embeds its UE8M0 scales in the 584-byte slot.
-            pass
-        else:
-            if scale_bytes_per_page <= 0:
-                raise RuntimeError(
-                    "ROCm DSV4 ATOM mixed KV requires per-page scale bytes "
-                    f"for {self.prefix}."
-                )
-            if kv_cache.dtype != torch.float8_e4m3fnuz:
-                raise RuntimeError(
-                    "ROCm DSV4 ATOM mixed KV expects compressed tail dtype "
-                    f"torch.float8_e4m3fnuz, got {kv_cache.dtype}."
-                )
-            scale_groups = self.head_dim // 64
-            expected_scale_bytes = scale_groups * get_dtype_size(torch.float32)
-            if scale_bytes_per_page != expected_scale_bytes:
-                raise RuntimeError(
-                    "ROCm DSV4 ATOM mixed KV scale bytes mismatch: "
-                    f"got {scale_bytes_per_page}, expected {expected_scale_bytes}."
-                )
-            if (prefix_bytes + tail_page_bytes) % get_dtype_size(torch.float32) != 0:
-                raise RuntimeError(
-                    "ROCm DSV4 ATOM mixed KV scale sidecar is not fp32 aligned."
-                )
-            page_stride = (tail_page_bytes + scale_bytes_per_page) // get_dtype_size(
-                torch.float32
-            )
-            scale_storage_offset = (prefix_bytes + tail_page_bytes) // get_dtype_size(
-                torch.float32
-            )
-            scale_base = torch.empty((), dtype=torch.float32, device=kv_cache.device)
-            scale_base.set_(
-                kv_cache.untyped_storage(),
-                scale_storage_offset,
-                (tail_pages, scale_groups),
-                (page_stride, 1),
-            )
-            self.atom_split_kv_scales = scale_base
         if self.compressor is not None:
             self.compressor.atom_kv_cache = kv_cache
-            self.compressor.atom_kv_scales = self.atom_split_kv_scales
+            self.compressor.atom_kv_scales = None
             self.compressor.atom_kv_layout = compressed_layout
 
 

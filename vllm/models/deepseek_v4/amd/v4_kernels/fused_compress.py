@@ -108,7 +108,8 @@ def _fused_compress_attn_kernel(
     sin_cache_ptr,
     cos_sin_pos_stride,  # = rope_head_dim // 2
     # ── KV cache scatter (paged) ────────────────────────────────────────
-    kv_cache_ptr,  # bf16: [NB, k_per_block, head_dim] / fp8: [NB, k_per_block, head_dim]
+    # bf16/fp8: [NB, k_per_block, head_dim]
+    kv_cache_ptr,
     kv_cache_block_stride,
     kv_cache_token_stride,
     cache_scale_ptr,  # fp32 [NB, k_per_block, groups] or [NB, k_per_block]
@@ -133,11 +134,14 @@ def _fused_compress_attn_kernel(
     #   ≤ STATE_SIZE; used for `s = position - K + 1 + k_static` loop bound
     HAS_BLOCK_TABLE: tl.constexpr,
     HAS_SLOT_MAPPING: tl.constexpr,
-    QUANT: tl.constexpr,  # 0 = raw BF16 (CSA/HCA Main), 1 = FP8 e4m3 + ue8m0 scale (Indexer)
-    PACKED_FP8_DS_MLA: tl.constexpr,  # ATOM DSV4 584B slot: 448 fp8 + 64 bf16 + 8 scales
+    # 0 = raw BF16 (CSA/HCA Main), 1 = FP8 e4m3 + ue8m0 scale (Indexer)
+    QUANT: tl.constexpr,
+    # ATOM DSV4 584B slot: 448 fp8 + 64 bf16 + 8 scales
+    PACKED_FP8_DS_MLA: tl.constexpr,
     USE_UE8M0: tl.constexpr,  # round scale to power-of-2 (only when QUANT == 1)
     QUANT_GROUP_SIZE: tl.constexpr,  # head_dim for per-row; 64 for main FP8 tail
-    PRESHUFFLE: tl.constexpr,  # MFMA 16x16 preshuffled FP8 layout (only when QUANT == 1)
+    # MFMA 16x16 preshuffled FP8 layout (only when QUANT == 1)
+    PRESHUFFLE: tl.constexpr,
     # E4M3 max (=448 for E4M3FN, =240 for E4M3FNUZ). Constexpr so the clamp
     # bounds and reciprocal fold to compile-time constants.  Ignored when
     # QUANT == 0 (caller passes 1.0 as a placeholder).
@@ -590,6 +594,10 @@ def fused_compress_attn(
         and not _hca_flat_layout
         and kv_slot_mapping is None
         and not packed_fp8_ds_mla
+        # The installed AITER/FlyDSL scatter ABI models a flat contiguous
+        # per-layer pool. vLLM's packed cache has a much larger inter-layer
+        # block stride; passing that view silently addresses the wrong rows.
+        and (kv_cache is None or kv_cache.is_contiguous())
         and (not quant or (_effective_quant_group_size == head_dim and preshuffle))
     )
     # HCA 2-kernel-split: BF16-only on V4-Pro HCA Main shape
@@ -652,9 +660,8 @@ def fused_compress_attn(
     # Validate shapes
     dim_full = (2 if overlap else 1) * head_dim
     K_pool = (2 if overlap else 1) * ratio  # pool window size (algorithm-defined)
-    state_size = kv_state.shape[
-        1
-    ]  # ring buffer modulo (≥ K_pool; V4-Pro: K_pool + max_spec_steps spec / K_pool non-spec)
+    # Ring modulo: K_pool plus speculative steps, or K_pool without spec.
+    state_size = kv_state.shape[1]
     assert kv_in.dim() == 2 and kv_in.shape[1] == dim_full, (
         f"kv_in {kv_in.shape}, expected [*, {dim_full}]"
     )
@@ -872,10 +879,7 @@ def fused_compress_attn_reference(
     state_size = kv_state.shape[1]  # ring buffer modulo (≥ K)
     plan_cpu = plan.compress_plan_gpu.detach().cpu()
     slot_map_cpu = state_slot_mapping.detach().cpu()
-    if block_tables is not None:
-        bt_cpu = block_tables.detach().cpu()
-    else:
-        bt_cpu = None
+    bt_cpu = block_tables.detach().cpu() if block_tables is not None else None
 
     out = torch.empty(plan.num_compress, head_dim, dtype=out_dtype, device=device)
 
@@ -887,10 +891,7 @@ def fused_compress_attn_reference(
         score_rows = []
         for k in range(K):
             s = position - K + 1 + k
-            if overlap:
-                col_off = head_dim if k >= ratio else 0
-            else:
-                col_off = 0
+            col_off = (head_dim if k >= ratio else 0) if overlap else 0
             ape_row = k % ratio
             d_slice = slice(col_off, col_off + head_dim)
             is_padding = s < 0

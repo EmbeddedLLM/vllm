@@ -225,6 +225,7 @@ class AttentionSpec(KVCacheSpec):
     @property
     def inner_block_stride_bytes(self) -> int | None:
         return None
+
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         # Attention KV is token-interleaved across DCP/PCP ranks, so each rank
         # only stores max_len // (dcp * pcp) tokens per request.
@@ -466,25 +467,16 @@ class MLAAttentionSpec(FullAttentionSpec):
 
 @dataclass(frozen=True, kw_only=True)
 class DeepseekV4AtomMLAAttentionSpec(MLAAttentionSpec):
-    """DeepSeek-V4 ROCm ATOM MLA cache with a SWA prefix.
+    """DeepSeek-V4 ROCm ATOM compressed MLA cache.
 
-    The normal MLA page-size fields describe the compressed paged tail.  The
-    ATOM layout also needs a per-layer SWA ring before that tail:
-
-    ``[max_num_reqs * (sliding_window + spec_tokens), head_dim]``.
-
-    The ROCm ATOM path can use either a homogeneous dense tail or the packed
-    DSV4 FP8 tail. For the packed layout, the SWA prefix is model dtype and the
-    compressed tail is ``fp8_ds_mla``: 448 FP8 NoPE bytes, 64 BF16 RoPE values
-    (128 bytes), and 8 embedded UE8M0 scale bytes per compressed token.
+    SWA is allocated separately as a ``SlidingWindowMLASpec`` and addressed
+    through its vLLM block table. This spec only describes the compressed
+    paged cache consumed alongside it by ATOM's split-KV kernels.
 
     The ``atom_compressed_*`` fields are the ROCm-only contract used by the
     vLLM-owned ATOM KV binding path. CUDA keeps using the existing MLA specs.
     """
 
-    atom_swa_prefix_bytes: int = 0
-    atom_swa_pages: int = 0
-    atom_swa_dtype: torch.dtype = torch.bfloat16
     atom_compressed_kv_dtype: torch.dtype | None = None
     atom_compressed_layout: str = "dense"
     atom_compressed_scale_dtype: torch.dtype | None = None
@@ -495,13 +487,6 @@ class DeepseekV4AtomMLAAttentionSpec(MLAAttentionSpec):
         return super().real_page_size_bytes + (
             self.storage_block_size * self.atom_compressed_scale_bytes_per_page
         )
-
-    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        return super().max_memory_usage_bytes(vllm_config) + self.atom_swa_prefix_bytes
-
-    @property
-    def fixed_prefix_size_bytes(self) -> int:
-        return self.atom_swa_prefix_bytes
 
     @property
     def requires_strided_kv_cache_view(self) -> bool:
@@ -525,9 +510,6 @@ class DeepseekV4AtomMLAAttentionSpec(MLAAttentionSpec):
             "All attention layers in the same KV cache group must be "
             "DeepseekV4AtomMLAAttentionSpec."
         )
-        atom_swa_prefix_bytes_set = set(spec.atom_swa_prefix_bytes for spec in specs)
-        atom_swa_pages_set = set(spec.atom_swa_pages for spec in specs)
-        atom_swa_dtype_set = set(spec.atom_swa_dtype for spec in specs)
         atom_compressed_kv_dtype_set = set(
             spec.atom_compressed_kv_dtype for spec in specs
         )
@@ -539,23 +521,17 @@ class DeepseekV4AtomMLAAttentionSpec(MLAAttentionSpec):
             spec.atom_compressed_scale_bytes_per_page for spec in specs
         )
         assert (
-            len(atom_swa_prefix_bytes_set) == 1
-            and len(atom_swa_pages_set) == 1
-            and len(atom_swa_dtype_set) == 1
-            and len(atom_compressed_kv_dtype_set) == 1
+            len(atom_compressed_kv_dtype_set) == 1
             and len(atom_compressed_layout_set) == 1
             and len(atom_compressed_scale_dtype_set) == 1
             and len(atom_compressed_scale_bytes_per_page_set) == 1
         ), (
             "All DeepseekV4 ATOM MLA specs in the same KV cache group must "
-            "use the same SWA prefix and compressed-tail layout."
+            "use the same compressed-tail layout."
         )
         merged = super().merge(specs)
         return replace(
             merged,
-            atom_swa_prefix_bytes=atom_swa_prefix_bytes_set.pop(),
-            atom_swa_pages=atom_swa_pages_set.pop(),
-            atom_swa_dtype=atom_swa_dtype_set.pop(),
             atom_compressed_kv_dtype=atom_compressed_kv_dtype_set.pop(),
             atom_compressed_layout=atom_compressed_layout_set.pop(),
             atom_compressed_scale_dtype=atom_compressed_scale_dtype_set.pop(),
@@ -946,6 +922,8 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        if not self.kv_cache_specs:
+            return 0
         max_num_pages = max(
             cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
             for spec in self.kv_cache_specs.values()
@@ -1050,6 +1028,9 @@ class KVCacheTensor:
     fixed_prefix_size: int = 0  # bytes not scaled by num_blocks
     offset: int = 0  # byte offset of this layer within a contiguous block
     block_stride: int = 0  # total bytes per block in a packed layout (0 = not packed)
+    allocation_id: int | None = None  # shared layer-major backing allocation
+    allocation_size: int = 0  # backing allocation size in bytes
+    allocation_offset: int = 0  # contiguous byte-range offset in the backing
 
 
 @dataclass

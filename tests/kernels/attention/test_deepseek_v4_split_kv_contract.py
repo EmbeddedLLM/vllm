@@ -9,12 +9,24 @@ import torch
 import vllm.models.deepseek_v4.amd.rocm as rocm_module
 import vllm.models.deepseek_v4.amd.v4_kernels.paged_decode as paged_decode_module
 import vllm.models.deepseek_v4.amd.v4_kernels.paged_prefill as paged_prefill_module
+import vllm.models.deepseek_v4.amd.v4_kernels.qk_norm_rope_maybe_quant as qk_module
 from vllm.models.deepseek_v4.amd.v4_kernels import (
     sparse_attn_v4_paged_decode_split_kv,
     sparse_attn_v4_paged_prefill_split_kv,
 )
 from vllm.models.deepseek_v4.amd.v4_kernels.paged_decode import (
     sparse_attn_v4_paged_decode_split_kv_reference,
+)
+from vllm.models.deepseek_v4.amd.v4_kernels.paged_decode_indices import (
+    write_v4_paged_decode_indices_reference,
+)
+from vllm.models.deepseek_v4.amd.v4_kernels.qk_norm_rope_maybe_quant import (
+    qk_norm_rope_maybe_quant,
+    qk_norm_rope_maybe_quant_reference,
+)
+from vllm.models.deepseek_v4.amd.v4_kernels.state_writes import (
+    swa_write,
+    swa_write_reference,
 )
 
 _PACKED_TOKEN_DATA_SIZE = 576
@@ -23,72 +35,108 @@ _PACKED_NOPE_BYTES = 448
 _PACKED_ROPE_BYTES = 128
 
 
+def test_qk_norm_rope_prefers_aiter_paged_abi_when_slot_mapping_is_present(
+    monkeypatch,
+):
+    tokens, heads, dim, rope_dim, block_size = 2, 1, 512, 64, 2
+    calls = []
+
+    def fake_flydsl(q, kv, _weight, _cos, _sin, _positions, **kwargs):
+        calls.append(kwargs)
+        kwargs["q_out"].copy_(q.view(tokens, heads, dim))
+        kwargs["kv_out"].copy_(kv)
+        return kwargs["q_out"], kwargs["kv_out"], None, None
+
+    monkeypatch.setattr(qk_module, "_FLYDSL_AVAILABLE", True)
+    monkeypatch.setattr(qk_module, "_FLYDSL_HAS_PAGED_SWA", True)
+    monkeypatch.setattr(qk_module, "flydsl_qk_norm_rope_quant", fake_flydsl)
+
+    q = torch.randn(tokens, heads * dim, dtype=torch.bfloat16)
+    kv = torch.randn(tokens, dim, dtype=torch.bfloat16)
+    weight = torch.ones(dim, dtype=torch.bfloat16)
+    positions = torch.arange(tokens, dtype=torch.int64)
+    cos = torch.ones(tokens, rope_dim // 2, dtype=torch.bfloat16)
+    sin = torch.zeros_like(cos)
+    swa_kv = torch.zeros(2, block_size, dim, dtype=torch.bfloat16)
+    block_tables = torch.tensor([[1, 0]], dtype=torch.int32)
+
+    qk_module.qk_norm_rope_maybe_quant(
+        q,
+        kv,
+        weight,
+        cos,
+        sin,
+        positions,
+        heads,
+        dim,
+        rope_dim,
+        1.0e-6,
+        swa_kv=swa_kv,
+        batch_id_per_token=torch.zeros(tokens, dtype=torch.int32),
+        swa_block_tables=block_tables,
+        swa_block_size=block_size,
+        swa_slot_mapping=torch.arange(tokens, dtype=torch.int64),
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["swa_kv"].shape == (4, dim)
+    assert calls[0]["swa_kv"].is_contiguous()
+    assert calls[0]["swa_block_tables"] is block_tables
+    assert "swa_slot_mapping" not in calls[0]
+
+
 @pytest.mark.parametrize(
-    ("bound", "num_prefills", "num_decodes", "tokens", "reqs", "expected"),
+    ("tokens", "cache_shape", "cache_dtype", "expected"),
     [
-        (True, 0, 32, 32, 32, True),
-        (False, 0, 32, 32, 32, False),
-        (True, 1, 31, 32, 32, False),
-        (True, 0, 0, 0, 0, False),
-        (True, 0, 32, 64, 32, False),
+        (32, (4, 8, 512), torch.bfloat16, True),
+        (0, (4, 8, 512), torch.bfloat16, False),
+        (32, (4, 8, 512), torch.uint8, False),
+        (32, (32, 512), torch.bfloat16, False),
     ],
 )
-def test_atom_direct_swa_authority_contract(
-    bound: bool,
-    num_prefills: int,
-    num_decodes: int,
+def test_atom_paged_swa_authority_contract(
     tokens: int,
-    reqs: int,
+    cache_shape: tuple[int, ...],
+    cache_dtype: torch.dtype,
     expected: bool,
 ):
     attn = SimpleNamespace(
-        atom_direct_swa_bound=bound,
         compress_ratio=4,
         _atom_layer_id=0,
     )
-    metadata = SimpleNamespace(
-        num_prefills=num_prefills,
-        num_decodes=num_decodes,
-    )
-    state = SimpleNamespace(
-        num_actual_tokens=tokens,
-        num_actual_reqs=reqs,
-    )
+    metadata = SimpleNamespace(block_table=torch.zeros(2, 4, dtype=torch.int32))
+    state = SimpleNamespace(num_actual_tokens=tokens)
 
     assert (
-        rocm_module._atom_direct_swa_is_authoritative(
+        rocm_module._atom_paged_swa_is_authoritative(
             attn,
             metadata,
             state,
-            torch.empty(1),
+            torch.empty(cache_shape, dtype=cache_dtype),
         )
         is expected
     )
 
 
-@pytest.mark.parametrize(
-    ("direct_swa_bound", "expected_fused", "expected_native_inserts"),
-    [(True, True, 0), (False, False, 1)],
-)
-def test_atom_direct_swa_decode_write_dispatch(
-    monkeypatch,
-    direct_swa_bound: bool,
-    expected_fused: bool,
-    expected_native_inserts: int,
-):
+@pytest.mark.parametrize(("num_prefills", "expected_fused"), [(0, True), (1, False)])
+def test_atom_paged_swa_write_dispatch(monkeypatch, num_prefills, expected_fused):
     tokens, heads, dim, rope_dim = 2, 1, 4, 2
     state = SimpleNamespace(
         num_actual_tokens=tokens,
         num_actual_reqs=tokens,
-        batch_id_per_token=torch.arange(tokens, dtype=torch.int32),
+        # Full CUDA graphs can pad this metadata beyond the model input.
+        batch_id_per_token=torch.tensor([0, 1, -1, -1], dtype=torch.int32),
         state_slot_mapping=torch.arange(tokens, dtype=torch.int32),
+        query_start_loc=torch.arange(tokens + 1, dtype=torch.int32),
         win_with_spec=8,
     )
     metadata = SimpleNamespace(
-        num_prefills=0,
-        num_decodes=tokens,
+        num_prefills=num_prefills,
+        num_decodes=0 if num_prefills else tokens,
         slot_mapping=torch.arange(tokens, dtype=torch.int64),
-        block_size=128,
+        block_table=torch.tensor([[2, 0], [1, 3]], dtype=torch.int32),
+        block_size=8,
+        max_query_len=1,
     )
     attn = SimpleNamespace(
         n_local_heads=heads,
@@ -98,34 +146,24 @@ def test_atom_direct_swa_decode_write_dispatch(
         eps=1.0e-6,
         compress_ratio=4,
         _atom_layer_id=0,
-        atom_direct_swa_bound=direct_swa_bound,
-        atom_swa_kv=torch.empty(tokens, 8, dim),
         kv_norm=SimpleNamespace(
             weight=SimpleNamespace(data=torch.ones(dim)),
         ),
         swa_cache_layer=SimpleNamespace(
             prefix="swa",
-            kv_cache=torch.empty(1, 1, 584, dtype=torch.uint8),
+            kv_cache=torch.empty(4, 8, dim, dtype=torch.bfloat16),
         ),
         _atom_rotary_cos_sin=lambda dtype: (
             torch.ones(8, 1, 1, rope_dim // 2, dtype=dtype),
             torch.zeros(8, 1, 1, rope_dim // 2, dtype=dtype),
         ),
     )
-    native_insert_calls = 0
-    fused_calls = 0
-
-    def fake_fused(q, kv, *args, **kwargs):
-        nonlocal fused_calls
-        fused_calls += 1
-        return q.view(tokens, heads, dim)
+    qk_kwargs = None
 
     def fake_qk_norm(q, kv, *args, **kwargs):
+        nonlocal qk_kwargs
+        qk_kwargs = kwargs
         return q.view(tokens, heads, dim), kv, None, None
-
-    def fake_native_insert(*args, **kwargs):
-        nonlocal native_insert_calls
-        native_insert_calls += 1
 
     monkeypatch.setattr(
         rocm_module,
@@ -134,18 +172,8 @@ def test_atom_direct_swa_decode_write_dispatch(
     )
     monkeypatch.setattr(
         rocm_module,
-        "fused_reduce_qk_norm_rope_swa_write",
-        fake_fused,
-    )
-    monkeypatch.setattr(
-        rocm_module,
         "qk_norm_rope_maybe_quant",
         fake_qk_norm,
-    )
-    monkeypatch.setattr(
-        rocm_module,
-        "quantize_and_insert_k_cache",
-        fake_native_insert,
     )
 
     q = torch.randn(tokens, heads, dim)
@@ -160,10 +188,242 @@ def test_atom_direct_swa_decode_write_dispatch(
     )
 
     assert output.shape == q.shape
-    assert attn._atom_direct_swa_authoritative is direct_swa_bound
+    assert attn._atom_paged_swa_authoritative
     assert attn._atom_swa_write_fused is expected_fused
-    assert fused_calls == int(expected_fused)
-    assert native_insert_calls == expected_native_inserts
+    assert qk_kwargs is not None
+    if expected_fused:
+        assert qk_kwargs["swa_kv"] is attn.swa_cache_layer.kv_cache
+        assert qk_kwargs["swa_block_tables"] is metadata.block_table
+        assert qk_kwargs["swa_block_size"] == metadata.block_size
+        assert qk_kwargs["swa_write_per_batch"] == metadata.max_query_len
+        # The block table is authoritative for content-addressed paged SWA.
+        # Passing a direct slot mapping as well would make the local fallback
+        # bypass the paged path and would not match the newer AITER ABI.
+        assert qk_kwargs["swa_slot_mapping"] is None
+        assert torch.equal(
+            qk_kwargs["batch_id_per_token"],
+            state.batch_id_per_token[:tokens],
+        )
+    else:
+        assert qk_kwargs["swa_kv"] is None
+        assert qk_kwargs["swa_block_tables"] is None
+        assert qk_kwargs["swa_slot_mapping"] is None
+
+
+def test_paged_swa_write_reference_uses_block_table():
+    block_size, dim = 2, 4
+    kv = torch.arange(3 * dim, dtype=torch.bfloat16).view(3, dim)
+    positions = torch.tensor([0, 1, 2], dtype=torch.int64)
+    cu_seqlens = torch.tensor([0, 3], dtype=torch.int32)
+    state_slots = torch.tensor([7], dtype=torch.int32)
+    block_tables = torch.tensor([[2, 0]], dtype=torch.int32)
+    cache = torch.zeros(3, block_size, dim, dtype=torch.bfloat16)
+
+    swa_write_reference(
+        kv,
+        positions,
+        cu_seqlens,
+        state_slots,
+        cache,
+        block_size,
+        3,
+        block_tables=block_tables,
+        block_size=block_size,
+    )
+
+    torch.testing.assert_close(cache[2, 0], kv[0])
+    torch.testing.assert_close(cache[2, 1], kv[1])
+    torch.testing.assert_close(cache[0, 0], kv[2])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is None,
+    reason="ROCm GPU required for strided paged-SWA kernels",
+)
+def test_strided_paged_swa_write_and_split_attention_rocm():
+    device = "cuda"
+    torch.manual_seed(17)
+    block_size, dim = 2, 512
+    # vLLM packs layer pages into one block-strided backing allocation.
+    # Selecting one layer leaves dense token rows but a gap between blocks.
+    backing = torch.zeros((2, 2, block_size, dim), device=device, dtype=torch.bfloat16)
+    strided_swa = backing[:, 1]
+    assert not strided_swa.is_contiguous()
+    assert strided_swa.stride(1) == dim
+
+    kv = torch.randn((4, dim), device=device, dtype=torch.bfloat16) * 0.01
+    positions = torch.arange(4, device=device, dtype=torch.int64)
+    cu_seqlens = torch.tensor([0, 4], device=device, dtype=torch.int32)
+    state_slots = torch.tensor([0], device=device, dtype=torch.int32)
+    block_tables = torch.tensor([[1, 0]], device=device, dtype=torch.int32)
+    swa_write(
+        kv,
+        positions,
+        cu_seqlens,
+        state_slots,
+        strided_swa,
+        block_size,
+        4,
+        block_tables=block_tables,
+        block_size=block_size,
+    )
+    dense_swa = strided_swa.clone()
+    torch.testing.assert_close(strided_swa[1, 0], kv[0])
+    torch.testing.assert_close(strided_swa[0, 1], kv[3])
+
+    q = torch.randn((1, 2, dim), device=device, dtype=torch.bfloat16) * 0.01
+    compressed_backing = (
+        torch.randn((2, 2, 2, dim), device=device, dtype=torch.bfloat16) * 0.01
+    )
+    strided_compressed = compressed_backing[:, 1]
+    dense_compressed = strided_compressed.clone()
+    assert not strided_compressed.is_contiguous()
+    prefix_indices = torch.tensor([0, 3, 4, 5], device=device, dtype=torch.int32)
+    prefix_indptr = torch.tensor([0, 4], device=device, dtype=torch.int32)
+    attn_sink = torch.zeros((2,), device=device, dtype=torch.float32)
+
+    decode_strided = sparse_attn_v4_paged_decode_split_kv(
+        q,
+        strided_swa,
+        strided_compressed,
+        prefix_indices,
+        prefix_indptr,
+        attn_sink,
+        dim**-0.5,
+        swa_pages=4,
+        kv_splits=1,
+    )
+    decode_dense = sparse_attn_v4_paged_decode_split_kv(
+        q,
+        dense_swa,
+        dense_compressed,
+        prefix_indices,
+        prefix_indptr,
+        attn_sink,
+        dim**-0.5,
+        swa_pages=4,
+        kv_splits=1,
+    )
+
+    extend_kv = torch.randn((1, dim), device=device, dtype=torch.bfloat16) * 0.01
+    extend_indices = torch.tensor([0], device=device, dtype=torch.int32)
+    extend_indptr = torch.tensor([0, 1], device=device, dtype=torch.int32)
+    prefill_strided = sparse_attn_v4_paged_prefill_split_kv(
+        q,
+        strided_swa,
+        strided_compressed,
+        prefix_indices,
+        prefix_indptr,
+        extend_kv,
+        extend_indices,
+        extend_indptr,
+        attn_sink,
+        dim**-0.5,
+        swa_pages=4,
+    )
+    prefill_dense = sparse_attn_v4_paged_prefill_split_kv(
+        q,
+        dense_swa,
+        dense_compressed,
+        prefix_indices,
+        prefix_indptr,
+        extend_kv,
+        extend_indices,
+        extend_indptr,
+        attn_sink,
+        dim**-0.5,
+        swa_pages=4,
+    )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(decode_strided, decode_dense, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(prefill_strided, prefill_dense, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is None,
+    reason="ROCm GPU required for fused paged-SWA write",
+)
+def test_qk_norm_rope_fuses_strided_paged_swa_write_rocm():
+    device = "cuda"
+    torch.manual_seed(29)
+    tokens, heads, dim, rope_dim, block_size = 4, 1, 512, 64, 2
+    q = torch.randn(tokens, heads * dim, device=device, dtype=torch.bfloat16)
+    kv = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(dim, device=device, dtype=torch.bfloat16)
+    positions = torch.arange(tokens, device=device, dtype=torch.int64)
+    cos = torch.ones(tokens, rope_dim // 2, device=device, dtype=torch.bfloat16)
+    sin = torch.zeros_like(cos)
+
+    backing = torch.zeros((2, 3, block_size, dim), device=device, dtype=torch.bfloat16)
+    strided_swa = backing[:, 1]
+    block_tables = torch.tensor([[1, 0], [1, 0]], device=device, dtype=torch.int32)
+    batch_ids = torch.tensor([0, 0, 1, 1], device=device, dtype=torch.int32)
+    slot_mapping = torch.tensor([2, 3, 0, 1], device=device, dtype=torch.int64)
+
+    q_out, kv_out, _, _ = qk_norm_rope_maybe_quant(
+        q,
+        kv,
+        weight,
+        cos,
+        sin,
+        positions,
+        heads,
+        dim,
+        rope_dim,
+        1.0e-6,
+        swa_kv=strided_swa,
+        batch_id_per_token=batch_ids,
+        swa_block_tables=block_tables,
+        swa_block_size=block_size,
+        swa_slot_mapping=slot_mapping,
+    )
+    q_ref, kv_ref, _, _ = qk_norm_rope_maybe_quant_reference(
+        q,
+        kv,
+        weight,
+        cos,
+        sin,
+        positions,
+        heads,
+        dim,
+        rope_dim,
+        1.0e-6,
+    )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(kv_out, kv_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(strided_swa[1], kv_out[:2])
+    torch.testing.assert_close(strided_swa[0], kv_out[2:])
+
+
+def test_paged_decode_indices_reference_uses_swa_block_table():
+    positions = torch.tensor([5], dtype=torch.int64)
+    indptr = torch.tensor([0, 4], dtype=torch.int32)
+    outputs = [torch.full((4,), -1, dtype=torch.int32) for _ in range(3)]
+
+    write_v4_paged_decode_indices_reference(
+        state_slot_per_seq=torch.tensor([9], dtype=torch.int32),
+        batch_id_per_token=torch.tensor([0], dtype=torch.int32),
+        positions=positions,
+        swa_indptr=indptr,
+        csa_indptr=indptr,
+        hca_indptr=indptr,
+        swa_indices=outputs[0],
+        csa_indices=outputs[1],
+        hca_indices=outputs[2],
+        swa_block_tables=torch.tensor([[4, 1, 3]], dtype=torch.int32),
+        swa_block_size=2,
+        T=1,
+        win=4,
+        cs=4,
+        max_pages=10,
+    )
+
+    expected = torch.tensor([2, 3, 6, 7], dtype=torch.int32)
+    for output in outputs:
+        torch.testing.assert_close(output, expected)
 
 
 def _packed_block_bytes(packed_tail: torch.Tensor) -> torch.Tensor:
@@ -590,14 +850,13 @@ def test_unified_prefill_tuned_paths_match_reference_rocm(prefix_len: int):
     device = "cuda"
     torch.manual_seed(prefix_len)
     tokens, heads, dim = 2, 2, 512
-    q = torch.randn(
-        (tokens, heads, dim), device=device, dtype=torch.bfloat16
-    ) * 0.01
+    q = torch.randn((tokens, heads, dim), device=device, dtype=torch.bfloat16) * 0.01
     unified_kv = torch.randn((64, dim), device=device, dtype=torch.bfloat16) * 0.01
     extend_kv = torch.randn((4, dim), device=device, dtype=torch.bfloat16) * 0.01
-    prefix_indices = torch.arange(
-        tokens * prefix_len, device=device, dtype=torch.int32
-    ) % unified_kv.shape[0]
+    prefix_indices = (
+        torch.arange(tokens * prefix_len, device=device, dtype=torch.int32)
+        % unified_kv.shape[0]
+    )
     prefix_indptr = torch.arange(
         0,
         (tokens + 1) * prefix_len,

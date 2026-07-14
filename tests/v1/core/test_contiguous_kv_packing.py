@@ -2,16 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for contiguous KV cache packing."""
 
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
+import vllm.v1.core.kv_cache_utils as kv_cache_utils
 from vllm.v1.core.kv_cache_utils import (
     _get_kv_cache_config_packed,
     get_kv_cache_config_from_groups,
 )
 from vllm.v1.kv_cache_interface import (
+    DeepseekV4AtomMLAAttentionSpec,
     FullAttentionSpec,
     KVCacheGroupSpec,
     KVCacheTensor,
@@ -19,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.worker.gpu.attn_utils import _allocate_kv_cache
 
 
 def _make_mla_spec(page_size: int, block_size: int = 256) -> MLAAttentionSpec:
@@ -86,11 +90,49 @@ def _make_groups(n_c4, n_c128, n_swa):
 def _mock_vllm_config(kv_connector_extra_config: dict[str, str] | None = None):
     config = MagicMock()
     config.cache_config.num_gpu_blocks_override = None
+    config.cache_config.dsv4_kv_cache_layout = "packed"
     config.kv_transfer_config = None
     if kv_connector_extra_config is not None:
         config.kv_transfer_config = MagicMock()
         config.kv_transfer_config.kv_connector_extra_config = kv_connector_extra_config
     return config
+
+
+def _make_atom_groups() -> list[KVCacheGroupSpec]:
+    atom_spec = DeepseekV4AtomMLAAttentionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.bfloat16,
+        compress_ratio=4,
+        cache_dtype_str="bf16",
+        model_version="deepseek_v4",
+    )
+    swa_spec = MLAAttentionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.bfloat16,
+    )
+    return [
+        KVCacheGroupSpec(
+            ["compressed.0", "compressed.1"],
+            UniformTypeKVCacheSpecs(
+                block_size=4,
+                kv_cache_specs={
+                    "compressed.0": atom_spec,
+                    "compressed.1": atom_spec,
+                },
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["swa.0", "swa.1"],
+            UniformTypeKVCacheSpecs(
+                block_size=4,
+                kv_cache_specs={"swa.0": swa_spec, "swa.1": swa_spec},
+            ),
+        ),
+    ]
 
 
 def _run(n_c4=3, n_c128=2, n_swa=5, mem=100 * 1024 * 1024):
@@ -225,6 +267,119 @@ class TestInterleavedPacking:
             spec.page_size_bytes * 2 * 32
         )
         assert [t.block_stride for t in config.kv_cache_tensors] == [0, 0]
+
+
+class TestDeepseekV4ContiguousPools:
+    @pytest.mark.parametrize("layout", ["separate", "slab"])
+    def test_layout_preserves_capacity_and_contiguous_page_ranges(self, layout):
+        groups = _make_atom_groups()
+        config = _mock_vllm_config()
+        config.cache_config.dsv4_kv_cache_layout = layout
+        bytes_per_block = sum(
+            spec.page_size_bytes
+            for group in groups
+            for spec in group.kv_cache_spec.kv_cache_specs.values()
+        )
+        available_memory = bytes_per_block * 7
+
+        cache_config = get_kv_cache_config_from_groups(config, groups, available_memory)
+
+        assert cache_config.num_blocks == 7
+        assert sum(t.size for t in cache_config.kv_cache_tensors) == available_memory
+        assert all(t.block_stride == 0 for t in cache_config.kv_cache_tensors)
+        if layout == "separate":
+            assert all(t.allocation_id is None for t in cache_config.kv_cache_tensors)
+        else:
+            assert all(t.allocation_id == 0 for t in cache_config.kv_cache_tensors)
+            assert all(
+                t.allocation_size == available_memory
+                for t in cache_config.kv_cache_tensors
+            )
+            ranges = sorted(
+                (t.allocation_offset, t.allocation_offset + t.size)
+                for t in cache_config.kv_cache_tensors
+            )
+            assert ranges[0][0] == 0
+            assert ranges[-1][1] == available_memory
+            assert all(left[1] == right[0] for left, right in zip(ranges, ranges[1:]))
+
+    def test_auto_selects_layer_major_slab_for_paged_aiter(self, monkeypatch):
+        groups = _make_atom_groups()
+        config = _mock_vllm_config()
+        config.cache_config.dsv4_kv_cache_layout = "auto"
+        monkeypatch.setattr(kv_cache_utils, "_aiter_has_paged_swa_abi", lambda: True)
+
+        cache_config = get_kv_cache_config_from_groups(config, groups, 4096)
+
+        assert cache_config.kv_cache_tensors
+        assert all(t.allocation_id == 0 for t in cache_config.kv_cache_tensors)
+
+    def test_auto_preserves_packed_layout_without_paged_aiter(self, monkeypatch):
+        groups = _make_atom_groups()
+        config = _mock_vllm_config()
+        config.cache_config.dsv4_kv_cache_layout = "auto"
+        monkeypatch.setattr(kv_cache_utils, "_aiter_has_paged_swa_abi", lambda: False)
+
+        cache_config = get_kv_cache_config_from_groups(config, groups, 4096)
+
+        assert all(t.block_stride > 0 for t in cache_config.kv_cache_tensors)
+
+    def test_packed_override_preserves_inter_layer_stride(self):
+        groups = _make_atom_groups()
+        config = _mock_vllm_config()
+
+        cache_config = get_kv_cache_config_from_groups(config, groups, 4096)
+
+        assert all(t.block_stride > 0 for t in cache_config.kv_cache_tensors)
+        assert all(t.allocation_id is None for t in cache_config.kv_cache_tensors)
+
+    def test_slab_allocator_returns_non_overlapping_contiguous_views(self):
+        groups = _make_atom_groups()
+        config = _mock_vllm_config()
+        config.cache_config.dsv4_kv_cache_layout = "slab"
+        cache_config = get_kv_cache_config_from_groups(config, groups, 4096)
+
+        tensors = _allocate_kv_cache(cache_config, {}, torch.device("cpu"))
+        representatives = [
+            tensors[t.shared_by[0]] for t in cache_config.kv_cache_tensors
+        ]
+
+        assert all(t.is_contiguous() for t in representatives)
+        assert len({t.untyped_storage().data_ptr() for t in representatives}) == 1
+        for value, tensor in enumerate(representatives, start=1):
+            tensor.fill_(value)
+        for value, tensor in enumerate(representatives, start=1):
+            assert torch.all(tensor == value)
+
+    def test_flat_layout_removes_inter_group_page_padding(self):
+        groups = _make_atom_groups()
+        compressed_group = groups[0]
+        compressed_specs = compressed_group.kv_cache_spec.kv_cache_specs
+        for layer_name, spec in tuple(compressed_specs.items()):
+            compressed_specs[layer_name] = replace(
+                spec, page_size_padded=spec.real_page_size_bytes + 64
+            )
+        real_bytes_per_block = sum(
+            spec.real_page_size_bytes
+            for group in groups
+            for spec in group.kv_cache_spec.kv_cache_specs.values()
+        )
+        config = _mock_vllm_config()
+        config.cache_config.dsv4_kv_cache_layout = "slab"
+
+        cache_config = get_kv_cache_config_from_groups(
+            config, groups, real_bytes_per_block * 5
+        )
+
+        assert cache_config.num_blocks == 5
+        assert sum(t.size for t in cache_config.kv_cache_tensors) == (
+            real_bytes_per_block * 5
+        )
+        assert all(
+            spec.page_size_padded is None
+            for group in cache_config.kv_cache_groups
+            for spec in group.kv_cache_spec.kv_cache_specs.values()
+        )
 
 
 if __name__ == "__main__":

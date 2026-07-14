@@ -130,8 +130,6 @@ spec_args_map: dict[type[KVCacheSpec], dict[str, Any]] = {
         num_kv_heads=1,
         head_size=128,
         dtype=torch.bfloat16,
-        atom_swa_prefix_bytes=4096,
-        atom_swa_pages=4,
     ),
     HiddenStateCacheSpec: dict(
         block_size=64, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
@@ -315,7 +313,7 @@ class TestKVCacheSpecRegistry:
 
         assert not are_uniform_specs(spec, replace(spec, block_size=32))
 
-    def test_deepseek_v4_atom_fp8_ds_mla_page_size_and_prefix_memory(self):
+    def test_deepseek_v4_atom_fp8_ds_mla_page_size(self):
         spec = DeepseekV4AtomMLAAttentionSpec(
             block_size=128,
             num_kv_heads=1,
@@ -324,9 +322,6 @@ class TestKVCacheSpecRegistry:
             cache_dtype_str="fp8_ds_mla",
             compress_ratio=4,
             model_version="deepseek_v4",
-            atom_swa_prefix_bytes=4096,
-            atom_swa_pages=4,
-            atom_swa_dtype=torch.bfloat16,
             atom_compressed_kv_dtype=torch.uint8,
             atom_compressed_layout="fp8_ds_mla",
         )
@@ -341,9 +336,7 @@ class TestKVCacheSpecRegistry:
         assert spec.storage_block_size == 32
         assert spec.real_page_size_bytes == 32 * 584
         assert spec.page_size_bytes == 32 * 584
-        assert spec.max_memory_usage_bytes(vllm_config) == (
-            64 * 32 * 584 + spec.atom_swa_prefix_bytes
-        )
+        assert spec.max_memory_usage_bytes(vllm_config) == 64 * 32 * 584
 
     def test_registered_custom_spec_uses_base_uniform_rule(self):
         @register_kv_cache_spec(

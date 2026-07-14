@@ -315,9 +315,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
         if isinstance(self.speculator, DraftModelSpeculator):
-            register_atom_model = getattr(
-                self.model_state, "register_atom_model", None
-            )
+            register_atom_model = getattr(self.model_state, "register_atom_model", None)
             if register_atom_model is not None:
                 register_atom_model(self.speculator.model)
 

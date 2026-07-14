@@ -295,9 +295,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # long context and high batch sizes, so always flatten next_n > 1.
         # On other non-SM100 platforms the FP8 paged MQA logits kernel only
         # supports next_n in (1, 2), so flatten larger horizons there.
-        self.use_flattening = (
-            current_platform.is_rocm() and next_n > 1
-        ) or (
+        self.use_flattening = (current_platform.is_rocm() and next_n > 1) or (
             not current_platform.is_device_capability_family(100)
             and next_n not in (1, 2)
         )

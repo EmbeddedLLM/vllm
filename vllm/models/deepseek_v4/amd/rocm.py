@@ -7,13 +7,6 @@ from typing import cast
 import numpy as np
 import torch
 
-try:
-    from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
-        fused_reduce_qk_norm_rope_swa_write,
-    )
-except ImportError:
-    fused_reduce_qk_norm_rope_swa_write = None
-
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
@@ -90,6 +83,15 @@ def _atom_attention_enabled_for_ratio(ratio: int) -> bool:
     return ratio >= 1
 
 
+def _atom_metadata_cache_hits_allowed() -> bool:
+    # Cache hits are a Python-side launch elision. During CUDA/HIP graph
+    # capture the dummy block-table tensors can alias across cache groups even
+    # though their runtime mappings do not. Eliding a launch then permanently
+    # omits it from the captured graph, so every layer must record its metadata
+    # update while capture is active.
+    return not torch.cuda.is_current_stream_capturing()
+
+
 def _should_use_atom_split_kv_decode(
     unified_kv: torch.Tensor | None,
     split_swa_kv: torch.Tensor | None,
@@ -137,7 +139,34 @@ def _resolve_atom_kv_views(
         return cached
 
     unified_kv = getattr(attn, "atom_unified_kv", None)
-    split_swa_kv = getattr(attn, "atom_split_kv_swa", None)
+    swa_cache_layer = getattr(attn, "swa_cache_layer", None)
+    paged_swa_kv = getattr(swa_cache_layer, "kv_cache", None)
+    paged_swa_bound = (
+        isinstance(paged_swa_kv, torch.Tensor)
+        and paged_swa_kv.dtype == torch.bfloat16
+        and paged_swa_kv.numel() > 0
+    )
+    if paged_swa_bound:
+        split_swa_kv = paged_swa_kv
+        if int(getattr(attn, "compress_ratio", 1)) <= 1:
+            # ``reshape`` silently materializes a copy for vLLM's packed
+            # inter-layer layout.  Decode would then keep reading that stale
+            # snapshot while QK+RoPE updated the original paged tensor.  Only
+            # expose a flattened unified view when it really aliases storage;
+            # otherwise route the SWA-only layer through the stride-aware
+            # split-KV kernels with an empty compressed tail.
+            if paged_swa_kv.is_contiguous():
+                unified_kv = paged_swa_kv.view(-1, int(attn.head_dim))
+            else:
+                unified_kv = None
+                split_compressed_kv = paged_swa_kv.as_strided(
+                    (0, int(attn.head_dim)),
+                    (int(attn.head_dim), 1),
+                )
+        else:
+            unified_kv = None
+    else:
+        split_swa_kv = getattr(attn, "atom_split_kv_swa", None)
     split_compressed_kv = getattr(attn, "atom_split_kv_compressed", None)
     split_kv_scales = getattr(attn, "atom_split_kv_scales", None)
     split_kv_layout = getattr(attn, "atom_split_kv_layout", "dense")
@@ -150,7 +179,7 @@ def _resolve_atom_kv_views(
             split_kv_scales = buffers.compressed_kv_scales.get(layer_id)
             split_kv_layout = buffers.compressed_kv_layout.get(layer_id, "dense")
 
-        if unified_kv is None:
+        if unified_kv is None and not paged_swa_bound:
             unified_kv_by_layer = getattr(buffers, "unified_kv_by_layer", {})
             unified_kv = unified_kv_by_layer.get(layer_id)
 
@@ -184,32 +213,22 @@ def _atom_attention_enabled_for_layer(layer_id: int | None) -> bool:
     return True
 
 
-def _atom_direct_swa_is_authoritative(
+def _atom_paged_swa_is_authoritative(
     attn: object,
     swa_metadata: DeepseekSparseSWAMetadata,
     atom_state: DeepseekV4RocmAtomStateMetadata | None,
     atom_swa_kv: torch.Tensor | None,
 ) -> bool:
-    """Whether decode may omit the legacy block-table SWA cache write.
-
-    The direct ring is authoritative only for the validated non-speculative
-    pure-decode shape. Prefill and mixed batches keep the legacy write because
-    their native fallback can still consume the block-table-backed cache.
-    """
+    """Whether the vLLM-owned paged BF16 SWA cache is authoritative."""
     if atom_state is None or atom_swa_kv is None:
         return False
     return bool(
-        getattr(attn, "atom_direct_swa_bound", False)
-        and _atom_attention_enabled_for_ratio(
-            int(getattr(attn, "compress_ratio", 0))
-        )
-        and _atom_attention_enabled_for_layer(
-            getattr(attn, "_atom_layer_id", None)
-        )
-        and swa_metadata.num_prefills == 0
-        and swa_metadata.num_decodes > 0
+        atom_swa_kv.dtype == torch.bfloat16
+        and atom_swa_kv.dim() == 3
+        and _atom_attention_enabled_for_ratio(int(getattr(attn, "compress_ratio", 0)))
+        and _atom_attention_enabled_for_layer(getattr(attn, "_atom_layer_id", None))
         and atom_state.num_actual_tokens > 0
-        and atom_state.num_actual_tokens == atom_state.num_actual_reqs
+        and swa_metadata.block_table.dim() == 2
     )
 
 
@@ -502,9 +521,7 @@ def _gather_plain_k_cache_kernel(
     d_mask = d_offsets < D
 
     seq_len = tl.load(seq_lens + batch_idx)
-    gather_len = (
-        tl.load(gather_lens + batch_idx) if HAS_GATHER_LENS else seq_len
-    )
+    gather_len = tl.load(gather_lens + batch_idx) if HAS_GATHER_LENS else seq_len
     start_pos = seq_len - gather_len
 
     for i in range(token_worker, gather_len, token_workers):
@@ -961,65 +978,65 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
         q_flat = q.reshape(q.shape[0], self.n_local_heads * self.head_dim)
         atom_state = get_deepseek_v4_rocm_atom_state(swa_metadata)
-        atom_swa_kv = getattr(self, "atom_swa_kv", None)
-        direct_swa_authoritative = _atom_direct_swa_is_authoritative(
+        atom_swa_kv = self.swa_cache_layer.kv_cache
+        paged_swa_authoritative = _atom_paged_swa_is_authoritative(
             self,
             swa_metadata,
             atom_state,
             atom_swa_kv,
         )
-        self._atom_direct_swa_authoritative = direct_swa_authoritative
-        can_fuse_swa_write = (
-            fused_reduce_qk_norm_rope_swa_write is not None
-            and direct_swa_authoritative
-            and q_flat.shape[0] == atom_state.batch_id_per_token.shape[0]
+        self._atom_paged_swa_authoritative = paged_swa_authoritative
+        write_paged_swa = (
+            paged_swa_authoritative
+            and swa_metadata.num_prefills == 0
+            and swa_metadata.slot_mapping.shape[0] >= q_flat.shape[0]
         )
-        self._atom_swa_write_fused = can_fuse_swa_write
-        if can_fuse_swa_write:
-            # In the non-speculative pure-decode hot path there is one token
-            # per request, so batch_id_per_token is also the active source-row
-            # list (0..actual_tokens-1, then -1 for graph padding). The AITER
-            # kernel normalizes Q/K, applies RoPE, writes K in-place, and
-            # scatters the same row into the ModelState-owned SWA view.
-            q_out = fused_reduce_qk_norm_rope_swa_write(
-                q_flat,
-                kv,
-                None,
-                self.kv_norm.weight.data,
-                self.eps,
-                self.eps,
-                self.rope_head_dim,
-                cos_cache,
-                sin_cache,
-                positions,
-                is_neox=False,
-                write_indices=atom_state.batch_id_per_token,
-                batch_id_per_token=atom_state.batch_id_per_token,
-                state_slot_mapping=atom_state.state_slot_mapping,
-                swa_kv=atom_swa_kv,
-                win=int(atom_state.win_with_spec),
-            )
-            kv_out = kv
-        else:
-            q_out, kv_out, _, _ = qk_norm_rope_maybe_quant(
-                q_flat,
-                kv,
-                self.kv_norm.weight.data,
-                cos_cache,
-                sin_cache,
-                positions,
-                self.n_local_heads,
-                self.head_dim,
-                self.rope_head_dim,
-                self.eps,
-                quant_q=False,
-                quant_k=False,
-            )
+        self._atom_swa_write_fused = write_paged_swa
+        q_out, kv_out, _, _ = qk_norm_rope_maybe_quant(
+            q_flat,
+            kv,
+            self.kv_norm.weight.data,
+            cos_cache,
+            sin_cache,
+            positions,
+            self.n_local_heads,
+            self.head_dim,
+            self.rope_head_dim,
+            self.eps,
+            quant_q=False,
+            quant_k=False,
+            swa_kv=atom_swa_kv if write_paged_swa else None,
+            state_slot_mapping=(
+                atom_state.state_slot_mapping if write_paged_swa else None
+            ),
+            batch_id_per_token=(
+                atom_state.batch_id_per_token[: q_flat.shape[0]]
+                if write_paged_swa
+                and atom_state is not None
+                and atom_state.batch_id_per_token.shape[0] >= q_flat.shape[0]
+                else None
+            ),
+            swa_cu_seqlens_q=(atom_state.query_start_loc if write_paged_swa else None),
+            swa_cache_size=(swa_metadata.block_size if write_paged_swa else None),
+            swa_write_per_batch=(
+                swa_metadata.max_query_len if write_paged_swa else None
+            ),
+            swa_block_tables=(swa_metadata.block_table if write_paged_swa else None),
+            swa_block_size=(swa_metadata.block_size if write_paged_swa else None),
+            # Keep the block table authoritative. Passing both forms made the
+            # local fused fallback prefer ``slot_mapping`` and bypass the
+            # content-addressed path that ATOM/AITER paged SWA requires.
+            swa_slot_mapping=None,
+        )
         self._atom_last_kv = kv_out
 
-        if not direct_swa_authoritative:
+        if not write_paged_swa:
             swa_kv_cache = self.swa_cache_layer.kv_cache
-            if swa_kv_cache.dtype == torch.uint8:
+            if paged_swa_authoritative:
+                # Prefill writes after sparse attention so the current chunk
+                # cannot replace prior-window entries before they are read.
+                pass
+            elif swa_kv_cache.dtype == torch.uint8:
                 quantize_and_insert_k_cache(
                     kv_out,
                     swa_kv_cache.view(swa_kv_cache.shape[0], -1),
@@ -1127,7 +1144,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         ) or not _atom_attention_enabled_for_layer(self._atom_layer_id):
             return
         atom_state = get_deepseek_v4_rocm_atom_state(swa_metadata)
-        atom_swa_kv = getattr(self, "atom_swa_kv", None)
+        atom_swa_kv = self.swa_cache_layer.kv_cache
         kv = getattr(self, "_atom_last_kv", None)
         if atom_state is None or atom_swa_kv is None or kv is None:
             return
@@ -1136,7 +1153,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
         write_per_batch = min(
             int(getattr(swa_metadata, "max_query_len", kv.shape[0]) or kv.shape[0]),
-            int(atom_state.win_with_spec),
+            int(kv.shape[0]),
         )
         if write_per_batch <= 0:
             return
@@ -1147,8 +1164,10 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             atom_state.query_start_loc[: atom_state.num_actual_reqs + 1],
             atom_state.state_slot_mapping[: atom_state.num_actual_reqs],
             atom_swa_kv,
-            int(atom_state.win_with_spec),
+            swa_metadata.block_size,
             write_per_batch,
+            block_tables=swa_metadata.block_table,
+            block_size=swa_metadata.block_size,
         )
 
     def _forward_decode(
@@ -1174,12 +1193,6 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             output=output,
         ):
             return
-
-        if hasattr(self, "atom_vllm_unified_kv_prefix_bytes"):
-            raise RuntimeError(
-                "ROCm DeepSeek-V4 requires ATOM decode because native sparse "
-                "decode cannot consume the vLLM-owned BF16 ATOM layout."
-            )
 
         topk_indices = None
         topk_lens = None
@@ -1263,6 +1276,11 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 "ROCm DeepSeek-V4 ATOM attention requires bound unified or "
                 "split KV views."
             )
+        if split_swa_kv is not None:
+            swa_pages = split_swa_kv.numel() // self.head_dim
+        else:
+            assert unified_kv is not None
+            swa_pages = int(atom_state.swa_pages)
         # Optional bridge for a future all-FP8 ATOM unified-KV pool.  The
         # generic paged-decode wrapper can dequantize in-kernel when this scale
         # tensor is present.  The current production path leaves it unset and
@@ -1286,7 +1304,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                     kv_indptr,
                     self.attn_sink,
                     self.scale,
-                    swa_pages=int(atom_state.swa_pages),
+                    swa_pages=swa_pages,
                     compressed_kv_scales=split_kv_scales,
                     compressed_kv_layout=split_kv_layout,
                     out=output,
@@ -1329,11 +1347,17 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         csa_indices = buffers.csa_indices
         hca_indices = buffers.hca_indices
         cache = getattr(atom_state, "decode_cache", None)
+        swa_block_table = swa_metadata.block_table
         common_indices_key = (
             int(T),
             int(atom_state.decode_swa_total),
             int(atom_state.decode_csa_total),
             int(atom_state.decode_hca_total),
+            int(swa_block_table.data_ptr()),
+            int(swa_block_table.storage_offset()),
+            int(swa_block_table.stride(0)),
+            int(swa_block_table.stride(1)),
+            tuple(int(x) for x in swa_block_table.shape),
         )
 
         def ensure_decode_indices(
@@ -1342,8 +1366,11 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             hca_block_capacity: int,
         ) -> None:
             write_hca_head = hca_block_table is not None
-            common_valid = (
-                cache is not None and cache.common_indices_key == common_indices_key
+            allow_cache_hits = _atom_metadata_cache_hits_allowed()
+            common_valid = bool(
+                allow_cache_hits
+                and cache is not None
+                and cache.common_indices_key == common_indices_key
             )
             hca_key: tuple[object, ...] | None = None
             if write_hca_head:
@@ -1359,8 +1386,10 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                     int(hca_block_capacity),
                     common_indices_key,
                 )
-            hca_valid = not write_hca_head or (
-                cache is not None and cache.hca_indices_key == hca_key
+            hca_valid = not write_hca_head or bool(
+                allow_cache_hits
+                and cache is not None
+                and cache.hca_indices_key == hca_key
             )
             if common_valid and hca_valid:
                 if cache is not None:
@@ -1377,7 +1406,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                     n_committed_hca_per_seq=atom_state.n_committed_hca_per_seq,
                     hca_indices=hca_indices,
                     hca_indptr=hca_indptr,
-                    swa_pages=int(atom_state.swa_pages),
+                    swa_pages=swa_pages,
                     hca_block_capacity=hca_block_capacity,
                     T=T,
                 )
@@ -1396,15 +1425,17 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 swa_indices=swa_indices,
                 csa_indices=csa_indices,
                 hca_indices=hca_indices,
+                swa_block_tables=swa_metadata.block_table,
+                swa_block_size=swa_metadata.block_size,
                 T=T,
                 win=self.window_size,
                 cs=int(atom_state.win_with_spec),
-                max_pages=int(atom_state.swa_pages),
+                max_pages=swa_pages,
                 hca_block_table=hca_block_table,
                 hca_n_committed_per_seq=(
                     atom_state.n_committed_hca_per_seq if write_hca_head else None
                 ),
-                hca_swa_pages=int(atom_state.swa_pages),
+                hca_swa_pages=swa_pages,
                 hca_block_capacity=hca_block_capacity,
             )
             if cache is not None:
@@ -1447,7 +1478,8 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 common_indices_key,
             )
             skip_translate = (
-                bool(getattr(self, "skip_topk", False))
+                _atom_metadata_cache_hits_allowed()
+                and bool(getattr(self, "skip_topk", False))
                 and cache is not None
                 and cache.csa_translate_key == translate_key
             )
@@ -1463,7 +1495,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                     atom_state.batch_id_per_token,
                     None,
                     csa_indices,
-                    swa_pages=int(atom_state.swa_pages),
+                    swa_pages=swa_pages,
                     csa_block_capacity=csa_block_capacity,
                     window_size=self.window_size,
                 )
@@ -1482,7 +1514,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                     n_committed_hca_per_seq=atom_state.n_committed_hca_per_seq,
                     hca_indices=hca_indices,
                     hca_indptr=hca_indptr,
-                    swa_pages=int(atom_state.swa_pages),
+                    swa_pages=swa_pages,
                     hca_block_capacity=attn_metadata.block_size // self.compress_ratio,
                     T=T,
                 )
@@ -1505,7 +1537,11 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         assert buffers is not None
         cache = getattr(atom_state, "prefill_cache", None)
         cache_key = (int(T), int(token_offset), bool(swa_only))
-        if cache is not None and cache.indptr_key == cache_key:
+        if (
+            _atom_metadata_cache_hits_allowed()
+            and cache is not None
+            and cache.indptr_key == cache_key
+        ):
             cache.indptr_hits += 1
             return cache.totals
 
@@ -1555,10 +1591,11 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             ).astype(np.int32, copy=False)
 
             hca_committed = atom_state.n_committed_hca_per_seq_cpu[safe_batch]
-            hca_comp_lens = np.where(valid, hca_committed, 0).astype(
-                np.int32,
-                copy=False,
-            )
+            hca_comp_lens = np.where(
+                valid,
+                np.minimum((positions_cpu + 1) // 128, hca_committed),
+                0,
+            ).astype(np.int32, copy=False)
 
         buffers.extend_indptr_cpu[:1] = 0
         buffers.prefix_swa_indptr_cpu[:1] = 0
@@ -1676,6 +1713,10 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 "ROCm DeepSeek-V4 ATOM attention requires bound unified or "
                 "split KV views."
             )
+        if split_swa_kv is not None:
+            swa_pages = split_swa_kv.numel() // self.head_dim
+        else:
+            swa_pages = int(atom_state.swa_pages)
         if q.shape[0] == 0:
             return True
         if kv_full is None:
@@ -1717,6 +1758,11 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             int(prefix_swa_total),
             int(prefix_csa_total),
             int(prefix_hca_total),
+            int(swa_metadata.block_table.data_ptr()),
+            int(swa_metadata.block_table.storage_offset()),
+            int(swa_metadata.block_table.stride(0)),
+            int(swa_metadata.block_table.stride(1)),
+            tuple(int(x) for x in swa_metadata.block_table.shape),
         )
 
         def ensure_common_indices(
@@ -1724,8 +1770,11 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             *,
             write_hca: bool,
         ) -> None:
-            common_valid = (
-                cache is not None and cache.common_indices_key == common_indices_key
+            allow_cache_hits = _atom_metadata_cache_hits_allowed()
+            common_valid = bool(
+                allow_cache_hits
+                and cache is not None
+                and cache.common_indices_key == common_indices_key
             )
             hca_key = (
                 int(T),
@@ -1738,7 +1787,11 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 tuple(int(x) for x in block_tables.shape),
                 common_indices_key,
             )
-            hca_valid = cache is not None and cache.hca_indices_key == hca_key
+            hca_valid = bool(
+                allow_cache_hits
+                and cache is not None
+                and cache.hca_indices_key == hca_key
+            )
             if common_valid and (not write_hca or hca_valid):
                 if cache is not None:
                     cache.common_indices_hits += 1
@@ -1753,6 +1806,8 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 cu_seqlens_q_per_seq=buffers.cu_q_per_seq,
                 state_slot_per_seq=atom_state.state_slot_mapping,
                 n_committed_hca_per_seq=atom_state.n_committed_hca_per_seq,
+                swa_block_tables=swa_metadata.block_table,
+                swa_block_size=swa_metadata.block_size,
                 block_tables=block_tables,
                 extend_indptr=buffers.extend_indptr[: T + 1],
                 prefix_swa_indptr=buffers.prefix_swa_indptr[: T + 1],
@@ -1765,7 +1820,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 T=T,
                 win=self.window_size,
                 cs=int(atom_state.win_with_spec),
-                swa_pages=int(atom_state.swa_pages),
+                swa_pages=swa_pages,
                 write_hca=write_hca,
             )
             if cache is not None:
@@ -1802,7 +1857,8 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 common_indices_key,
             )
             skip_translate = (
-                bool(getattr(self, "skip_topk", False))
+                _atom_metadata_cache_hits_allowed()
+                and bool(getattr(self, "skip_topk", False))
                 and cache is not None
                 and cache.csa_translate_key == translate_key
             )
@@ -1850,7 +1906,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 buffers.extend_indptr[: T + 1],
                 self.attn_sink,
                 self.scale,
-                swa_pages=int(atom_state.swa_pages),
+                swa_pages=swa_pages,
                 compressed_kv_scales=split_kv_scales,
                 compressed_kv_layout=split_kv_layout,
                 out=output[:T],
@@ -1869,7 +1925,9 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 out=output[:T],
             )
 
-        if atom_swa_kv is not None:
+        if atom_swa_kv is not None and not getattr(
+            self, "_atom_swa_write_fused", False
+        ):
             write_per_batch = min(
                 int(getattr(swa_metadata, "max_query_len", kv_full.shape[0]) or T),
                 int(atom_state.win_with_spec),
@@ -1881,8 +1939,10 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                     atom_state.query_start_loc[: atom_state.num_actual_reqs + 1],
                     atom_state.state_slot_mapping[: atom_state.num_actual_reqs],
                     atom_swa_kv,
-                    int(atom_state.win_with_spec),
+                    swa_metadata.block_size,
                     write_per_batch,
+                    block_tables=swa_metadata.block_table,
+                    block_size=swa_metadata.block_size,
                 )
         return True
 

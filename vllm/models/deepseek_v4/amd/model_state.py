@@ -5,7 +5,7 @@
 This module deliberately lives under the ROCm DeepSeek-V4 model package rather
 than the common GPU worker.  Model runner v2 lets a model provide its own
 ``ModelState`` implementation, which is the right place for DSV4 request-lived
-state such as SWA rings and compressor state rings.
+state such as compressor state rings. SWA itself remains vLLM-paged.
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ from vllm.models.deepseek_v4.amd.v4_kernels.compress_plan import (
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import get_paged_mqa_logits_metadata, has_deep_gemm
 from vllm.utils.platform_utils import num_compute_units
-from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -89,12 +88,7 @@ class DeepseekV4RocmAtomStateBuffers:
 
 @dataclass(frozen=True)
 class DeepseekV4RocmAtomUnifiedKVBuffers:
-    """ATOM-style per-layer unified KV pools.
-
-    Each layer gets one contiguous pool.  The prefix is the persistent SWA ring
-    addressed by request state slot, and the tail is the compressed CSA/HCA
-    block cache addressed by vLLM physical block IDs.
-    """
+    """Views over vLLM-owned paged SWA and compressed KV pools."""
 
     unified_kv: tuple[torch.Tensor, ...]
     unified_kv_by_layer: dict[int, torch.Tensor]
@@ -187,7 +181,7 @@ class DeepseekV4RocmAtomPrefillCache:
         self.index_topk = int(index_topk)
         self.indptr_key: tuple[int, int, bool] | None = None
         self.totals: tuple[int, int, int, int] = (0, 0, 0, 0)
-        self.common_indices_key: tuple[int, int, int, int, int, int] | None = None
+        self.common_indices_key: tuple[Any, ...] | None = None
         self.hca_indices_key: (
             tuple[
                 int,
@@ -217,7 +211,7 @@ class DeepseekV4RocmAtomDecodeCache:
     """Mutable per-forward cache for ATOM paged-decode index buffers."""
 
     def __init__(self) -> None:
-        self.common_indices_key: tuple[int, int, int, int] | None = None
+        self.common_indices_key: tuple[Any, ...] | None = None
         self.hca_indices_key: tuple[Any, ...] | None = None
         self.csa_translate_key: tuple[Any, ...] | None = None
         self.common_indices_hits = 0
@@ -341,9 +335,8 @@ def get_deepseek_v4_rocm_atom_state(
 class DeepseekV4RocmAtomModelState(DefaultModelState):
     """ModelState carrying ATOM request-slot metadata for DSV4 on ROCm.
 
-    This first integration slice does not replace vLLM's physical KV cache
-    layout.  It establishes the request-lifetime state contract needed by the
-    ATOM SWA, compressor, and unified-KV kernels without changing GPU workers.
+    SWA and compressed token caches are vLLM-paged. Request slots are retained
+    only for compressor rolling state, which is not content-addressable.
     """
 
     def __init__(
@@ -376,7 +369,6 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         self._additional_atom_models: list[nn.Module] = []
         self._atom_state_buffers: DeepseekV4RocmAtomStateBuffers | None = None
         self._atom_unified_kv_buffers: DeepseekV4RocmAtomUnifiedKVBuffers | None = None
-        self._atom_swa_only_kv_by_layer: dict[int, torch.Tensor] = {}
         self._compress_plan_buffers = self._allocate_compress_plan_buffers()
         self._req_id_to_atom_slot: dict[str, int] = {}
 
@@ -514,20 +506,6 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
             ):
                 if score_state.numel():
                     score_state[:, req_index].fill_(-float("inf"))
-
-        unified = self._atom_unified_kv_buffers
-        zero_split_swa = self._atom_unified_kv_from_vllm_bound
-        if unified is not None:
-            start = req_index * self.win_with_spec
-            end = start + self.win_with_spec
-            for layer_kv in unified.unified_kv:
-                layer_kv[start:end].zero_()
-            zero_split_swa = zero_split_swa or not unified.unified_kv
-        if zero_split_swa:
-            for _, attn in self._iter_active_attn_modules():
-                atom_swa_kv = getattr(attn, "atom_swa_kv", None)
-                if atom_swa_kv is not None and atom_swa_kv.numel():
-                    atom_swa_kv[req_index].zero_()
 
     def _allocate_compress_plan_buffers(
         self,
@@ -790,22 +768,6 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         self._additional_atom_models.append(model)
         self._atom_state_buffers = self._allocate_atom_state_buffers()
         self._bind_atom_state_buffers(self._atom_state_buffers)
-        for layer_id, attn in self._iter_active_attn_modules():
-            if int(getattr(attn, "compress_ratio", 0)) > 1:
-                continue
-            unified = self._atom_swa_only_kv_by_layer.get(layer_id)
-            if unified is None:
-                unified = torch.zeros(
-                    (self.swa_pages, self.head_dim),
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                self._atom_swa_only_kv_by_layer[layer_id] = unified
-            attn.atom_unified_kv = unified
-            attn.atom_swa_kv = unified.view(
-                self.max_num_reqs, self.win_with_spec, self.head_dim
-            )
-            attn.atom_swa_pages = self.swa_pages
 
     def _allocate_atom_state_buffers(self) -> DeepseekV4RocmAtomStateBuffers:
         active_attn = self._iter_active_attn_modules()
@@ -905,29 +867,6 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                     inner.atom_kv_state = buffers.csa_idx_kv_state[pos]
                     inner.atom_score_state = buffers.csa_idx_score_state[pos]
 
-    def _make_storage_view(
-        self,
-        source: torch.Tensor,
-        *,
-        dtype: torch.dtype,
-        offset_bytes: int,
-        shape: tuple[int, ...],
-    ) -> torch.Tensor:
-        dtype_size = get_dtype_size(dtype)
-        if offset_bytes % dtype_size != 0:
-            raise ValueError(
-                f"Cannot view storage at byte offset {offset_bytes} as {dtype}."
-            )
-        stride = torch.empty(shape, dtype=dtype, device=source.device).stride()
-        view = torch.empty((), dtype=dtype, device=source.device)
-        view.set_(
-            source.untyped_storage(),
-            offset_bytes // dtype_size,
-            shape,
-            stride,
-        )
-        return view
-
     def _try_bind_atom_unified_kv_from_vllm(
         self,
         kv_cache_config: KVCacheConfig,
@@ -940,55 +879,7 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
             return False
 
         active_attn = self._iter_active_attn_modules()
-        atom_attn: list[tuple[int, nn.Module]] = []
-        for layer_id, attn in active_attn:
-            if int(getattr(attn, "compress_ratio", 0)) <= 1:
-                continue
-            if not hasattr(attn, "atom_vllm_unified_kv_prefix_bytes"):
-                # Ratio/layer-scoped ATOM attention keeps the native vLLM KV
-                # layout for fallback sparse-MLA layers. Only layers that
-                # emitted the ATOM spec participate in this binding path.
-                continue
-            atom_attn.append((layer_id, attn))
-            kv_cache = getattr(attn, "kv_cache", None)
-            if kv_cache is None or not isinstance(kv_cache, torch.Tensor):
-                return False
-            if kv_cache.numel() == 0:
-                return False
-            compressed_layout = getattr(attn, "atom_vllm_compressed_layout", "dense")
-            if compressed_layout == "fp8_ds_mla":
-                if (
-                    kv_cache.dtype != torch.uint8
-                    or kv_cache.dim() != 3
-                    or int(kv_cache.shape[-1]) != 584
-                ):
-                    raise RuntimeError(
-                        "ROCm DSV4 ATOM packed fp8_ds_mla KV was requested, "
-                        "but vLLM allocated an incompatible compressed tail "
-                        f"for layer {getattr(attn, 'prefix', '<unknown>')}: "
-                        f"dtype={kv_cache.dtype}, shape={tuple(kv_cache.shape)}."
-                    )
-                continue
-            if kv_cache.dtype != self.dtype and not (
-                hasattr(attn, "atom_split_kv_swa")
-                and hasattr(attn, "atom_split_kv_compressed")
-                and hasattr(attn, "atom_split_kv_scales")
-            ):
-                logger.warning_once(
-                    "ROCm DSV4 ATOM vLLM-owned mixed KV cannot bind yet: "
-                    "layer %s compressed tail dtype is %s and split KV "
-                    "views are not available. Falling back to the "
-                    "model-state side allocation.",
-                    getattr(attn, "prefix", "<unknown>"),
-                    kv_cache.dtype,
-                )
-                return False
-
-        if not atom_attn:
-            logger.warning_once(
-                "ROCm DSV4 ATOM vLLM-owned unified KV was requested, but no "
-                "compressed attention layer emitted the ATOM KV cache spec."
-            )
+        if not active_attn:
             return False
 
         unified_kv: list[torch.Tensor] = []
@@ -997,152 +888,100 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
         compressed_kv_scales: dict[int, torch.Tensor | None] = {}
         compressed_kv_layout: dict[int, str] = {}
         unified_layer_ids: list[int] = []
+        requires_contiguous_pool = bool(kv_cache_config.kv_cache_tensors) and not any(
+            tensor.block_stride > 0 for tensor in kv_cache_config.kv_cache_tensors
+        )
 
-        for layer_id, unified in self._atom_swa_only_kv_by_layer.items():
-            unified_kv.append(unified)
-            unified_kv_by_layer[layer_id] = unified
-            unified_layer_ids.append(layer_id)
-
-        for layer_id, attn in atom_attn:
+        swa_pages_by_layer: dict[int, int] = {}
+        atom_attn: list[tuple[int, nn.Module]] = []
+        for layer_id, attn in active_attn:
             ratio = int(getattr(attn, "compress_ratio", 0))
-
-            prefix_bytes = int(getattr(attn, "atom_vllm_unified_kv_prefix_bytes", 0))
-            swa_pages = int(getattr(attn, "atom_vllm_unified_kv_swa_pages", 0))
-            if prefix_bytes <= 0 or swa_pages <= 0:
+            swa_cache = getattr(
+                getattr(attn, "swa_cache_layer", None), "kv_cache", None
+            )
+            if not isinstance(swa_cache, torch.Tensor) or swa_cache.numel() == 0:
                 return False
-            k_per_block = self.k1_csa if ratio == 4 else self.k2_hca
-            kv_cache = attn.kv_cache
-            compressed_layout = getattr(attn, "atom_vllm_compressed_layout", "dense")
-            if compressed_layout == "fp8_ds_mla":
-                if (
-                    kv_cache.dtype != torch.uint8
-                    or kv_cache.dim() != 3
-                    or int(kv_cache.shape[0]) != num_blocks
-                    or int(kv_cache.shape[1]) != k_per_block
-                    or int(kv_cache.shape[2]) != 584
-                ):
-                    raise RuntimeError(
-                        "ROCm DSV4 ATOM packed fp8_ds_mla KV shape mismatch "
-                        f"for layer {getattr(attn, 'prefix', '<unknown>')}: "
-                        f"expected=({num_blocks}, {k_per_block}, 584), "
-                        f"got dtype={kv_cache.dtype}, shape={tuple(kv_cache.shape)}."
-                    )
-                storage_bytes = kv_cache.untyped_storage().nbytes()
-                expected_bytes = prefix_bytes + num_blocks * k_per_block * 584
-                if storage_bytes < expected_bytes:
-                    raise RuntimeError(
-                        "ROCm DSV4 ATOM packed fp8_ds_mla KV storage is too "
-                        f"small for layer {getattr(attn, 'prefix', '<unknown>')}: "
-                        f"storage_bytes={storage_bytes}, "
-                        f"expected_bytes={expected_bytes}, "
-                        f"swa_pages={swa_pages}, num_blocks={num_blocks}, "
-                        f"k_per_block={k_per_block}."
-                    )
-                atom_swa_dtype = getattr(
-                    attn, "atom_vllm_unified_kv_swa_dtype", self.dtype
-                )
-                swa = self._make_storage_view(
-                    kv_cache,
-                    dtype=atom_swa_dtype,
-                    offset_bytes=0,
-                    shape=(swa_pages, self.head_dim),
-                )
-                compressed = kv_cache
-                unified_layer_ids.append(layer_id)
-                compressed_kv_cache[layer_id] = compressed
-                compressed_kv_scales[layer_id] = None
-                compressed_kv_layout[layer_id] = "fp8_ds_mla"
-
-                attn.atom_swa_kv = swa.view(
-                    self.max_num_reqs, self.win_with_spec, self.head_dim
-                )
-                attn.atom_direct_swa_bound = True
-                attn.atom_swa_pages = swa_pages
-                attn.atom_compressed_kv_cache = compressed
-                attn.atom_split_kv_swa = attn.atom_swa_kv
-                attn.atom_split_kv_compressed = compressed
-                attn.atom_split_kv_scales = None
-                attn.atom_split_kv_layout = "fp8_ds_mla"
-                if hasattr(attn, "atom_unified_kv"):
-                    delattr(attn, "atom_unified_kv")
-                compressor = getattr(attn, "compressor", None)
-                if compressor is not None:
-                    compressor.atom_kv_cache = compressed
-                    compressor.atom_kv_scales = None
-                    compressor.atom_kv_layout = "fp8_ds_mla"
-                continue
-
-            if kv_cache.dtype != self.dtype:
-                compressed = getattr(attn, "atom_split_kv_compressed", None)
-                if compressed is None:
-                    return False
-                compressed_kv_cache[layer_id] = compressed
-                compressed_kv_scales[layer_id] = getattr(
-                    attn, "atom_split_kv_scales", None
-                )
-                compressed_kv_layout[layer_id] = getattr(
-                    attn, "atom_split_kv_layout", "dense"
-                )
-                unified_layer_ids.append(layer_id)
-                attn.atom_swa_pages = swa_pages
-                attn.atom_compressed_kv_cache = compressed
-                compressor = getattr(attn, "compressor", None)
-                if compressor is not None:
-                    compressor.atom_kv_cache = compressed
-                    compressor.atom_kv_scales = getattr(
-                        attn, "atom_split_kv_scales", None
-                    )
-                    compressor.atom_kv_layout = getattr(
-                        attn, "atom_split_kv_layout", "dense"
-                    )
-                continue
-
-            total_pages = swa_pages + num_blocks * k_per_block
-            expected_bytes = total_pages * self.head_dim * get_dtype_size(self.dtype)
-            storage_bytes = kv_cache.untyped_storage().nbytes()
-            if storage_bytes < expected_bytes:
+            if (
+                swa_cache.dtype != torch.bfloat16
+                or swa_cache.dim() != 3
+                or int(swa_cache.shape[-1]) != self.head_dim
+            ):
                 raise RuntimeError(
-                    "ROCm DSV4 ATOM vLLM-owned unified KV storage is too "
-                    f"small for layer {getattr(attn, 'prefix', '<unknown>')}: "
-                    f"storage_bytes={storage_bytes}, expected_bytes={expected_bytes}, "
-                    f"swa_pages={swa_pages}, num_blocks={num_blocks}, "
-                    f"k_per_block={k_per_block}, head_dim={self.head_dim}, "
-                    f"dtype={self.dtype}."
+                    "ROCm DSV4 ATOM paged SWA cache must be "
+                    f"[num_blocks, block_size, {self.head_dim}] BF16; got "
+                    f"dtype={swa_cache.dtype}, shape={tuple(swa_cache.shape)}."
                 )
-            unified = self._make_storage_view(
-                kv_cache,
-                dtype=self.dtype,
-                offset_bytes=0,
-                shape=(total_pages, self.head_dim),
-            )
-            compressed = unified[swa_pages:].view(
-                num_blocks,
-                k_per_block,
-                self.head_dim,
-            )
-            unified_kv.append(unified)
-            unified_kv_by_layer[layer_id] = unified
+            if requires_contiguous_pool and not swa_cache.is_contiguous():
+                raise RuntimeError(
+                    "ROCm DeepSeek-V4 layer-separated SWA cache must be "
+                    f"contiguous; got stride={swa_cache.stride()}."
+                )
+            swa_pages = swa_cache.numel() // self.head_dim
+            swa_pages_by_layer[layer_id] = swa_pages
+            attn.atom_swa_kv = swa_cache
+            attn.atom_split_kv_swa = swa_cache
+            attn.atom_paged_swa_bound = True
+            attn.atom_swa_pages = swa_pages
             unified_layer_ids.append(layer_id)
+
+            if ratio <= 1:
+                flat_swa = (
+                    swa_cache.view(-1, self.head_dim)
+                    if requires_contiguous_pool
+                    else swa_cache.reshape(-1, self.head_dim)
+                )
+                attn.atom_unified_kv = flat_swa
+                unified_kv.append(flat_swa)
+                unified_kv_by_layer[layer_id] = flat_swa
+                continue
+            atom_attn.append((layer_id, attn))
+            compressed = getattr(attn, "kv_cache", None)
+            if not isinstance(compressed, torch.Tensor) or compressed.numel() == 0:
+                return False
+            compressed_layout = getattr(attn, "atom_vllm_compressed_layout", "dense")
+            k_per_block = self.k1_csa if ratio == 4 else self.k2_hca
+            expected_width = 584 if compressed_layout == "fp8_ds_mla" else self.head_dim
+            if (
+                compressed.dim() != 3
+                or int(compressed.shape[0]) != num_blocks
+                or int(compressed.shape[1]) != k_per_block
+                or int(compressed.shape[2]) != expected_width
+            ):
+                raise RuntimeError(
+                    "ROCm DSV4 ATOM compressed KV shape mismatch for "
+                    f"{getattr(attn, 'prefix', '<unknown>')}: expected "
+                    f"({num_blocks}, {k_per_block}, {expected_width}), got "
+                    f"{tuple(compressed.shape)}."
+                )
+            if requires_contiguous_pool and not compressed.is_contiguous():
+                raise RuntimeError(
+                    "ROCm DeepSeek-V4 layer-separated compressed cache must "
+                    f"be contiguous; got stride={compressed.stride()}."
+                )
             compressed_kv_cache[layer_id] = compressed
             compressed_kv_scales[layer_id] = None
-            compressed_kv_layout[layer_id] = "dense"
-
-            attn.atom_unified_kv = unified
-            attn.atom_swa_kv = unified[:swa_pages].view(
-                self.max_num_reqs, self.win_with_spec, self.head_dim
-            )
-            attn.atom_direct_swa_bound = True
-            attn.atom_swa_pages = swa_pages
+            compressed_kv_layout[layer_id] = compressed_layout
+            if hasattr(attn, "atom_unified_kv"):
+                delattr(attn, "atom_unified_kv")
             attn.atom_compressed_kv_cache = compressed
-            attn.atom_split_kv_swa = attn.atom_swa_kv
             attn.atom_split_kv_compressed = compressed
             attn.atom_split_kv_scales = None
-            attn.atom_split_kv_layout = "dense"
+            attn.atom_split_kv_layout = compressed_layout
             compressor = getattr(attn, "compressor", None)
             if compressor is not None:
                 compressor.atom_kv_cache = compressed
-                compressor.atom_kv_scales = getattr(attn, "atom_split_kv_scales", None)
-                compressor.atom_kv_layout = "dense"
+                compressor.atom_kv_scales = None
+                compressor.atom_kv_layout = compressed_layout
+
+        if not atom_attn:
+            return False
+
+        if len(set(swa_pages_by_layer.values())) != 1:
+            raise RuntimeError(
+                "ROCm DSV4 ATOM SWA layers received different vLLM pool sizes: "
+                f"{swa_pages_by_layer}."
+            )
+        self.swa_pages = next(iter(swa_pages_by_layer.values()))
 
         self._atom_unified_kv_buffers = DeepseekV4RocmAtomUnifiedKVBuffers(
             unified_kv=tuple(unified_kv),
@@ -1166,7 +1005,8 @@ class DeepseekV4RocmAtomModelState(DefaultModelState):
                 layout = getattr(attn, "atom_split_kv_layout", "dense")
                 layout_counts[layout] = layout_counts.get(layout, 0) + 1
         logger.info(
-            "Bound ROCm DSV4 ATOM unified KV views from vLLM-owned KV storage: "
+            "Bound ROCm DSV4 ATOM paged SWA and compressed KV views from "
+            "vLLM-owned storage: "
             "active_layers=%d, ratio_counts=%s, num_blocks=%d, swa_pages=%d, "
             "win_with_spec=%d, head_dim=%d, dtype=%s, layout_counts=%s",
             len(unified_layer_ids),

@@ -140,7 +140,7 @@ def test_bind_kv_cache_draft_model(default_vllm_config):
     assert runner_kv_caches[3] is kv_cache["draft_model.layers.1.attn"]
 
 
-def test_representative_worker_spec_prefers_atom_mla():
+def test_representative_worker_spec_uses_first_spec_without_fixed_prefix():
     regular = MLAAttentionSpec(
         block_size=4,
         num_kv_heads=1,
@@ -152,8 +152,6 @@ def test_representative_worker_spec_prefers_atom_mla():
         num_kv_heads=1,
         head_size=8,
         dtype=torch.bfloat16,
-        atom_swa_prefix_bytes=100,
-        atom_swa_pages=5,
     )
     group_spec = UniformTypeKVCacheSpecs(
         block_size=regular.block_size,
@@ -162,9 +160,7 @@ def test_representative_worker_spec_prefers_atom_mla():
 
     representative = _representative_worker_spec(group_spec)
 
-    assert representative is atom
-    assert representative.atom_swa_prefix_bytes == atom.atom_swa_prefix_bytes
-    assert representative.atom_swa_pages == atom.atom_swa_pages
+    assert representative is regular
 
 
 def _deepseek_v4_attn_stub(
@@ -213,14 +209,12 @@ def test_deepseek_v4_kv_cache_spec_always_uses_atom_mla_on_rocm(
 
     spec = DeepseekV4Attention.get_kv_cache_spec(attn, default_vllm_config)
 
-    expected_swa_pages = default_vllm_config.scheduler_config.max_num_seqs * 128
-    expected_prefix_bytes = expected_swa_pages * attn.head_dim * torch.bfloat16.itemsize
     assert isinstance(spec, DeepseekV4AtomMLAAttentionSpec)
     assert spec.cache_dtype_str == "bf16"
     assert spec.atom_compressed_layout == "dense"
-    assert spec.atom_swa_pages == expected_swa_pages
-    assert spec.atom_swa_prefix_bytes == expected_prefix_bytes
-    assert attn.atom_vllm_unified_kv_prefix_bytes == expected_prefix_bytes
+    assert spec.atom_compressed_kv_dtype is torch.bfloat16
+    assert not hasattr(spec, "atom_swa_pages")
+    assert not hasattr(spec, "atom_swa_prefix_bytes")
 
 
 def test_deepseek_v4_vllm_owned_atom_kv_enforces_block_size(
@@ -397,8 +391,6 @@ def test_kv_block_zeroer_includes_atom_attention_specs():
         dtype=torch.uint8,
         cache_dtype_str="fp8_ds_mla",
         model_version="deepseek_v4",
-        atom_swa_prefix_bytes=1024,
-        atom_swa_pages=1,
         atom_compressed_kv_dtype=torch.uint8,
         atom_compressed_layout="fp8_ds_mla",
     )
@@ -440,8 +432,6 @@ def test_kv_block_zeroer_groups_nonuniform_atom_page_sizes():
         dtype=torch.uint8,
         cache_dtype_str="fp8_ds_mla",
         model_version="deepseek_v4",
-        atom_swa_prefix_bytes=1024,
-        atom_swa_pages=1,
         atom_compressed_kv_dtype=torch.uint8,
         atom_compressed_layout="fp8_ds_mla",
     )
@@ -490,35 +480,18 @@ def test_reshape_kv_cache_strides_atom_mixed_tail_scales():
         num_kv_heads=1,
         head_size=8,
         dtype=torch.uint8,
-        atom_swa_prefix_bytes=100,
-        atom_swa_pages=5,
         atom_compressed_kv_dtype=torch.uint8,
         atom_compressed_scale_dtype=torch.float32,
         atom_compressed_scale_bytes_per_page=16,
     )
-    raw = torch.zeros(
-        atom.atom_swa_prefix_bytes + 2 * atom.page_size_bytes,
-        dtype=torch.int8,
-    )
-    raw[atom.atom_swa_prefix_bytes + atom.page_size_bytes] = 7
+    raw = torch.zeros(2 * atom.page_size_bytes, dtype=torch.int8)
+    raw[atom.page_size_bytes] = 7
     group = AttentionGroup(
         backend=_AtomMLATestBackend,  # type: ignore[arg-type]
         layer_names=["atom"],
         kv_cache_spec=atom,
         kv_cache_group_id=0,
     )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=2,
-        kv_cache_tensors=[
-            KVCacheTensor(
-                size=raw.numel(),
-                shared_by=["atom"],
-                fixed_prefix_size=atom.atom_swa_prefix_bytes,
-            )
-        ],
-        kv_cache_groups=[],
-    )
-
     kv_caches = _reshape_kv_cache(
         [group],
         {"atom": raw},
@@ -529,14 +502,11 @@ def test_reshape_kv_cache_strides_atom_mixed_tail_scales():
 
     kv_cache = kv_caches["atom"]
     assert kv_cache.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
-    assert kv_cache.storage_offset() == atom.atom_swa_prefix_bytes
+    assert kv_cache.storage_offset() == 0
     assert kv_cache.shape == (2, 4, 8)
     assert kv_cache.stride(0) == atom.page_size_bytes
     assert kv_cache.stride(1) == 8 + atom.atom_compressed_scale_bytes_per_page
     assert int(kv_cache[1, 0, 0]) == 7
-    assert kv_cache_config.kv_cache_tensors[0].fixed_prefix_size == (
-        atom.atom_swa_prefix_bytes
-    )
 
 
 def test_reshape_kv_cache_atom_packed_fp8_tail_keeps_584_byte_slots():
@@ -548,17 +518,11 @@ def test_reshape_kv_cache_atom_packed_fp8_tail_keeps_584_byte_slots():
         compress_ratio=4,
         cache_dtype_str="fp8_ds_mla",
         model_version="deepseek_v4",
-        atom_swa_prefix_bytes=128,
-        atom_swa_pages=1,
         atom_compressed_kv_dtype=torch.uint8,
         atom_compressed_layout="fp8_ds_mla",
     )
-    raw = torch.zeros(
-        atom.atom_swa_prefix_bytes + 3 * atom.page_size_bytes,
-        dtype=torch.int8,
-    )
-    first_tail_byte = atom.atom_swa_prefix_bytes + atom.page_size_bytes
-    raw[first_tail_byte] = 11
+    raw = torch.zeros(3 * atom.page_size_bytes, dtype=torch.int8)
+    raw[atom.page_size_bytes] = 11
     group = AttentionGroup(
         backend=_AtomPackedMLATestBackend,  # type: ignore[arg-type]
         layer_names=["atom"],
@@ -576,7 +540,7 @@ def test_reshape_kv_cache_atom_packed_fp8_tail_keeps_584_byte_slots():
 
     kv_cache = kv_caches["atom"]
     assert kv_cache.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
-    assert kv_cache.storage_offset() == atom.atom_swa_prefix_bytes
+    assert kv_cache.storage_offset() == 0
     assert atom.real_page_size_bytes == atom.storage_block_size * 584
     assert kv_cache.shape == (3, atom.storage_block_size, 584)
     assert kv_cache.dtype == torch.uint8
@@ -591,13 +555,7 @@ def test_deepseek_v4_post_bind_stays_noop_off_rocm(monkeypatch):
     monkeypatch.setattr(attention_mod.current_platform, "is_rocm", lambda: False)
     attn = SimpleNamespace(
         compress_ratio=4,
-        atom_vllm_unified_kv_prefix_bytes=1024,
-        atom_vllm_unified_kv_swa_pages=1,
-        atom_vllm_unified_kv_swa_dtype=torch.bfloat16,
         atom_vllm_compressed_layout="fp8_ds_mla",
-        kv_cache_torch_dtype=torch.bfloat16,
-        head_dim=512,
-        max_num_reqs=1,
         prefix="layers.0.attn",
         compressor=None,
     )
@@ -616,13 +574,7 @@ def test_deepseek_v4_post_bind_stays_noop_for_swa_layer(monkeypatch):
     monkeypatch.setattr(attention_mod.current_platform, "is_rocm", lambda: True)
     attn = SimpleNamespace(
         compress_ratio=1,
-        atom_vllm_unified_kv_prefix_bytes=1024,
-        atom_vllm_unified_kv_swa_pages=1,
-        atom_vllm_unified_kv_swa_dtype=torch.bfloat16,
         atom_vllm_compressed_layout="fp8_ds_mla",
-        kv_cache_torch_dtype=torch.bfloat16,
-        head_dim=512,
-        max_num_reqs=1,
         prefix="layers.0.attn",
         compressor=None,
     )
@@ -634,59 +586,30 @@ def test_deepseek_v4_post_bind_stays_noop_for_swa_layer(monkeypatch):
     assert not hasattr(attn, "atom_unified_kv")
 
 
-def test_deepseek_v4_post_bind_exposes_mixed_atom_split_views(monkeypatch):
+def test_deepseek_v4_post_bind_exposes_dense_compressed_view(monkeypatch):
     from vllm.models.deepseek_v4 import attention as attention_mod
     from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 
     monkeypatch.setattr(attention_mod.current_platform, "is_rocm", lambda: True)
 
-    head_dim = 64
-    swa_pages = 1
-    prefix_bytes = swa_pages * head_dim * torch.bfloat16.itemsize
-    num_blocks = 2
-    k_per_block = 4
-    scale_bytes = torch.float32.itemsize
-    row_bytes = head_dim * torch.float8_e4m3fnuz.itemsize
-    tail_pages = num_blocks * k_per_block
-    raw = torch.zeros(
-        prefix_bytes + tail_pages * (row_bytes + scale_bytes), dtype=torch.int8
-    )
-    raw.view(torch.float32)[(prefix_bytes + row_bytes) // torch.float32.itemsize] = 3.5
-    tail = torch.as_strided(
-        raw[prefix_bytes:].view(torch.float8_e4m3fnuz),
-        size=(num_blocks, k_per_block, head_dim),
-        stride=(k_per_block * (row_bytes + scale_bytes), row_bytes + scale_bytes, 1),
-    )
+    tail = torch.zeros((2, 4, 64), dtype=torch.bfloat16)
     compressor = SimpleNamespace()
     attn = SimpleNamespace(
         compress_ratio=4,
-        atom_vllm_unified_kv_prefix_bytes=prefix_bytes,
-        atom_vllm_unified_kv_swa_pages=swa_pages,
-        atom_vllm_unified_kv_swa_dtype=torch.bfloat16,
-        atom_vllm_compressed_scale_bytes_per_page=scale_bytes,
-        kv_cache_torch_dtype=torch.bfloat16,
-        head_dim=head_dim,
-        max_num_reqs=1,
+        atom_vllm_compressed_layout="dense",
         prefix="layers.0.attn",
         compressor=compressor,
     )
 
     DeepseekV4Attention.post_bind_kv_cache(attn, tail)
 
-    assert attn.atom_swa_kv.shape == (1, 1, head_dim)
-    assert attn.atom_swa_kv.dtype is torch.bfloat16
     assert attn.atom_split_kv_compressed is tail
     assert attn.atom_split_kv_layout == "dense"
-    assert attn.atom_split_kv_scales.shape == (tail_pages, 1)
-    assert attn.atom_split_kv_scales.stride() == (
-        (row_bytes + scale_bytes) // torch.float32.itemsize,
-        1,
-    )
-    assert float(attn.atom_split_kv_scales[0, 0]) == 3.5
+    assert attn.atom_split_kv_scales is None
     assert compressor.atom_kv_cache is tail
-    assert compressor.atom_kv_scales is attn.atom_split_kv_scales
+    assert compressor.atom_kv_scales is None
     assert compressor.atom_kv_layout == "dense"
-    assert not hasattr(attn, "atom_unified_kv")
+    assert not hasattr(attn, "atom_swa_kv")
 
 
 def test_deepseek_v4_post_bind_rejects_unknown_atom_layout(monkeypatch):
@@ -696,14 +619,7 @@ def test_deepseek_v4_post_bind_rejects_unknown_atom_layout(monkeypatch):
     monkeypatch.setattr(attention_mod.current_platform, "is_rocm", lambda: True)
     attn = SimpleNamespace(
         compress_ratio=4,
-        atom_vllm_unified_kv_prefix_bytes=128,
-        atom_vllm_unified_kv_swa_pages=1,
-        atom_vllm_unified_kv_swa_dtype=torch.bfloat16,
         atom_vllm_compressed_layout="unexpected",
-        atom_vllm_compressed_scale_bytes_per_page=0,
-        kv_cache_torch_dtype=torch.bfloat16,
-        head_dim=64,
-        max_num_reqs=1,
         prefix="layers.0.attn",
         compressor=None,
     )
@@ -718,61 +634,57 @@ def test_deepseek_v4_post_bind_exposes_packed_atom_split_view(monkeypatch):
 
     monkeypatch.setattr(attention_mod.current_platform, "is_rocm", lambda: True)
 
-    head_dim = 512
-    swa_pages = 1
-    prefix_bytes = swa_pages * head_dim * torch.bfloat16.itemsize
-    num_blocks = 2
-    k_per_block = 4
-    tail_pages = num_blocks * k_per_block
-    raw = torch.zeros(prefix_bytes + tail_pages * 584, dtype=torch.uint8)
-    raw[prefix_bytes] = 13
-    tail = raw[prefix_bytes:].view(num_blocks, k_per_block, 584)
+    tail = torch.zeros((2, 4, 584), dtype=torch.uint8)
     attn = SimpleNamespace(
         compress_ratio=4,
-        atom_vllm_unified_kv_prefix_bytes=prefix_bytes,
-        atom_vllm_unified_kv_swa_pages=swa_pages,
-        atom_vllm_unified_kv_swa_dtype=torch.bfloat16,
-        atom_vllm_compressed_scale_bytes_per_page=0,
         atom_vllm_compressed_layout="fp8_ds_mla",
-        kv_cache_torch_dtype=torch.bfloat16,
-        head_dim=head_dim,
-        max_num_reqs=1,
         prefix="layers.0.attn",
         compressor=None,
     )
 
     DeepseekV4Attention.post_bind_kv_cache(attn, tail)
 
-    assert attn.atom_swa_kv.shape == (1, 1, head_dim)
     assert attn.atom_split_kv_compressed is tail
     assert attn.atom_split_kv_layout == "fp8_ds_mla"
     assert attn.atom_split_kv_scales is None
-    assert not hasattr(attn, "atom_unified_kv")
+    assert not hasattr(attn, "atom_swa_kv")
 
 
-def test_deepseek_v4_model_state_binds_packed_vllm_owned_kv():
+def test_deepseek_v4_model_state_binds_strided_packed_vllm_owned_kv():
     from vllm.models.deepseek_v4.amd.model_state import (
         DeepseekV4RocmAtomModelState,
         DeepseekV4RocmAtomUnifiedKVBuffers,
     )
 
-    head_dim = 512
-    swa_pages = 1
-    prefix_bytes = swa_pages * head_dim * torch.bfloat16.itemsize
+    head_dim = 64
     num_blocks = 2
+    swa_block_size = 2
+    swa_pages = num_blocks * swa_block_size
     k_per_block = 4
-    raw = torch.zeros(prefix_bytes + num_blocks * k_per_block * 584, dtype=torch.uint8)
-    raw.view(torch.bfloat16)[0] = 7
-    raw[prefix_bytes] = 13
-    tail = raw[prefix_bytes:].view(num_blocks, k_per_block, 584)
+    swa_backing = torch.zeros(
+        (num_blocks, 2 * swa_block_size, head_dim), dtype=torch.bfloat16
+    )
+    swa = torch.as_strided(
+        swa_backing,
+        size=(num_blocks, swa_block_size, head_dim),
+        stride=(2 * swa_block_size * head_dim, head_dim, 1),
+    )
+    compressed_backing = torch.zeros(
+        (num_blocks, 2 * k_per_block, head_dim), dtype=torch.bfloat16
+    )
+    tail = torch.as_strided(
+        compressed_backing,
+        size=(num_blocks, k_per_block, head_dim),
+        stride=(2 * k_per_block * head_dim, head_dim, 1),
+    )
+    swa[0, 0, 0] = 7
+    tail[0, 0, 0] = 13
     compressor = SimpleNamespace()
     attn = SimpleNamespace(
         compress_ratio=4,
         kv_cache=tail,
-        atom_vllm_unified_kv_prefix_bytes=prefix_bytes,
-        atom_vllm_unified_kv_swa_pages=swa_pages,
-        atom_vllm_unified_kv_swa_dtype=torch.bfloat16,
-        atom_vllm_compressed_layout="fp8_ds_mla",
+        swa_cache_layer=SimpleNamespace(kv_cache=swa),
+        atom_vllm_compressed_layout="dense",
         prefix="layers.0.attn",
         compressor=compressor,
     )
@@ -791,7 +703,18 @@ def test_deepseek_v4_model_state_binds_packed_vllm_owned_kv():
     state._iter_active_attn_modules = lambda: [(0, attn)]
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
-        kv_cache_tensors=[],
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=swa.numel() * swa.element_size(),
+                shared_by=["swa"],
+                block_stride=2 * swa_block_size * head_dim * swa.element_size(),
+            ),
+            KVCacheTensor(
+                size=tail.numel() * tail.element_size(),
+                shared_by=["compressed"],
+                block_stride=2 * k_per_block * head_dim * tail.element_size(),
+            ),
+        ],
         kv_cache_groups=[],
     )
 
@@ -804,27 +727,24 @@ def test_deepseek_v4_model_state_binds_packed_vllm_owned_kv():
     assert buffers.unified_kv_by_layer == {}
     assert buffers.compressed_kv_cache[0] is tail
     assert buffers.compressed_kv_scales[0] is None
-    assert buffers.compressed_kv_layout[0] == "fp8_ds_mla"
+    assert buffers.compressed_kv_layout[0] == "dense"
     assert state._atom_unified_kv_from_vllm_bound
-    assert attn.atom_swa_kv.shape == (1, 1, head_dim)
-    assert attn.atom_swa_kv.dtype is torch.bfloat16
+    assert attn.atom_swa_kv is swa
+    assert not attn.atom_swa_kv.is_contiguous()
     assert float(attn.atom_swa_kv[0, 0, 0]) == 7
     assert attn.atom_split_kv_compressed is tail
-    assert attn.atom_split_kv_layout == "fp8_ds_mla"
+    assert not attn.atom_split_kv_compressed.is_contiguous()
+    assert attn.atom_split_kv_layout == "dense"
     assert attn.atom_split_kv_scales is None
     assert attn.atom_compressed_kv_cache is tail
     assert compressor.atom_kv_cache is tail
     assert compressor.atom_kv_scales is None
-    assert compressor.atom_kv_layout == "fp8_ds_mla"
+    assert compressor.atom_kv_layout == "dense"
     assert not hasattr(attn, "atom_unified_kv")
-
-    state._reset_atom_request_slot(0)
-
-    assert float(attn.atom_swa_kv[0, 0, 0]) == 0
-    assert int(raw[prefix_bytes]) == 13
+    assert float(tail[0, 0, 0]) == 13
 
 
-def test_deepseek_v4_model_state_binds_sidecar_vllm_owned_kv(monkeypatch):
+def test_deepseek_v4_model_state_binds_contiguous_vllm_owned_kv(monkeypatch):
     from vllm.models.deepseek_v4 import attention as attention_mod
     from vllm.models.deepseek_v4.amd.model_state import (
         DeepseekV4RocmAtomModelState,
@@ -835,32 +755,19 @@ def test_deepseek_v4_model_state_binds_sidecar_vllm_owned_kv(monkeypatch):
     monkeypatch.setattr(attention_mod.current_platform, "is_rocm", lambda: True)
 
     head_dim = 64
-    swa_pages = 1
-    prefix_bytes = swa_pages * head_dim * torch.bfloat16.itemsize
     num_blocks = 2
+    swa_block_size = 2
+    swa_pages = num_blocks * swa_block_size
     k_per_block = 4
-    scale_bytes = torch.float32.itemsize
-    row_bytes = head_dim * torch.float8_e4m3fnuz.itemsize
-    tail_pages = num_blocks * k_per_block
-    raw = torch.zeros(
-        prefix_bytes + tail_pages * (row_bytes + scale_bytes),
-        dtype=torch.int8,
-    )
-    raw.view(torch.bfloat16)[0] = 7
-    raw.view(torch.float32)[(prefix_bytes + row_bytes) // torch.float32.itemsize] = 3.5
-    tail = torch.as_strided(
-        raw[prefix_bytes:].view(torch.float8_e4m3fnuz),
-        size=(num_blocks, k_per_block, head_dim),
-        stride=(k_per_block * (row_bytes + scale_bytes), row_bytes + scale_bytes, 1),
-    )
+    swa = torch.zeros(num_blocks, swa_block_size, head_dim, dtype=torch.bfloat16)
+    swa[0, 0, 0] = 7
+    tail = torch.zeros(num_blocks, k_per_block, head_dim, dtype=torch.bfloat16)
     compressor = SimpleNamespace()
     attn = SimpleNamespace(
         compress_ratio=4,
         kv_cache=tail,
-        atom_vllm_unified_kv_prefix_bytes=prefix_bytes,
-        atom_vllm_unified_kv_swa_pages=swa_pages,
-        atom_vllm_unified_kv_swa_dtype=torch.bfloat16,
-        atom_vllm_compressed_scale_bytes_per_page=scale_bytes,
+        swa_cache_layer=SimpleNamespace(kv_cache=swa),
+        atom_vllm_compressed_layout="dense",
         kv_cache_torch_dtype=torch.bfloat16,
         head_dim=head_dim,
         max_num_reqs=1,
@@ -883,7 +790,12 @@ def test_deepseek_v4_model_state_binds_sidecar_vllm_owned_kv(monkeypatch):
     state._iter_active_attn_modules = lambda: [(0, attn)]
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
-        kv_cache_tensors=[],
+        kv_cache_tensors=[
+            KVCacheTensor(size=swa.numel() * swa.element_size(), shared_by=["swa"]),
+            KVCacheTensor(
+                size=tail.numel() * tail.element_size(), shared_by=["compressed"]
+            ),
+        ],
         kv_cache_groups=[],
     )
 
@@ -900,7 +812,7 @@ def test_deepseek_v4_model_state_binds_sidecar_vllm_owned_kv(monkeypatch):
     assert attn.atom_compressed_kv_cache is tail
     assert attn.atom_split_kv_layout == "dense"
     assert float(attn.atom_swa_kv[0, 0, 0]) == 7
-    assert float(buffers.compressed_kv_scales[0][0, 0]) == 3.5
+    assert buffers.compressed_kv_scales[0] is None
     assert compressor.atom_kv_cache is tail
     assert compressor.atom_kv_scales is attn.atom_split_kv_scales
     assert compressor.atom_kv_layout == "dense"

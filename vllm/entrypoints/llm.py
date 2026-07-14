@@ -19,6 +19,7 @@ from vllm.config import (
     StructuredOutputsConfig,
     is_init_field,
 )
+from vllm.config.cache import DeepseekV4KVCacheLayout
 from vllm.config.compilation import CompilationMode
 from vllm.config.model import (
     ConvertOption,
@@ -211,6 +212,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         profiler_config: dict[str, Any] | ProfilerConfig | None = None,
         attention_config: dict[str, Any] | AttentionConfig | None = None,
         kv_cache_memory_bytes: int | None = None,
+        dsv4_kv_cache_layout: DeepseekV4KVCacheLayout = "packed",
         compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
         quantization_config: dict[str, Any] | QuantizationConfigArgs | None = None,
         logits_processors: list[str | type[LogitsProcessor]] | None = None,
@@ -320,6 +322,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             seed=seed,
             gpu_memory_utilization=gpu_memory_utilization,
             kv_cache_memory_bytes=kv_cache_memory_bytes,
+            dsv4_kv_cache_layout=dsv4_kv_cache_layout,
             cpu_offload_gb=cpu_offload_gb,
             offload_group_size=offload_group_size,
             offload_num_in_group=offload_num_in_group,

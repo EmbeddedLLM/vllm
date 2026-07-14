@@ -75,6 +75,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         dtype: torch.dtype,
         prefix: str,
         cache_config: CacheConfig,
+        cache_dtype_str: str | None = None,
     ):
         super().__init__()
         self.kv_cache = torch.tensor([])
@@ -83,6 +84,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
+        self.cache_dtype_str = cache_dtype_str or cache_config.cache_dtype
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -104,14 +106,14 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # FlashMLA's UE8M0 paged layout needs 576B alignment; FlashInfer's
         # contiguous bf16/fp8 cache uses the natural element-size page.
-        is_flashmla = self.cache_config.cache_dtype == "fp8_ds_mla"
+        is_flashmla = self.cache_dtype_str == "fp8_ds_mla"
         return SlidingWindowMLASpec(
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
             sliding_window=self.window_size,
-            cache_dtype_str=self.cache_config.cache_dtype,
+            cache_dtype_str=self.cache_dtype_str,
             alignment=576 if is_flashmla else None,
             model_version="deepseek_v4",
         )
@@ -193,6 +195,7 @@ class DeepseekSparseSWAMetadata:
     num_prefills: int = 0
     num_decode_tokens: int = 0
     num_prefill_tokens: int = 0
+    max_query_len: int = 0
 
     # Pre-computed prefill metadata shared across all DeepseekV4 attention layers.
     prefill_seq_lens: torch.Tensor | None = None
@@ -325,6 +328,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # NOTE: Ensure all metadata tensors maintain fixed memory addresses
         # for CUDA graph compatibility.
         query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        max_query_len = int(query_lens.max().item()) if num_reqs else 0
         x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
         token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
         token_to_req_indices.copy_(x, non_blocking=True)
@@ -389,6 +393,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             num_prefills=num_prefills,
             num_decode_tokens=num_decode_tokens,
             num_prefill_tokens=num_prefill_tokens,
+            max_query_len=max_query_len,
             tile_sched_swaonly=tile_sched[_LAYER_TYPE_SWAONLY],
             tile_sched_c4a=tile_sched[_LAYER_TYPE_C4A],
             tile_sched_c128a=tile_sched[_LAYER_TYPE_C128A],
