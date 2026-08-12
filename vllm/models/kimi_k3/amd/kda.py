@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
+from collections.abc import Callable
+
 import torch
 from einops import rearrange
 from torch import nn
@@ -36,8 +39,15 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
 )
-from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    sharded_weight_loader,
+)
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.models.kimi_k3.amd.ops.kda_flydsl import (
+    is_supported as is_flydsl_decode_supported,
+    kda_flydsl_decode,
+)
 from vllm.models.kimi_k3.amd.ops.third_party.kda import (
     chunk_kda_with_fused_gate,
     fused_recurrent_kda,
@@ -46,6 +56,17 @@ from vllm.models.kimi_k3.amd.ops.third_party.kda import (
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+
+def _make_decode_norm_weight_loader(
+    decode_norm_weight: torch.Tensor,
+) -> Callable[..., None]:
+    def weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        default_weight_loader(param, loaded_weight)
+        if not param.is_meta:
+            decode_norm_weight.copy_(param.data)
+
+    return weight_loader
 
 
 class KimiK3DeltaAttention(GatedDeltaNetAttention):
@@ -175,6 +196,20 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         )
 
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
+        decode_norm_weight = torch.empty(
+            self.head_dim,
+            dtype=torch.float32,
+            device=self.o_norm.weight.device,
+        )
+        self.register_buffer(
+            "decode_norm_weight", decode_norm_weight, persistent=False
+        )
+        if hasattr(self.o_norm.weight, "weight_loader"):
+            delattr(self.o_norm.weight, "weight_loader")
+        set_weight_attrs(
+            self.o_norm.weight,
+            {"weight_loader": _make_decode_norm_weight_loader(decode_norm_weight)},
+        )
         self.o_proj = RowParallelLinear(
             self.projection_size,
             self.hidden_size,
@@ -482,33 +517,72 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 decode_conv_indices = non_spec_state_indices_tensor[
                     : mixed_qkv_ns.size(0)
                 ]
-                # Sibling beta and, for full-rank gates, output-gate views
-                # remain live, so write the conv output separately.
-                packed_conv_out = torch.empty(
-                    mixed_qkv_ns.shape,
-                    dtype=mixed_qkv_ns.dtype,
-                    device=mixed_qkv_ns.device,
-                )
-                mixed_qkv_ns = causal_conv1d_update(
+                num_decode_tokens = mixed_qkv_ns.size(0)
+                decode_output_gate = g2[:num_decode_tokens]
+                decode_output = core_attn_out[:, :num_decode_tokens]
+                use_flydsl_decode = is_flydsl_decode_supported(
                     mixed_qkv_ns,
                     conv_state,
-                    conv_weights,
-                    self.conv1d.bias,
-                    activation="silu",
-                    conv_state_indices=decode_conv_indices,
-                    validate_data=True,
-                    out=packed_conv_out,
+                    g1_ns,
+                    beta_ns,
+                    decode_output_gate,
+                    recurrent_state,
+                    self.head_dim,
+                    self.conv_size,
+                    spec_sequence_masks is not None,
+                    m.num_decodes,
                 )
-                core_attn_out_non_spec, _ = fused_recurrent_kda_packed_decode(
-                    mixed_qkv=mixed_qkv_ns,
-                    raw_g=g1_ns,
-                    raw_beta=beta_ns,
-                    A_log=self.A_log,
-                    dt_bias=self.dt_bias,
-                    lower_bound=self.gate_lower_bound,
-                    initial_state=recurrent_state,
-                    state_indices=decode_conv_indices,
-                )
+                if use_flydsl_decode:
+                    lower_bound = (
+                        0.0
+                        if self.gate_lower_bound is None
+                        else self.gate_lower_bound
+                    )
+                    kda_flydsl_decode(
+                        mixed_qkv_ns,
+                        conv_weights,
+                        conv_state,
+                        g1_ns,
+                        beta_ns,
+                        decode_output_gate,
+                        self.decode_norm_weight,
+                        self.A_log,
+                        self.dt_bias,
+                        decode_conv_indices,
+                        recurrent_state,
+                        decode_output,
+                        1.0 / math.sqrt(self.head_dim),
+                        self.o_norm.eps,
+                        lower_bound,
+                        self.gate_lower_bound is not None,
+                    )
+                    return
+                else:
+                    packed_conv_out = torch.empty(
+                        mixed_qkv_ns.shape,
+                        dtype=mixed_qkv_ns.dtype,
+                        device=mixed_qkv_ns.device,
+                    )
+                    mixed_qkv_ns = causal_conv1d_update(
+                        mixed_qkv_ns,
+                        conv_state,
+                        conv_weights,
+                        self.conv1d.bias,
+                        activation="silu",
+                        conv_state_indices=decode_conv_indices,
+                        validate_data=True,
+                        out=packed_conv_out,
+                    )
+                    core_attn_out_non_spec, _ = fused_recurrent_kda_packed_decode(
+                        mixed_qkv=mixed_qkv_ns,
+                        raw_g=g1_ns,
+                        raw_beta=beta_ns,
+                        A_log=self.A_log,
+                        dt_bias=self.dt_bias,
+                        lower_bound=self.gate_lower_bound,
+                        initial_state=recurrent_state,
+                        state_indices=decode_conv_indices,
+                    )
 
         # ---------- merge spec and non-spec outputs ----------
         if core_attn_out_spec is not None and core_attn_out_non_spec is not None:
