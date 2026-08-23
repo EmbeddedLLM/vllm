@@ -117,6 +117,140 @@ The filesystem and object-store tiers can publish hash-only `BlockStored` KV eve
 
 Set the optional `locality` tier field to `LOCAL` or `REMOTE` to describe the tier's storage location relative to the publishing vLLM instance. `LOCAL` marks storage local to that instance, while `REMOTE` marks storage that is not local to it. When the setting is omitted, locality is unspecified. vLLM does not infer it from the tier type, so an OBJ tier is not implicitly `REMOTE`. A KV event includes `locality` only when the tier explicitly configures it. This metadata describes the tier property without implying that a consumer can already route requests to its blocks.
 
+### MoRI UMBP
+
+The MoRI tier (`type: "mori"`) uses UMBP as a distributed DRAM and optional
+SSD pool. Install `amd-mori` with `BUILD_UMBP=ON`. For distributed mode, start
+the packaged master before vLLM:
+
+```bash
+umbp_master 0.0.0.0:15558
+```
+
+Then configure UMBP as a secondary tier. The CPU primary tier is registered
+once with MoRI, so batched puts and gets operate directly on its page buffers.
+
+```bash
+vllm serve <model> \
+  --kv-transfer-config '{
+    "kv_connector": "OffloadingConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+      "spec_name": "TieringOffloadingSpec",
+      "cpu_bytes_to_use": 68719476736,
+      "secondary_tiers": [{
+        "type": "mori",
+        "dram_capacity_bytes": 34359738368,
+        "master_address": "10.0.0.1:15558",
+        "node_address": "10.0.0.2",
+        "io_engine_port": 16000,
+        "peer_service_port": 17000,
+        "key_prefix": "vllm:kimi:",
+        "eviction_policy": "prefix_aware_lru"
+      }]
+    }
+  }'
+```
+
+Omit `master_address` for a standalone, node-local UMBP pool. In distributed
+mode, `node_address`, `io_engine_port`, and `peer_service_port` must be
+reachable by the other UMBP nodes. Ports must be unique for each local vLLM
+process. `dram_capacity_bytes` is required and is the capacity contributed by
+this process. Set `ssd_enabled`, `ssd_storage_dir`, and `ssd_capacity_bytes` to
+add the local SSD tier. MoRI's `MORI_UMBP_*` and `UMBP_*` environment variables
+remain available for lower-level transport and master tuning.
+
+In distributed mode, UMBP puts are admitted to a node's DRAM tier first and
+then copied asynchronously to SSD. SSD capacity does not replace DRAM admission
+capacity for a burst of new blocks. Size `dram_capacity_bytes` for the expected
+write burst and allow for the master's heartbeat interval; otherwise route-put
+requests can be rejected temporarily even while SSD has free space. Placement
+updates are also heartbeat-driven, so a request sent immediately after a put
+may precede the master's view of that block.
+
+#### Placement event feed
+
+UMBP can also index blocks that remain in vLLM-managed GPU or CPU caches. This
+is the scheduler-visible path in the UMBP architecture. Enable vLLM's ZMQ KV
+events and run the bridge before sending requests:
+
+```bash
+.venv/bin/python examples/features/kv_events/umbp_kv_event_bridge.py \
+  --endpoint tcp://127.0.0.1:5557 \
+  --topic kv-events \
+  --master-address 10.0.0.1:15558 \
+  --node-id <the-tier-node-id> \
+  --key-prefix vllm:kimi:
+```
+
+Add the publisher configuration to the vLLM command:
+
+```bash
+--kv-events-config '{
+  "enable_kv_cache_events": true,
+  "publisher": "zmq",
+  "endpoint": "tcp://*:5557",
+  "topic": "kv-events"
+}'
+```
+
+`node-id` must equal this process's UMBP tier `node_id` (or the vLLM engine ID
+when `node_id` is omitted), and `key-prefix` must equal the tier's explicit
+`key_prefix`. The bridge maps GPU events to UMBP HBM placements and CPU events
+to DRAM placements. It reference-counts repeated announcements before revoking
+a placement. Start it before vLLM traffic because this initial bridge consumes
+the live event stream and does not replay events emitted before it subscribed.
+
+Routers can use `MoriPlacementClient.match(..., count_as_hit=True)` to query
+which registered nodes hold a request's block hashes. The returned MoRI match
+objects include the node ID, peer address, and matched hashes grouped by HBM,
+DRAM, and SSD tier. Request dispatch based on those results belongs to the
+deployment's router; vLLM's in-engine scheduler does not route between server
+replicas.
+
+#### Cache-aware routing proxy
+
+The reference proxy turns those placement queries into request routing for
+text-only completions and chat completions:
+
+```bash
+.venv/bin/python examples/online_serving/umbp_cache_aware_proxy.py \
+  --model <tokenizer-or-model-path> \
+  --base-model-name <served-model-name> \
+  --master-address 10.0.0.1:15558 \
+  --key-prefix vllm:kimi: \
+  --hash-block-size 16 \
+  --group-indices 0 \
+  --replicas '[
+    {"node_id":"replica-0","url":"http://10.0.0.2:8001"},
+    {"node_id":"replica-1","url":"http://10.0.0.3:8001"}
+  ]' \
+  --port 8000
+```
+
+Each replica must use the same tokenizer, prefix-caching hash algorithm, hash
+block size, and `key_prefix` as the proxy. Its UMBP tier `node_id` must match
+the corresponding proxy entry. For a server that exposes multiple internal DP
+ranks at one URL, add a separate entry per rank with `"dp_rank": N`; the proxy
+sets `X-data-parallel-rank` on forwarded requests.
+
+The proxy computes vLLM's chained full-block hashes, queries all configured KV
+cache groups, and selects the replica with the longest consecutive cached
+prefix. HBM, DRAM, and SSD matches break equal-length ties in that order. When
+there is no placement match, it falls back to in-flight-aware round robin.
+LoRA names and `cache_salt` are included in hashes. Requests with multimodal
+message content, prompt embeddings, batched prompts, or custom server-side chat
+template behavior fall back to load-aware routing because the proxy cannot
+reconstruct their complete engine hash metadata safely.
+
+`--hash-block-size` is the engine's prefix-hash block size, not necessarily the
+offloading chunk size. `--hash-algorithm` must match
+`--prefix-caching-hash-algo` and defaults to `sha256`. For hybrid cache models,
+pass every event group index as a comma-separated list, for example
+`--group-indices 0,1`. Keep the default byte-valued KV event hashes; legacy
+integer event hashes are namespaced separately and cannot address UMBP data
+entries created from full SHA-256 hashes.
+
 ### Filesystem (FS)
 
 The filesystem tier (`type: "fs"`) writes blocks to a filesystem directory.

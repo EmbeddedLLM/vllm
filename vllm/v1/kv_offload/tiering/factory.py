@@ -123,3 +123,9 @@ SecondaryTierFactory.register_tier(
     "vllm.v1.kv_offload.tiering.obj.manager",
     "ObjectStoreSecondaryTierManager",
 )
+
+SecondaryTierFactory.register_tier(
+    "mori",
+    "vllm.v1.kv_offload.tiering.mori.manager",
+    "MoriSecondaryTierManager",
+)
