@@ -75,6 +75,12 @@ class BlockStored(KVCacheEvent):
     kv_cache_spec_sliding_window: int | None = None
     locality: str | None = None
     """LOCAL or REMOTE relative to the publisher; None means unspecified."""
+    storage_tier: str | None = None
+    """Physical tier hint such as DRAM or SSD; None means unspecified."""
+    source_node: str | None = None
+    """Node that can serve the blocks; None means the event publisher."""
+    estimated_bandwidth_bps: float | None = None
+    """Estimated read bandwidth from source_node; None means unknown."""
 
     def __hash__(self) -> int:
         return hash(
@@ -90,6 +96,9 @@ class BlockStored(KVCacheEvent):
                 self.kv_cache_spec_kind,
                 self.kv_cache_spec_sliding_window,
                 self.locality,
+                self.storage_tier,
+                self.source_node,
+                self.estimated_bandwidth_bps,
             )
         )
 
@@ -100,6 +109,10 @@ class BlockRemoved(KVCacheEvent):
     group_idx: int | None = None
     locality: str | None = None
     """LOCAL or REMOTE relative to the publisher; None means unspecified."""
+    storage_tier: str | None = None
+    """Physical tier hint such as DRAM or SSD; None means unspecified."""
+    source_node: str | None = None
+    """Node that served the blocks; None means the event publisher."""
 
     def __hash__(self) -> int:
         return hash(
@@ -108,6 +121,8 @@ class BlockRemoved(KVCacheEvent):
                 self.medium,
                 self.group_idx,
                 self.locality,
+                self.storage_tier,
+                self.source_node,
             )
         )
 

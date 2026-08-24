@@ -105,7 +105,7 @@ and explicit JSON values take precedence over environment values.
 
 - [x] vLLM can emit self-describing GPU and CPU KV events.
 - [x] UMBP bridge can register HBM/DRAM placement with the master.
-- [ ] Define event representation for UMBP DRAM and SSD location, locality,
+- [x] Define event representation for UMBP DRAM and SSD location, locality,
   source node, and estimated bandwidth.
 - [x] Confirm llm-d's precise index and scorer retain per-replica `DeviceTier`.
 - [x] Add a measured tier restore-versus-recompute scorer and compose it with
@@ -267,13 +267,21 @@ and keeps cluster policy out of the vLLM engine.
 - Confirmed the current MoRI Python boundary returns only batch success flags.
   Exact UMBP DRAM-versus-SSD attribution requires a MoRI result/metrics API
   extension; vLLM must not infer the medium from latency or SSD enablement.
+- Extended KV store/remove events with append-only physical placement hints:
+  `storage_tier`, `source_node`, and (for stores)
+  `estimated_bandwidth_bps`. `medium` continues to identify the vLLM cache
+  layer and `locality` remains relative to the publisher. The hints default to
+  unknown and preserve decoding in both directions with older schemas. They
+  must only be populated from an authoritative placement observation; MoRI's
+  master remains authoritative when blocks can migrate between DRAM and SSD.
 
 ## Open decisions
 
 1. Whether the HTTP control endpoint should remain public or move behind a
    dedicated authenticated internal listener before production enablement.
-2. Whether UMBP tier placement should enter llm-d through standard KV events,
-   a MoRI master adapter, or both with one authoritative source.
+2. Whether llm-d should consume authoritative MoRI placement by polling the
+   master, subscribing to a future placement feed, or through a sidecar that
+   emits the optional standard KV-event placement hints.
 3. How llm-d communicates a recompute-versus-restore decision without adding
    UMBP-specific fields to the OpenAI request schema.
 4. Whether SDMA loadback belongs in the generic CPU offload worker so all

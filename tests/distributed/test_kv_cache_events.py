@@ -50,6 +50,9 @@ def _make_block_stored(
     group_idx: int | None = None,
     kv_cache_spec_sliding_window: int | None = None,
     locality: str | None = None,
+    storage_tier: str | None = None,
+    source_node: str | None = None,
+    estimated_bandwidth_bps: float | None = None,
 ) -> BlockStored:
     return BlockStored(
         block_hashes=[_FAKE_HASH],
@@ -62,18 +65,25 @@ def _make_block_stored(
         group_idx=group_idx,
         kv_cache_spec_sliding_window=kv_cache_spec_sliding_window,
         locality=locality,
+        storage_tier=storage_tier,
+        source_node=source_node,
+        estimated_bandwidth_bps=estimated_bandwidth_bps,
     )
 
 
 def _make_block_removed(
     group_idx: int | None = None,
     locality: str | None = None,
+    storage_tier: str | None = None,
+    source_node: str | None = None,
 ) -> BlockRemoved:
     return BlockRemoved(
         block_hashes=[_FAKE_HASH],
         medium="GPU",
         group_idx=group_idx,
         locality=locality,
+        storage_tier=storage_tier,
+        source_node=source_node,
     )
 
 
@@ -160,15 +170,11 @@ def test_block_stored_locality_is_wire_compatible():
         kv_cache_spec_sliding_window=128,
     )
     legacy_payload = msgspec.msgpack.encode(legacy)
-    assert (
+    assert msgspec.msgpack.decode(
         msgspec.msgpack.encode(
-            _make_block_stored(
-                group_idx=2,
-                kv_cache_spec_sliding_window=128,
-            )
+            _make_block_stored(group_idx=2, kv_cache_spec_sliding_window=128)
         )
-        == legacy_payload
-    )
+    ) == msgspec.msgpack.decode(legacy_payload)
     assert msgspec.msgpack.decode(legacy_payload, type=BlockStored).locality is None
     new_payload = msgspec.msgpack.encode(_make_block_stored(locality="LOCAL"))
     assert msgspec.msgpack.decode(new_payload)["locality"] == "LOCAL"
@@ -183,3 +189,56 @@ def test_block_removed_locality_is_wire_compatible():
     new_payload = msgspec.msgpack.encode(_make_block_removed(locality="REMOTE"))
     assert msgspec.msgpack.decode(new_payload)["locality"] == "REMOTE"
     assert msgspec.msgpack.decode(new_payload, type=_LegacyBlockRemoved).medium == "GPU"
+
+
+def test_block_stored_placement_hint_is_wire_compatible():
+    legacy_payload = msgspec.msgpack.encode(_make_block_stored())
+    decoded = msgspec.msgpack.decode(legacy_payload, type=BlockStored)
+    assert decoded.storage_tier is None
+    assert decoded.source_node is None
+    assert decoded.estimated_bandwidth_bps is None
+
+    event = _make_block_stored(
+        locality="REMOTE",
+        storage_tier="SSD",
+        source_node="worker-1",
+        estimated_bandwidth_bps=2.5e9,
+    )
+    payload = msgspec.msgpack.encode(event)
+    raw = msgspec.msgpack.decode(payload)
+    assert raw["storage_tier"] == "SSD"
+    assert raw["source_node"] == "worker-1"
+    assert raw["estimated_bandwidth_bps"] == 2.5e9
+    assert msgspec.msgpack.decode(payload, type=_LegacyBlockStored).medium == "GPU"
+
+
+def test_block_removed_placement_hint_is_wire_compatible():
+    legacy_payload = msgspec.msgpack.encode(_make_block_removed())
+    decoded = msgspec.msgpack.decode(legacy_payload, type=BlockRemoved)
+    assert decoded.storage_tier is None
+    assert decoded.source_node is None
+
+    event = _make_block_removed(
+        locality="REMOTE",
+        storage_tier="DRAM",
+        source_node="worker-2",
+    )
+    payload = msgspec.msgpack.encode(event)
+    raw = msgspec.msgpack.decode(payload)
+    assert raw["storage_tier"] == "DRAM"
+    assert raw["source_node"] == "worker-2"
+    assert msgspec.msgpack.decode(payload, type=_LegacyBlockRemoved).medium == "GPU"
+
+
+@pytest.mark.parametrize(
+    ("field", "left", "right"),
+    [
+        ("storage_tier", "DRAM", "SSD"),
+        ("source_node", "worker-1", "worker-2"),
+        ("estimated_bandwidth_bps", 1.0e9, 2.0e9),
+    ],
+)
+def test_block_stored_hash_includes_placement_hint(field, left, right):
+    assert hash(_make_block_stored(**{field: left})) != hash(
+        _make_block_stored(**{field: right})
+    )
