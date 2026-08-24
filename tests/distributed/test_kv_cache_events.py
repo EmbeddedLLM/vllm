@@ -76,6 +76,7 @@ def _make_block_removed(
     locality: str | None = None,
     storage_tier: str | None = None,
     source_node: str | None = None,
+    estimated_bandwidth_bps: float | None = None,
 ) -> BlockRemoved:
     return BlockRemoved(
         block_hashes=[_FAKE_HASH],
@@ -84,6 +85,7 @@ def _make_block_removed(
         locality=locality,
         storage_tier=storage_tier,
         source_node=source_node,
+        estimated_bandwidth_bps=estimated_bandwidth_bps,
     )
 
 
@@ -222,11 +224,13 @@ def test_block_removed_placement_hint_is_wire_compatible():
         locality="REMOTE",
         storage_tier="DRAM",
         source_node="worker-2",
+        estimated_bandwidth_bps=5.0e9,
     )
     payload = msgspec.msgpack.encode(event)
     raw = msgspec.msgpack.decode(payload)
     assert raw["storage_tier"] == "DRAM"
     assert raw["source_node"] == "worker-2"
+    assert raw["estimated_bandwidth_bps"] == 5.0e9
     assert msgspec.msgpack.decode(payload, type=_LegacyBlockRemoved).medium == "GPU"
 
 

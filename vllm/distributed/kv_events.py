@@ -113,6 +113,8 @@ class BlockRemoved(KVCacheEvent):
     """Physical tier hint such as DRAM or SSD; None means unspecified."""
     source_node: str | None = None
     """Node that served the blocks; None means the event publisher."""
+    estimated_bandwidth_bps: float | None = None
+    """Estimated read bandwidth from source_node; None means unknown."""
 
     def __hash__(self) -> int:
         return hash(
@@ -123,6 +125,7 @@ class BlockRemoved(KVCacheEvent):
                 self.locality,
                 self.storage_tier,
                 self.source_node,
+                self.estimated_bandwidth_bps,
             )
         )
 
