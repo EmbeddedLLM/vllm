@@ -194,10 +194,11 @@ may precede the master's view of that block.
 
 UMBP can also index blocks that remain in vLLM-managed GPU or CPU caches. This
 is the scheduler-visible path in the UMBP architecture. The bridge is a proxy:
-it consumes vLLM's event stream, forwards it to a different endpoint, and adds
-periodic events describing the DRAM or SSD location currently reported by the
-MoRI master. It requires MoRI's read-only `BatchInspect` API. Enable vLLM's ZMQ
-KV events and run the bridge before sending requests:
+it consumes vLLM's event stream, forwards it to a different endpoint, and
+labels successful storage events as logical `UMBP` availability. Physical
+node, locality, and DRAM/SSD tier remain unspecified because released MoRI does
+not expose them through a read-only API. Enable vLLM's ZMQ KV events and run
+the bridge before sending requests:
 
 ```bash
 .venv/bin/python examples/features/kv_events/umbp_kv_event_bridge.py \
@@ -206,9 +207,7 @@ KV events and run the bridge before sending requests:
   --topic 'kv@<pod-name>@<model-name>' \
   --master-address 10.0.0.1:15558 \
   --node-id <the-tier-node-id> \
-  --key-prefix vllm:kimi: \
-  --poll-interval 10 \
-  --bandwidth-bps '{"LOCAL:DRAM":4e9,"LOCAL:SSD":2e9,"REMOTE:DRAM":3e9,"REMOTE:SSD":1e9}'
+  --key-prefix vllm:kimi:
 ```
 
 Add the publisher configuration to the vLLM command:
@@ -226,16 +225,14 @@ Add the publisher configuration to the vLLM command:
 when `node_id` is omitted), and `key-prefix` must equal the tier's explicit
 `key_prefix`. Configure llm-d to subscribe to the bridge output on port 5558,
 not directly to vLLM on port 5557. Its placement TTL should be at least three
-times `poll-interval`, allowing a delayed poll without immediately discarding
-valid placement. Bandwidth values are deployment measurements, not defaults;
-omit entries that have not been measured. The bridge continues to register
-GPU/CPU advisory placement while its read-only reconciliation path publishes
-authoritative UMBP DRAM/SSD placement, including migrations and removals.
-Start it before vLLM traffic because the live stream does not replay events
-emitted before it subscribed.
+times the expected event delay. The bridge continues to register GPU/CPU
+advisory placement and marks vLLM-observed storage events as UMBP. llm-d must
+use deployment-calibrated UMBP restore cost rather than interpreting the event
+as proof of a particular physical tier. Start the bridge before vLLM traffic
+because the live stream does not replay events emitted before it subscribed.
 
 To validate the distributed data and placement paths without GPUs, launch the
-same-host two-replica harness against a MoRI build that includes `BatchInspect`:
+same-host two-replica harness against an unmodified MoRI build:
 
 ```bash
 .venv/bin/python \
@@ -244,18 +241,17 @@ same-host two-replica harness against a MoRI build that includes `BatchInspect`:
 ```
 
 The harness starts an ephemeral master and two clients, writes a deterministic
-4 KiB payload, discovers which replica owns it, reads it through the other
-replica, compares every byte, and checks that vLLM emits `REMOTE:DRAM` with the
-actual source node. A successful run ends with output similar to:
+4 KiB payload before the second replica joins, reads it through that second
+replica, compares every byte, and checks that vLLM emits logical `UMBP`
+availability without fabricated physical hints. A successful run ends with:
 
 ```text
-PASS: replica-a restored 4096 correct bytes from replica-b; placement=REMOTE:DRAM
+PASS: replica-b restored 4096 correct bytes from replica-a; availability=UMBP
 ```
 
-This proves routing, remote-read correctness, and placement-event integration.
-Because both clients run on one host, it does not prove RDMA transport, NIC
-selection, or cross-node performance. Run the same correctness sequence on two
-hosts and inspect MoRI transport metrics before claiming RDMA validation.
+This proves remote-read correctness and logical event integration. Because both
+clients run on one host, it does not prove RDMA transport, NIC selection,
+physical placement, or cross-node performance.
 
 Routers can use `MoriPlacementClient.match(..., count_as_hit=True)` to query
 which registered nodes hold a request's block hashes. The returned MoRI match

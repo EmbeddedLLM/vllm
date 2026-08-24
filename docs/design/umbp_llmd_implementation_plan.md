@@ -325,17 +325,17 @@ that from a periodically polling control plane:
   the owning node, physical tier, size, or peer address required for locality-
   and bandwidth-aware routing.
 
-For this reason, the cross-project implementation adds a read-only
+An experimental cross-project implementation therefore added a read-only
 `BatchInspect` RPC to MoRI. It returns the actual servable node, tier, size, and
 peer address without recording access or granting a lease. The Python
 `UMBPMasterClient` exposes the same operation for a bounded placement polling
 adapter. This keeps the MoRI master authoritative while allowing llm-d's
 placement TTL to fail closed if refresh stops.
 
-The MoRI work is committed locally as `8521f3dc` on branch
-`umbp-placement-inspect`. It is not yet pushed because the configured
-`ROCm/mori` HTTPS remote has no credential. Validation completed before the
-checkpoint:
+The experiment was committed locally as `8521f3dc`, validated, and never
+pushed. It was subsequently reverted by `a1bbcf20` so MoRI remains unchanged.
+The rationale stays here because exact physical placement would still require
+an equivalent upstream API. Validation completed before the revert:
 
 - `cmake --build build -j2` passed, including protobuf regeneration, the master,
   client, and Python bindings.
@@ -349,29 +349,24 @@ Without this MoRI API addition, exact DRAM/SSD-aware routing must remain
 disabled. Falling back to `MatchExternalKv` would be inaccurate, while polling
 `BatchRouteGet` would change the behavior being measured.
 
-### Authoritative placement proxy checkpoint
+### Logical availability proxy
 
-The vLLM event bridge now retains the original KV-event stream and enriches it
-with bounded, periodic `BatchInspect` reconciliation. It refreshes unchanged
-locations for llm-d's fail-closed TTL, retracts stale locations, and emits a
-remove/store pair when a block migrates between node or storage tier. Optional
-measured bandwidth values are attached by locality and tier. A wire-format
-round-trip test guards the append-only event schema used between vLLM and
-llm-d; unit tests cover refresh, migration, disappearance, explicit removal,
-and bounded master requests.
+The production design keeps MoRI unchanged. The vLLM bridge retains the
+original KV-event stream and labels successful storage events as logical
+`UMBP` availability. It deliberately leaves physical tier, owner, locality,
+and bandwidth empty. llm-d can route to an endpoint with UMBP availability
+using calibrated restore cost, but cannot claim exact DRAM/SSD placement.
 
 The proxy remains intentionally outside the vLLM engine. That keeps master
-polling and llm-d-specific refresh policy out of the inference data path while
+integration and llm-d-specific policy out of the inference data path while
 preserving the standard KV-event boundary. The next distributed validation is
-to run two UMBP nodes, force a remote read and DRAM-to-SSD movement, and verify
-that the proxy's placement sequence agrees with the actual read source.
+to run the correctness sequence on two physical nodes and use existing MoRI
+transport and aggregate tier metrics to validate the path.
 
-The same-host distributed validator now starts a real master and two UMBP
-clients, discovers the master's selected physical owner, restores through the
-other client, verifies all payload bytes, and checks that the reconciler emits
-the owner as a `REMOTE:DRAM` source. The observed local run restored 4,096 bytes
-from `replica-b` into `replica-a`. This completes the two-replica functional
-item only; it does not close the two-node RDMA or performance items.
+The same-host validator stores before the second UMBP client joins, restores
+through that second client, verifies all payload bytes, and checks the logical
+`UMBP` event. This completes the two-replica functional item only; it does not
+close physical placement, two-node RDMA, or performance validation.
 
 1. Whether SDMA loadback belongs in the generic CPU offload worker so all
    secondary tiers benefit.

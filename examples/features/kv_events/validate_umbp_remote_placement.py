@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Validate same-host remote UMBP reads and placement reconciliation."""
+"""Validate same-host remote UMBP reads and logical availability events."""
 
 import argparse
 import contextlib
@@ -10,12 +10,12 @@ import subprocess
 import time
 from pathlib import Path
 
-from mori.cpp import UMBPClient, UMBPConfig, UMBPDistributedConfig, UMBPMasterClient
+from mori.cpp import UMBPClient, UMBPConfig, UMBPDistributedConfig
 
 from vllm.distributed.kv_events import MEDIUM_STORAGE, BlockStored, KVEventBatch
 from vllm.v1.kv_offload.tiering.mori.placement import (
-    MoriPlacementReconciler,
     encode_umbp_event_key,
+    enrich_umbp_logical_placement,
 )
 
 
@@ -78,48 +78,26 @@ def main() -> None:
             lambda: master.poll() is None and _port_is_open("127.0.0.1", master_port)
         )
         source = make_client(master_address, "replica-a")
-        destination = make_client(master_address, "replica-b")
-        query = UMBPMasterClient(master_address)
         block_hash = b"remote-block"
         key = encode_umbp_event_key(block_hash, None, args.key_prefix)
 
         source_data = (ctypes.c_ubyte * args.size)(
             *((index * 131 + 17) % 256 for index in range(args.size))
         )
-        restored_a = (ctypes.c_ubyte * args.size)()
         restored_b = (ctypes.c_ubyte * args.size)()
         source_ptr = ctypes.addressof(source_data)
-        restored_a_ptr = ctypes.addressof(restored_a)
         restored_b_ptr = ctypes.addressof(restored_b)
         assert source.register_memory(source_ptr, args.size)
-        assert source.register_memory(restored_a_ptr, args.size)
-        assert destination.register_memory(restored_b_ptr, args.size)
         assert source.put_from_ptr(key, source_ptr, args.size)
         source.flush()
+        wait_until(lambda: source.exists(key))
 
-        wait_until(lambda: query.batch_inspect([key])[0] is not None)
-        placement = query.batch_inspect([key])[0]
-        if placement.node_id == "replica-a":
-            reader = destination
-            reader_id = "replica-b"
-            restored_data = restored_b
-            restored_ptr = restored_b_ptr
-        elif placement.node_id == "replica-b":
-            reader = source
-            reader_id = "replica-a"
-            restored_data = restored_a
-            restored_ptr = restored_a_ptr
-        else:
-            raise AssertionError(f"unexpected placement node: {placement.node_id}")
-        assert reader.get_into_ptr(key, restored_ptr, args.size)
-        assert bytes(restored_data) == bytes(source_data), "remote data mismatch"
+        destination = make_client(master_address, "replica-b")
+        assert destination.register_memory(restored_b_ptr, args.size)
+        assert destination.get_into_ptr(key, restored_b_ptr, args.size)
+        assert bytes(restored_b) == bytes(source_data), "remote data mismatch"
 
-        reconciler = MoriPlacementReconciler(
-            query,
-            node_id=reader_id,
-            key_prefix=args.key_prefix,
-        )
-        reconciler.observe_batch(
+        event_batch = enrich_umbp_logical_placement(
             KVEventBatch(
                 ts=time.time(),
                 events=[
@@ -135,14 +113,13 @@ def main() -> None:
                 ],
             )
         )
-        events = reconciler.reconcile()
-        assert len(events) == 1
-        assert events[0].source_node == placement.node_id
-        assert events[0].locality == "REMOTE"
-        assert events[0].storage_tier == "DRAM"
+        event = event_batch.events[0]
+        assert event.storage_tier == "UMBP"
+        assert event.source_node is None
+        assert event.locality is None
         print(
-            f"PASS: {reader_id} restored {args.size} correct bytes from "
-            f"{placement.node_id}; placement=REMOTE:DRAM"
+            f"PASS: replica-b restored {args.size} correct bytes from "
+            "replica-a; availability=UMBP"
         )
     finally:
         for client in (destination, source):

@@ -4,8 +4,9 @@
 
 from collections import Counter
 from collections.abc import Iterable
-from dataclasses import dataclass
 from typing import Any
+
+import msgspec
 
 from vllm.distributed.kv_events import (
     MEDIUM_CPU,
@@ -21,14 +22,6 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import ExternalBlockHash
 
 logger = init_logger(__name__)
-
-
-@dataclass(frozen=True)
-class MoriPhysicalPlacement:
-    storage_tier: str
-    source_node: str
-    locality: str
-    estimated_bandwidth_bps: float | None
 
 
 def encode_umbp_event_key(
@@ -152,116 +145,17 @@ class MoriPlacementClient:
         return self._client.get_external_kv_hit_counts(keys)
 
 
-class MoriPlacementReconciler:
-    """Convert authoritative MoRI placements into refreshable KV events."""
+def enrich_umbp_logical_placement(batch: KVEventBatch) -> KVEventBatch:
+    """Mark successful storage events as logical UMBP availability.
 
-    def __init__(
-        self,
-        master_client: Any,
-        node_id: str,
-        key_prefix: str,
-        bandwidth_bps: dict[str, float] | None = None,
-        max_batch_size: int = 1024,
-    ) -> None:
-        if max_batch_size <= 0:
-            raise ValueError("max_batch_size must be greater than zero")
-        if any(value <= 0 for value in (bandwidth_bps or {}).values()):
-            raise ValueError("bandwidth_bps values must be greater than zero")
-        self._client = master_client
-        self._node_id = node_id
-        self._key_prefix = key_prefix
-        self._bandwidth_bps = {
-            key.upper(): value for key, value in (bandwidth_bps or {}).items()
-        }
-        self._max_batch_size = max_batch_size
-        self._tracked: dict[str, tuple[ExternalBlockHash, int | None]] = {}
-        self._metadata: dict[str, tuple[ExternalBlockHash, int | None]] = {}
-        self._published: dict[str, MoriPhysicalPlacement] = {}
-
-    def _encode_key(self, block_hash: ExternalBlockHash, group_idx: int | None) -> str:
-        return encode_umbp_event_key(block_hash, group_idx, self._key_prefix)
-
-    def observe_batch(self, batch: KVEventBatch) -> None:
-        for event in batch.events:
-            if isinstance(event, AllBlocksCleared):
-                self._tracked.clear()
-            elif isinstance(event, BlockStored) and event.medium == MEDIUM_STORAGE:
-                for block_hash in event.block_hashes:
-                    self._tracked[self._encode_key(block_hash, event.group_idx)] = (
-                        block_hash,
-                        event.group_idx,
-                    )
-                    self._metadata[self._encode_key(block_hash, event.group_idx)] = (
-                        block_hash,
-                        event.group_idx,
-                    )
-            elif isinstance(event, BlockRemoved) and event.medium == MEDIUM_STORAGE:
-                for block_hash in event.block_hashes:
-                    self._tracked.pop(
-                        self._encode_key(block_hash, event.group_idx), None
-                    )
-
-    @staticmethod
-    def _tier_name(tier: Any) -> str:
-        return str(getattr(tier, "name", tier)).upper()
-
-    def _placement(self, result: Any) -> MoriPhysicalPlacement:
-        tier = self._tier_name(result.tier)
-        locality = "LOCAL" if result.node_id == self._node_id else "REMOTE"
-        bandwidth = self._bandwidth_bps.get(f"{locality}:{tier}")
-        return MoriPhysicalPlacement(tier, result.node_id, locality, bandwidth)
-
-    @staticmethod
-    def _event(
-        metadata: tuple[ExternalBlockHash, int | None],
-        placement: MoriPhysicalPlacement,
-        removed: bool,
-    ) -> BlockStored | BlockRemoved:
-        block_hash, group_idx = metadata
-        common = {
-            "block_hashes": [block_hash],
-            "medium": MEDIUM_STORAGE,
-            "group_idx": group_idx,
-            "locality": placement.locality,
-            "storage_tier": placement.storage_tier,
-            "source_node": placement.source_node,
-            "estimated_bandwidth_bps": placement.estimated_bandwidth_bps,
-        }
-        if removed:
-            return BlockRemoved(**common)
-        return BlockStored(
-            parent_block_hash=None,
-            token_ids=[],
-            block_size=0,
-            lora_id=None,
-            lora_name=None,
-            **common,
-        )
-
-    def reconcile(self) -> list[BlockStored | BlockRemoved]:
-        keys = list(self._tracked)
-        results = []
-        for start in range(0, len(keys), self._max_batch_size):
-            results.extend(
-                self._client.batch_inspect(keys[start : start + self._max_batch_size])
-            )
-        if len(results) != len(keys):
-            raise RuntimeError(
-                "MoRI BatchInspect returned a result count different from its request"
-            )
-        current = {
-            key: self._placement(result)
-            for key, result in zip(keys, results)
-            if result is not None
-        }
-        events: list[BlockStored | BlockRemoved] = []
-        for key, old in self._published.items():
-            if current.get(key) != old:
-                events.append(self._event(self._metadata[key], old, removed=True))
-        for key, placement in current.items():
-            events.append(self._event(self._tracked[key], placement, removed=False))
-        self._published = current
-        for key in list(self._metadata):
-            if key not in self._tracked and key not in self._published:
-                del self._metadata[key]
-        return events
+    Released MoRI does not expose physical key placement. The publisher,
+    locality, and physical DRAM/SSD tier therefore remain unspecified.
+    """
+    events = [
+        msgspec.structs.replace(event, storage_tier="UMBP")
+        if isinstance(event, (BlockStored, BlockRemoved))
+        and event.medium == MEDIUM_STORAGE
+        else event
+        for event in batch.events
+    ]
+    return msgspec.structs.replace(batch, events=events)
