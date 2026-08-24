@@ -234,6 +234,29 @@ authoritative UMBP DRAM/SSD placement, including migrations and removals.
 Start it before vLLM traffic because the live stream does not replay events
 emitted before it subscribed.
 
+To validate the distributed data and placement paths without GPUs, launch the
+same-host two-replica harness against a MoRI build that includes `BatchInspect`:
+
+```bash
+.venv/bin/python \
+  examples/features/kv_events/validate_umbp_remote_placement.py \
+  --master-bin /path/to/mori/build/src/umbp/umbp_master
+```
+
+The harness starts an ephemeral master and two clients, writes a deterministic
+4 KiB payload, discovers which replica owns it, reads it through the other
+replica, compares every byte, and checks that vLLM emits `REMOTE:DRAM` with the
+actual source node. A successful run ends with output similar to:
+
+```text
+PASS: replica-a restored 4096 correct bytes from replica-b; placement=REMOTE:DRAM
+```
+
+This proves routing, remote-read correctness, and placement-event integration.
+Because both clients run on one host, it does not prove RDMA transport, NIC
+selection, or cross-node performance. Run the same correctness sequence on two
+hosts and inspect MoRI transport metrics before claiming RDMA validation.
+
 Routers can use `MoriPlacementClient.match(..., count_as_hit=True)` to query
 which registered nodes hold a request's block hashes. The returned MoRI match
 objects include the node ID, peer address, and matched hashes grouped by HBM,

@@ -150,7 +150,7 @@ roofline, and prefetch removes most restore time from request TTFT.
 ### Phase 5: distributed validation
 
 - [x] Optional AMD TP=2 local UMBP test.
-- [ ] Two-replica same-node remote-placement test.
+- [x] Two-replica same-node remote-placement test.
 - [ ] Two-node RDMA read and failure-fallback test.
 - [ ] llm-d routing integration test with stale and conflicting placements.
 - [ ] Concurrency 1/8/32/128 performance matrix.
@@ -365,6 +365,13 @@ polling and llm-d-specific refresh policy out of the inference data path while
 preserving the standard KV-event boundary. The next distributed validation is
 to run two UMBP nodes, force a remote read and DRAM-to-SSD movement, and verify
 that the proxy's placement sequence agrees with the actual read source.
+
+The same-host distributed validator now starts a real master and two UMBP
+clients, discovers the master's selected physical owner, restores through the
+other client, verifies all payload bytes, and checks that the reconciler emits
+the owner as a `REMOTE:DRAM` source. The observed local run restored 4,096 bytes
+from `replica-b` into `replica-a`. This completes the two-replica functional
+item only; it does not close the two-node RDMA or performance items.
 
 1. Whether SDMA loadback belongs in the generic CPU offload worker so all
    secondary tiers benefit.
