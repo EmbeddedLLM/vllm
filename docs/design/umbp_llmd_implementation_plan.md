@@ -84,7 +84,7 @@ must not become a second production router alongside llm-d.
 - [x] Reject conclusions when transfer counters do not prove restoration.
 - [ ] Add MoRI per-medium DRAM/SSD read counters to the vLLM metrics surface.
 - [x] Require one completed restoration per timed trial.
-- [ ] Record lookup, queue, tier read, CPU-to-GPU, and total critical-path time.
+- [x] Record lookup, queue, tier read, CPU-to-GPU, and total critical-path time.
 
 Acceptance: every timed request is classified as recompute, HBM, CPU, UMBP
 DRAM, local SSD, remote DRAM, or remote SSD without inference from latency.
@@ -259,6 +259,14 @@ and keeps cluster policy out of the vLLM engine.
   physical CPU-to-GPU restore; filesystem and UMBP modes additionally require
   a secondary-tier read per trial. Results report the proven restoration count
   and minimum per-trial byte deltas.
+- Added lookup sync/async, request queue, secondary-tier read, CPU-to-GPU,
+  server end-to-end, and client TTFT/latency measurements to the benchmark.
+  Fixed metric parsing to match exact Prometheus sample names so histogram
+  buckets cannot inflate sums. Stage times are reported separately because
+  asynchronous lookup and transfer stages can overlap.
+- Confirmed the current MoRI Python boundary returns only batch success flags.
+  Exact UMBP DRAM-versus-SSD attribution requires a MoRI result/metrics API
+  extension; vLLM must not infer the medium from latency or SSD enablement.
 
 ## Open decisions
 

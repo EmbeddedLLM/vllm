@@ -33,6 +33,10 @@ class Result:
     restorations_proven: int
     min_cpu_to_gpu_bytes_per_trial: float
     min_tier_read_bytes_per_trial: float
+    lookup_sync_time_s: float
+    lookup_async_time_s: float
+    request_queue_time_s: float
+    server_e2e_time_s: float
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -44,7 +48,10 @@ def _percentile(values: list[float], percentile: float) -> float:
 def _metric_total(metrics: str, name: str, required_label: str = "") -> float:
     total = 0.0
     for line in metrics.splitlines():
-        if not line.startswith(name) or required_label not in line:
+        if not line or line.startswith("#"):
+            continue
+        metric_name = line.split(maxsplit=1)[0].split("{", 1)[0]
+        if metric_name != name or required_label not in line:
             continue
         total += float(line.rsplit(maxsplit=1)[1])
     return total
@@ -70,6 +77,16 @@ def _metrics(base_url: str) -> dict[str, float]:
             body, "vllm:kv_offload_tiering_read_time_total"
         ),
         "tier_write": _metric_total(body, "vllm:kv_offload_tiering_write_bytes_total"),
+        "lookup_sync_time": _metric_total(
+            body, "vllm:kv_offload_tiering_lookup_sync_delay_seconds_sum"
+        ),
+        "lookup_async_time": _metric_total(
+            body, "vllm:kv_offload_tiering_lookup_async_delay_seconds_sum"
+        ),
+        "request_queue_time": _metric_total(
+            body, "vllm:request_queue_time_seconds_sum"
+        ),
+        "server_e2e_time": _metric_total(body, "vllm:e2e_request_latency_seconds_sum"),
     }
 
 
@@ -221,6 +238,18 @@ def main() -> None:
         restorations_proven=sum(value > 0 for value in trial_cpu_to_gpu_bytes),
         min_cpu_to_gpu_bytes_per_trial=min(trial_cpu_to_gpu_bytes),
         min_tier_read_bytes_per_trial=min(trial_tier_read_bytes),
+        lookup_sync_time_s=(
+            metrics_after["lookup_sync_time"] - metrics_before["lookup_sync_time"]
+        ),
+        lookup_async_time_s=(
+            metrics_after["lookup_async_time"] - metrics_before["lookup_async_time"]
+        ),
+        request_queue_time_s=(
+            metrics_after["request_queue_time"] - metrics_before["request_queue_time"]
+        ),
+        server_e2e_time_s=(
+            metrics_after["server_e2e_time"] - metrics_before["server_e2e_time"]
+        ),
     )
     if args.mode != "recompute" and result.cpu_to_gpu_bytes <= 0:
         raise RuntimeError("benchmark did not force any CPU-to-GPU restoration")

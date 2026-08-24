@@ -43,6 +43,11 @@ timed request: non-recompute modes fail immediately if any trial lacks a
 CPU-to-GPU transfer, and filesystem/UMBP modes also require a secondary-tier
 read in every trial. Aggregate bytes cannot hide an unproven trial.
 
+The result also records cumulative lookup sync/async time, request queue time,
+secondary-tier read time, CPU-to-GPU time, client-observed TTFT/latency, and
+server end-to-end request time over the measured interval. These stages can
+overlap and therefore must not be summed as if they were mutually exclusive.
+
 Run each mode from a fresh server. Reusing a server contaminates later trials
 because the deterministic eviction prompts remain cached.
 
