@@ -305,5 +305,48 @@ and keeps cluster policy out of the vLLM engine.
    emits the optional standard KV-event placement hints.
 3. How llm-d communicates a recompute-versus-restore decision without adding
    UMBP-specific fields to the OpenAI request schema.
+
+## Why authoritative placement requires a MoRI change
+
+The router must distinguish real, currently servable UMBP placement from
+advisory cache metadata. The existing MoRI APIs do not provide a safe way to do
+that from a periodically polling control plane:
+
+- `MatchExternalKv` queries the external KV index populated by vLLM cache
+  events. MoRI documents these entries as advisory and not servable through
+  `ResolveKey`; they do not prove that the UMBP data plane currently holds the
+  block in DRAM or SSD.
+- `BatchRouteGet` queries real servable placement, but it is a data-plane read
+  operation: it records access, updates routing counters, and grants leases.
+  Polling it from vLLM or llm-d would contaminate measurements, alter eviction
+  behavior, and could keep cold blocks resident merely because the control
+  plane inspected them.
+- `BatchLookup` is read-only but returns only existence flags. It cannot supply
+  the owning node, physical tier, size, or peer address required for locality-
+  and bandwidth-aware routing.
+
+For this reason, the cross-project implementation adds a read-only
+`BatchInspect` RPC to MoRI. It returns the actual servable node, tier, size, and
+peer address without recording access or granting a lease. The Python
+`UMBPMasterClient` exposes the same operation for a bounded placement polling
+adapter. This keeps the MoRI master authoritative while allowing llm-d's
+placement TTL to fail closed if refresh stops.
+
+The MoRI work is committed locally as `8521f3dc` on branch
+`umbp-placement-inspect`. It is not yet pushed because the configured
+`ROCm/mori` HTTPS remote has no credential. Validation completed before the
+checkpoint:
+
+- `cmake --build build -j2` passed, including protobuf regeneration, the master,
+  client, and Python bindings.
+- The full Python master-client suite passed (`45 passed`).
+- The new integration test performs a real distributed UMBP put, flushes its
+  heartbeat, observes its servable DRAM placement through `BatchInspect`,
+  verifies a missing key remains absent, and verifies the advisory external KV
+  index remains empty.
+
+Without this MoRI API addition, exact DRAM/SSD-aware routing must remain
+disabled. Falling back to `MatchExternalKv` would be inaccurate, while polling
+`BatchRouteGet` would change the behavior being measured.
 4. Whether SDMA loadback belongs in the generic CPU offload worker so all
    secondary tiers benefit.
