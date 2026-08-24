@@ -275,13 +275,19 @@ and keeps cluster policy out of the vLLM engine.
   must only be populated from an authoritative placement observation; MoRI's
   master remains authoritative when blocks can migrate between DRAM and SSD.
 - Updated llm-d's vLLM adapter to decode those hints from map and positional
-  encodings into generic KV events (local checkpoint `6f6492d`). Updated its
+  encodings into generic KV events (checkpoint `6f6492d`). Updated its
   event pool to prefer an authoritative physical `storage_tier` when building
   dedup scopes and KV-index entries, making `dram` and `ssd` available to the
-  existing precise-prefix and restore-cost pipeline (local checkpoint
+  existing precise-prefix and restore-cost pipeline (checkpoint
   `30d90a0`). Targeted `pkg/kvevents`, adapter, KV-index, and restore-cost tests
-  pass with Go 1.26.6. These llm-d checkpoints are not yet on the remote because
-  its sanitized HTTPS remote currently has no GitHub credential.
+  pass with Go 1.26.6.
+- Checkpoint
+  `da4bdb0` retains locality, source node, and bandwidth in index entries with
+  symmetric store/remove identity. Checkpoint `1bacaef` aggregates conservative
+  placement metadata across precise-prefix hits and lets the restore-cost
+  scorer derive per-block transfer time from `kvBlockBytes / bandwidth`, add a
+  configured locality penalty, and fall back to measured static tier cost when
+  bandwidth is unknown. The example EPP configuration documents the new knobs.
 
 ## Open decisions
 
