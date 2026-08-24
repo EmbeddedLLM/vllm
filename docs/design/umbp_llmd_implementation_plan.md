@@ -274,6 +274,14 @@ and keeps cluster policy out of the vLLM engine.
   unknown and preserve decoding in both directions with older schemas. They
   must only be populated from an authoritative placement observation; MoRI's
   master remains authoritative when blocks can migrate between DRAM and SSD.
+- Updated llm-d's vLLM adapter to decode those hints from map and positional
+  encodings into generic KV events (local checkpoint `6f6492d`). Updated its
+  event pool to prefer an authoritative physical `storage_tier` when building
+  dedup scopes and KV-index entries, making `dram` and `ssd` available to the
+  existing precise-prefix and restore-cost pipeline (local checkpoint
+  `30d90a0`). Targeted `pkg/kvevents`, adapter, KV-index, and restore-cost tests
+  pass with Go 1.26.6. These llm-d checkpoints are not yet on the remote because
+  its sanitized HTTPS remote currently has no GitHub credential.
 
 ## Open decisions
 
