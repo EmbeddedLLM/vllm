@@ -193,16 +193,22 @@ may precede the master's view of that block.
 #### Placement event feed
 
 UMBP can also index blocks that remain in vLLM-managed GPU or CPU caches. This
-is the scheduler-visible path in the UMBP architecture. Enable vLLM's ZMQ KV
-events and run the bridge before sending requests:
+is the scheduler-visible path in the UMBP architecture. The bridge is a proxy:
+it consumes vLLM's event stream, forwards it to a different endpoint, and adds
+periodic events describing the DRAM or SSD location currently reported by the
+MoRI master. It requires MoRI's read-only `BatchInspect` API. Enable vLLM's ZMQ
+KV events and run the bridge before sending requests:
 
 ```bash
 .venv/bin/python examples/features/kv_events/umbp_kv_event_bridge.py \
   --endpoint tcp://127.0.0.1:5557 \
-  --topic kv-events \
+  --output-endpoint 'tcp://*:5558' \
+  --topic 'kv@<pod-name>@<model-name>' \
   --master-address 10.0.0.1:15558 \
   --node-id <the-tier-node-id> \
-  --key-prefix vllm:kimi:
+  --key-prefix vllm:kimi: \
+  --poll-interval 10 \
+  --bandwidth-bps '{"LOCAL:DRAM":4e9,"LOCAL:SSD":2e9,"REMOTE:DRAM":3e9,"REMOTE:SSD":1e9}'
 ```
 
 Add the publisher configuration to the vLLM command:
@@ -212,16 +218,21 @@ Add the publisher configuration to the vLLM command:
   "enable_kv_cache_events": true,
   "publisher": "zmq",
   "endpoint": "tcp://*:5557",
-  "topic": "kv-events"
+  "topic": "kv@<pod-name>@<model-name>"
 }'
 ```
 
 `node-id` must equal this process's UMBP tier `node_id` (or the vLLM engine ID
 when `node_id` is omitted), and `key-prefix` must equal the tier's explicit
-`key_prefix`. The bridge maps GPU events to UMBP HBM placements and CPU events
-to DRAM placements. It reference-counts repeated announcements before revoking
-a placement. Start it before vLLM traffic because this initial bridge consumes
-the live event stream and does not replay events emitted before it subscribed.
+`key_prefix`. Configure llm-d to subscribe to the bridge output on port 5558,
+not directly to vLLM on port 5557. Its placement TTL should be at least three
+times `poll-interval`, allowing a delayed poll without immediately discarding
+valid placement. Bandwidth values are deployment measurements, not defaults;
+omit entries that have not been measured. The bridge continues to register
+GPU/CPU advisory placement while its read-only reconciliation path publishes
+authoritative UMBP DRAM/SSD placement, including migrations and removals.
+Start it before vLLM traffic because the live stream does not replay events
+emitted before it subscribed.
 
 Routers can use `MoriPlacementClient.match(..., count_as_hit=True)` to query
 which registered nodes hold a request's block hashes. The returned MoRI match

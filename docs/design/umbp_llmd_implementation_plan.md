@@ -348,5 +348,23 @@ checkpoint:
 Without this MoRI API addition, exact DRAM/SSD-aware routing must remain
 disabled. Falling back to `MatchExternalKv` would be inaccurate, while polling
 `BatchRouteGet` would change the behavior being measured.
-4. Whether SDMA loadback belongs in the generic CPU offload worker so all
+
+### Authoritative placement proxy checkpoint
+
+The vLLM event bridge now retains the original KV-event stream and enriches it
+with bounded, periodic `BatchInspect` reconciliation. It refreshes unchanged
+locations for llm-d's fail-closed TTL, retracts stale locations, and emits a
+remove/store pair when a block migrates between node or storage tier. Optional
+measured bandwidth values are attached by locality and tier. A wire-format
+round-trip test guards the append-only event schema used between vLLM and
+llm-d; unit tests cover refresh, migration, disappearance, explicit removal,
+and bounded master requests.
+
+The proxy remains intentionally outside the vLLM engine. That keeps master
+polling and llm-d-specific refresh policy out of the inference data path while
+preserving the standard KV-event boundary. The next distributed validation is
+to run two UMBP nodes, force a remote read and DRAM-to-SSD movement, and verify
+that the proxy's placement sequence agrees with the actual read source.
+
+1. Whether SDMA loadback belongs in the generic CPU offload worker so all
    secondary tiers benefit.
