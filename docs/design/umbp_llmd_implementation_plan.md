@@ -368,5 +368,14 @@ through that second client, verifies all payload bytes, and checks the logical
 `UMBP` event. This completes the two-replica functional item only; it does not
 close physical placement, two-node RDMA, or performance validation.
 
+llm-d checkpoint `761016e` recognizes this distinction. Logical `UMBP`
+lifecycle entries remain indexed until their remove event, while physical DRAM
+and SSD hints retain fail-closed placement expiry. The sample restore-cost
+profile includes a deployment-calibrated `umbp` tier entry. Full Go package
+tests, `go vet`, and the KV-event race suite passed. Container-backed presubmit
+could not run because Docker and Podman are unavailable; its earlier signature
+gate also rejects six unsigned checkpoint commits already present on the
+branch.
+
 1. Whether SDMA loadback belongs in the generic CPU offload worker so all
    secondary tiers benefit.
