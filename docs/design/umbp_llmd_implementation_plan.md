@@ -110,7 +110,7 @@ and explicit JSON values take precedence over environment values.
 - [x] Confirm llm-d's precise index and scorer retain per-replica `DeviceTier`.
 - [x] Add a measured tier restore-versus-recompute scorer and compose it with
   llm-d's existing queue/utilization scorers in the scheduling profile.
-- [ ] Preserve speculative indexing and stale-event TTL behavior.
+- [x] Preserve speculative indexing and stale-event TTL behavior.
 
 Acceptance: llm-d chooses among local recompute, local UMBP restore, remote
 UMBP restore, and a replica-local HBM hit using observable cost inputs.
@@ -288,6 +288,13 @@ and keeps cluster policy out of the vLLM engine.
   scorer derive per-block transfer time from `kvBlockBytes / bandwidth`, add a
   configured locality penalty, and fall back to measured static tier cost when
   bandwidth is unknown. The example EPP configuration documents the new knobs.
+- llm-d checkpoint `303550c` adds an optional TTL specifically for authoritative
+  physical placement hints. Refreshes replace generation-tagged timers;
+  explicit removals, pod clears, and shutdown cancel them. Expiry evicts the
+  exact enriched index identity while leaving ordinary GPU/CPU events and the
+  existing speculative-entry TTL unchanged. `go test -race ./pkg/kvevents` and
+  the full `go test ./pkg/...` suite pass, including a real-index
+  store-to-expiry integration test.
 
 ## Open decisions
 
