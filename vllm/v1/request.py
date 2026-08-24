@@ -78,6 +78,7 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        hbm_prefetch_only: bool = False,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -233,6 +234,8 @@ class Request:
         # If True, request should be aborted immediately after being added to
         # the scheduler so the connector's request_finished hook runs.
         self.abort_immediately = abort_immediately
+        self.hbm_prefetch_only = hbm_prefetch_only
+        self.hbm_prefetch_load_completed = False
 
     @classmethod
     def from_engine_core_request(
@@ -260,6 +263,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            hbm_prefetch_only=request.hbm_prefetch_only,
         )
 
     def append_output_token_ids(

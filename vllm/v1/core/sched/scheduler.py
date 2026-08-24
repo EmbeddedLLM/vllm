@@ -4,7 +4,7 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -68,6 +68,14 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class HBMPrefetchRecord:
+    status: str
+    total_blocks: int
+    total_bytes: int
+    updated_at: float
 
 
 class Scheduler(SchedulerInterface):
@@ -203,6 +211,48 @@ class Scheduler(SchedulerInterface):
         # requests so that they can free the cached states for those requests.
         # This is flushed at the end of each scheduling step.
         self.finished_req_ids: set[str] = set()
+        extra_config = (
+            kv_transfer_config.kv_connector_extra_config
+            if kv_transfer_config is not None
+            else {}
+        )
+        self.hbm_prefetch_max_pending_requests = int(
+            extra_config.get("prefetch_max_pending_requests", 64)
+        )
+        self.hbm_prefetch_max_pending_blocks = min(
+            int(extra_config.get("prefetch_max_pending_blocks", 4096)),
+            num_gpu_blocks,
+        )
+        self.hbm_prefetch_bytes_per_block = (
+            kv_cache_config.kv_cache_tensors[0].size // num_gpu_blocks
+            if kv_cache_config.kv_cache_tensors
+            else 0
+        )
+        default_pending_gpu_bytes = self.hbm_prefetch_bytes_per_block * num_gpu_blocks
+        self.hbm_prefetch_max_pending_gpu_bytes = int(
+            extra_config.get(
+                "prefetch_max_pending_gpu_bytes", default_pending_gpu_bytes
+            )
+        )
+        self.hbm_prefetch_pending_ttl_seconds = float(
+            extra_config.get("prefetch_pending_ttl_seconds", 30.0)
+        )
+        self.hbm_prefetch_terminal_ttl_seconds = float(
+            extra_config.get("prefetch_terminal_ttl_seconds", 60.0)
+        )
+        if (
+            self.hbm_prefetch_max_pending_requests <= 0
+            or self.hbm_prefetch_max_pending_blocks <= 0
+            or self.hbm_prefetch_pending_ttl_seconds <= 0
+            or self.hbm_prefetch_terminal_ttl_seconds <= 0
+            or (
+                "prefetch_max_pending_gpu_bytes" in extra_config
+                and self.hbm_prefetch_max_pending_gpu_bytes <= 0
+            )
+        ):
+            raise ValueError("HBM prefetch limits and TTLs must be greater than zero")
+        self.hbm_prefetch_results: dict[str, HBMPrefetchRecord] = {}
+        self._hbm_prefetch_time = time.monotonic
 
         # IDs of requests preempted since the last call to schedule().
         self.reset_preempted_req_ids: set[str] = set()
@@ -497,6 +547,7 @@ class Scheduler(SchedulerInterface):
         return max(num_new_tokens, 0)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        self.expire_hbm_prefetches()
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -810,6 +861,11 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.prepend_request(request)
                     continue
 
+                if request.hbm_prefetch_only and request.hbm_prefetch_load_completed:
+                    request_queue.pop_request()
+                    self._finish_hbm_prefetch(request)
+                    continue
+
                 # Check that adding the request still respects the max_loras
                 # constraint.
                 if (
@@ -932,6 +988,12 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+
+                if request.hbm_prefetch_only and not load_kv_async:
+                    request_queue.pop_request()
+                    request.num_computed_tokens = num_computed_tokens
+                    self._finish_hbm_prefetch(request)
+                    continue
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -2371,6 +2433,101 @@ class Scheduler(SchedulerInterface):
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
+    def add_hbm_prefetch(self, request: Request) -> None:
+        """Admit a synthetic request that only populates GPU prefix cache."""
+        if not request.hbm_prefetch_only:
+            raise ValueError("HBM prefetch request must be marked prefetch-only")
+        self.expire_hbm_prefetches()
+        if request.request_id in self.hbm_prefetch_results:
+            raise ValueError("HBM prefetch request already exists")
+        pending = [
+            record
+            for record in self.hbm_prefetch_results.values()
+            if record.status == "pending"
+        ]
+        if len(pending) >= self.hbm_prefetch_max_pending_requests:
+            raise RuntimeError("HBM prefetch request capacity is exhausted")
+        total_blocks = request.num_tokens // self.block_size
+        total_bytes = total_blocks * self.hbm_prefetch_bytes_per_block
+        if (
+            sum(record.total_blocks for record in pending) + total_blocks
+            > self.hbm_prefetch_max_pending_blocks
+        ):
+            raise RuntimeError("HBM prefetch block capacity is exhausted")
+        if (
+            self.hbm_prefetch_max_pending_gpu_bytes
+            and sum(record.total_bytes for record in pending) + total_bytes
+            > self.hbm_prefetch_max_pending_gpu_bytes
+        ):
+            raise RuntimeError("HBM prefetch byte capacity is exhausted")
+        self.hbm_prefetch_results[request.request_id] = HBMPrefetchRecord(
+            status="pending",
+            total_blocks=total_blocks,
+            total_bytes=total_bytes,
+            updated_at=self._hbm_prefetch_time(),
+        )
+        self.add_request(request)
+
+    def has_hbm_prefetch(self, request_id: str) -> bool:
+        self.expire_hbm_prefetches()
+        return request_id in self.hbm_prefetch_results
+
+    def poll_hbm_prefetch(self, request_id: str) -> tuple[str, int]:
+        self.expire_hbm_prefetches()
+        record = self.hbm_prefetch_results[request_id]
+        if record.status == "pending":
+            record.updated_at = self._hbm_prefetch_time()
+        return record.status, record.total_blocks
+
+    def cancel_hbm_prefetch(self, request_id: str) -> tuple[str, int]:
+        self.expire_hbm_prefetches()
+        record = self.hbm_prefetch_results[request_id]
+        if record.status != "pending":
+            return record.status, record.total_blocks
+        self._cancel_hbm_prefetch(request_id, record)
+        return record.status, record.total_blocks
+
+    def _cancel_hbm_prefetch(self, request_id: str, record: HBMPrefetchRecord) -> None:
+        self.finish_requests(request_id, RequestStatus.FINISHED_ABORTED)
+        self.finished_req_ids.discard(request_id)
+        if self.finished_req_ids_dict is not None:
+            for finished_ids in self.finished_req_ids_dict.values():
+                finished_ids.discard(request_id)
+        record.status = "cancelled"
+        record.updated_at = self._hbm_prefetch_time()
+
+    def expire_hbm_prefetches(self) -> None:
+        now = self._hbm_prefetch_time()
+        expired = []
+        for request_id, record in self.hbm_prefetch_results.items():
+            age = now - record.updated_at
+            if record.status == "pending":
+                if age < self.hbm_prefetch_pending_ttl_seconds:
+                    continue
+                self._cancel_hbm_prefetch(request_id, record)
+            elif age < self.hbm_prefetch_terminal_ttl_seconds:
+                continue
+            expired.append(request_id)
+        for request_id in expired:
+            del self.hbm_prefetch_results[request_id]
+
+    def _finish_hbm_prefetch(self, request: Request) -> None:
+        """Release request ownership after publishing loaded prefix blocks."""
+        request.status = RequestStatus.FINISHED_STOPPED
+        if request.num_computed_tokens == request.num_tokens:
+            status = "ready"
+        elif request.num_computed_tokens:
+            status = "partial"
+        else:
+            status = "miss"
+        record = self.hbm_prefetch_results[request.request_id]
+        record.status = status
+        record.updated_at = self._hbm_prefetch_time()
+        self._free_request(request)
+        self.finished_req_ids.discard(request.request_id)
+        if self.finished_req_ids_dict is not None:
+            self.finished_req_ids_dict[request.client_index].discard(request.request_id)
+
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
     ) -> list[Request]:
@@ -2778,6 +2935,7 @@ class Scheduler(SchedulerInterface):
         WAITING_FOR_REMOTE_KV.
         """
         assert self.connector is not None
+        request.hbm_prefetch_load_completed = request.hbm_prefetch_only
 
         if request.request_id in self.failed_recving_kv_req_ids:
             # Request had KV load failures; num_computed_tokens was already
@@ -2807,7 +2965,10 @@ class Scheduler(SchedulerInterface):
 
             # on a full prompt hit, we need to re-compute the last token
             # in order to be able to sample the next token
-            if request.num_computed_tokens == request.num_tokens:
+            if (
+                not request.hbm_prefetch_only
+                and request.num_computed_tokens == request.num_tokens
+            ):
                 request.num_computed_tokens = request.num_tokens - 1
 
         self.finished_recving_kv_req_ids.remove(request.request_id)

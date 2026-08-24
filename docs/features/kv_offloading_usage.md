@@ -160,6 +160,28 @@ this process. Set `ssd_enabled`, `ssd_storage_dir`, and `ssd_capacity_bytes` to
 add the local SSD tier. MoRI's `MORI_UMBP_*` and `UMBP_*` environment variables
 remain available for lower-level transport and master tuning.
 
+The tier starts with `UMBPConfig.from_environment()` and then applies explicit
+JSON values, so per-tier configuration takes precedence. Production tuning
+keys include:
+
+| Key | Purpose |
+| --- | --- |
+| `dram_high_watermark` / `dram_low_watermark` | Bound DRAM eviction hysteresis. |
+| `dram_use_hugepages` / `dram_hugepage_size` | Back the UMBP DRAM pool with huge pages. |
+| `dram_numa_node` / `dram_prefault` | Bind and fault memory near the GPU/NIC. |
+| `ssd_high_watermark` / `ssd_low_watermark` | Bound SSD eviction hysteresis. |
+| `ssd_backend` / `ssd_segment_size_bytes` | Select `file`/`spdk` storage and segment size. |
+| `copy_pipeline_worker_threads` | Parallel DRAM-to-SSD copy workers. |
+| `copy_pipeline_queue_depth` | Maximum asynchronous SSD-copy backlog. |
+| `copy_pipeline_batch_max_ops` | Maximum operations in one copy batch. |
+| `cache_remote_fetches` | Cache remotely fetched blocks on the reader. |
+| `cache_remote_admission` | Apply admission policy to remote fetch caching. |
+| `dram_page_size` | Distributed DRAM allocation page size. |
+
+The last three settings apply only when `master_address` enables distributed
+mode. SPDK also requires MoRI to be built with its SPDK support and configured
+for the target NVMe device.
+
 In distributed mode, UMBP puts are admitted to a node's DRAM tier first and
 then copied asynchronously to SSD. SSD capacity does not replace DRAM admission
 capacity for a burst of new blocks. Size `dram_capacity_bytes` for the expected
@@ -458,6 +480,65 @@ Example (OpenAI-compatible completions request):
   }
 }
 ```
+
+## Scheduler-aware loadback prefetch
+
+Set `target_tier` to `"gpu"` to preload a token prefix into the normal HBM
+prefix cache before admitting the real request:
+
+```json
+{
+  "version": "v1",
+  "prefetch_id": "route-42",
+  "model": "Qwen/Qwen3-0.6B",
+  "prompts": [[1, 2, 3, 4]],
+  "target_tier": "gpu"
+}
+```
+
+The engine admits an internal, non-executing request, loads matching blocks
+through the configured KV connector, publishes them in the ordinary prefix
+cache, and releases the request's references. Poll until the result is
+`ready`, `partial`, or `miss`. This guarded first implementation accepts one
+token-only prompt and an optional cache salt. LoRA and multimodal identities
+remain supported for CPU-targeted prefetch only.
+
+An external scheduler can initiate CPU-tier loadback before forwarding the
+normal inference request:
+
+```text
+POST   /v1/kv_cache/prefetch
+GET    /v1/kv_cache/prefetch/{prefetch_id}
+DELETE /v1/kv_cache/prefetch/{prefetch_id}
+```
+
+The start body contains `version: "v1"`, a unique `prefetch_id`, the served
+`model`, tokenized `prompts`, optional `cache_salt`, optional `lora_name`,
+per-prompt `multimodal_features`, and `target_tier: "cpu"`. Each multimodal
+feature contains its raw content `hash`, placeholder `offset`, and `length`.
+vLLM derives its own cache hashes and tower-LoRA identifiers; callers must not
+send router-local block hashes.
+
+The llm-d `umbp-prefetch` plugin forwards multimodal identities directly. It
+sets `lora_name` only through its explicit `loraModels` map from routed model
+name to vLLM LoRA name. Do not infer this mapping from model-name syntax: a
+false LoRA identity produces a safe miss but defeats prefetch reuse.
+
+The following top-level `kv_connector_extra_config` keys bound scheduler-side
+prefetch state:
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `prefetch_max_pending_requests` | `64` | Maximum simultaneous pending prefetches. |
+| `prefetch_max_pending_blocks` | `4096` | Maximum summed block references across pending prefetches. |
+| `prefetch_max_pending_gpu_bytes` | GPU KV capacity | Maximum HBM bytes reserved by pending GPU-targeted prefetches. |
+| `prefetch_pending_ttl_seconds` | `30` | Cancel and discard abandoned pending work. |
+| `prefetch_terminal_ttl_seconds` | `60` | Retain ready/miss/cancelled results for idempotent retries. |
+
+Admission-limit failures return HTTP 409. The router should fall back to
+ordinary request forwarding and recomputation. These limits bound control
+state and promoted block references; normal CPU-tier watermarks remain the
+authoritative byte-capacity limit.
 
 ## Further Reading
 

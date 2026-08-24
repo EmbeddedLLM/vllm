@@ -155,6 +155,10 @@ class EngineCoreRequest(
     # KV-transfer request is rejected on the D node before engine admission.
     abort_immediately: bool = False
 
+    # Internal request that loads cache blocks into the normal GPU prefix
+    # cache but must never execute the model or emit frontend output.
+    hbm_prefetch_only: bool = False
+
     session_id: str | None = None
 
     @property

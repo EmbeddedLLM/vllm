@@ -19,7 +19,15 @@ class FakeConfig:
         self.dram = SimpleNamespace()
         self.ssd = SimpleNamespace()
         self.eviction = SimpleNamespace()
+        self.copy_pipeline = SimpleNamespace()
         self.distributed = None
+
+    @classmethod
+    def from_environment(cls):
+        config = cls()
+        config.dram.high_watermark = 0.8
+        config.copy_pipeline.worker_threads = 2
+        return config
 
 
 class FakeDistributedConfig:
@@ -142,4 +150,53 @@ def test_mori_tier_builds_distributed_config(monkeypatch):
     assert distributed.master_config.node_address == "10.0.0.2"
     assert distributed.io_engine.port == 16000
     assert distributed.peer_service_port == 17000
+    tier.shutdown()
+
+
+def test_mori_tier_applies_tuning_over_environment(monkeypatch):
+    _install_fake_mori(monkeypatch)
+    view = memoryview(bytearray(32)).cast("B", shape=(2, 16))
+    tier = MoriSecondaryTierManager(
+        _make_spec(),
+        view,
+        "mori",
+        dram_capacity_bytes=1024,
+        dram_high_watermark=0.9,
+        dram_low_watermark=0.7,
+        dram_use_hugepages=True,
+        dram_hugepage_size=2 * 1024 * 1024,
+        dram_numa_node=1,
+        dram_prefault=True,
+        ssd_enabled=True,
+        ssd_capacity_bytes=4096,
+        ssd_backend="spdk",
+        ssd_segment_size_bytes=1024,
+        ssd_high_watermark=0.85,
+        ssd_low_watermark=0.65,
+        copy_pipeline_worker_threads=4,
+        copy_pipeline_queue_depth=256,
+        copy_pipeline_batch_max_ops=32,
+        master_address="master:15558",
+        cache_remote_fetches=False,
+        cache_remote_admission=False,
+        dram_page_size=2 * 1024 * 1024,
+    )
+
+    config = FakeClient.instances[0].config
+    assert config.dram.high_watermark == 0.9
+    assert config.dram.low_watermark == 0.7
+    assert config.dram.use_hugepages
+    assert config.dram.hugepage_size == 2 * 1024 * 1024
+    assert config.dram.numa_node == 1
+    assert config.dram.prefault
+    assert config.ssd.ssd_backend == "spdk"
+    assert config.ssd.segment_size_bytes == 1024
+    assert config.ssd.high_watermark == 0.85
+    assert config.ssd.low_watermark == 0.65
+    assert config.copy_pipeline.worker_threads == 4
+    assert config.copy_pipeline.queue_depth == 256
+    assert config.copy_pipeline.batch_max_ops == 32
+    assert not config.distributed.cache_remote_fetches
+    assert not config.distributed.cache_remote_admission
+    assert config.distributed.dram_page_size == 2 * 1024 * 1024
     tier.shutdown()

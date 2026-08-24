@@ -253,6 +253,23 @@ class EngineCoreClient(ABC):
     ) -> bool:
         raise NotImplementedError
 
+    async def start_kv_prefetch_async(
+        self,
+        prefetch_id: str,
+        prompts: list[list[int]],
+        cache_salt: str | None = None,
+        lora_name: str | None = None,
+        multimodal_features: list[list[dict[str, Any]]] | None = None,
+        target_tier: str = "cpu",
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def poll_kv_prefetch_async(self, prefetch_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def cancel_kv_prefetch_async(self, prefetch_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
     async def reset_encoder_cache_async(self) -> None:
         raise NotImplementedError
 
@@ -1180,6 +1197,31 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async(
             "reset_prefix_cache", reset_running_requests, reset_connector
         )
+
+    async def start_kv_prefetch_async(
+        self,
+        prefetch_id: str,
+        prompts: list[list[int]],
+        cache_salt: str | None = None,
+        lora_name: str | None = None,
+        multimodal_features: list[list[dict[str, Any]]] | None = None,
+        target_tier: str = "cpu",
+    ) -> dict[str, Any]:
+        return await self.call_utility_async(
+            "start_kv_prefetch",
+            prefetch_id,
+            prompts,
+            cache_salt,
+            lora_name,
+            multimodal_features,
+            target_tier,
+        )
+
+    async def poll_kv_prefetch_async(self, prefetch_id: str) -> dict[str, Any]:
+        return await self.call_utility_async("poll_kv_prefetch", prefetch_id)
+
+    async def cancel_kv_prefetch_async(self, prefetch_id: str) -> dict[str, Any]:
+        return await self.call_utility_async("cancel_kv_prefetch", prefetch_id)
 
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")

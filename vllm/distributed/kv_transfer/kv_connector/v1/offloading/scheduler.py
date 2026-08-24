@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import chain, islice
 from typing import Any, NamedTuple
@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
@@ -54,6 +55,10 @@ from vllm.v1.kv_offload.base import (
     TierMatcher,
     make_offload_key,
 )
+from vllm.v1.kv_offload.prefetch import (
+    KVOffloadPrefetchCoordinator,
+    PrefetchResult,
+)
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
 
@@ -62,6 +67,19 @@ logger = init_logger(__name__)
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
+
+
+def _positive_prefetch_config(
+    extra_config: Mapping[str, Any], key: str, default: int | float
+) -> int | float:
+    value = extra_config.get(key, default)
+    if isinstance(default, int):
+        valid = type(value) is int and value > 0
+    else:
+        valid = type(value) in (int, float) and value > 0
+    if not valid:
+        raise ValueError(f"'{key}' must be greater than zero")
+    return value
 
 
 @dataclass(slots=True)
@@ -499,6 +517,30 @@ class OffloadingConnectorScheduler:
             spec, vllm_config, kv_cache_config
         )
         self.manager: OffloadingManager = spec.get_manager()
+        extra_config = spec.extra_config
+        self.prefetch_coordinator = KVOffloadPrefetchCoordinator(
+            self.manager,
+            max_pending_requests=int(
+                _positive_prefetch_config(
+                    extra_config, "prefetch_max_pending_requests", 64
+                )
+            ),
+            max_pending_blocks=int(
+                _positive_prefetch_config(
+                    extra_config, "prefetch_max_pending_blocks", 4096
+                )
+            ),
+            pending_ttl_seconds=float(
+                _positive_prefetch_config(
+                    extra_config, "prefetch_pending_ttl_seconds", 30.0
+                )
+            ),
+            terminal_ttl_seconds=float(
+                _positive_prefetch_config(
+                    extra_config, "prefetch_terminal_ttl_seconds", 60.0
+                )
+            ),
+        )
         self._connector_stats = OffloadingConnectorStats()
 
         full_attention_groups: list[int] = []
@@ -537,29 +579,41 @@ class OffloadingConnectorScheduler:
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
-        # GPU block IDs allocated in the current engine step
         self._current_batch_allocated_block_ids: set[int] = set()
-        # if GPU prefix caching is enabled,
-        # Track loaded chunks to avoid redundant loads.
         self._chunks_being_loaded: set[OffloadKey] | None = (
             set() if vllm_config.cache_config.enable_prefix_caching else None
         )
-
-        # Job ID counter shared by loads and stores.
         self._job_counter: int = 0
-        # Threshold value for stale jobs. All job ids >= _stale_job_threshold are
-        # active jobs.
         self._stale_job_threshold: int = 0
         self._jobs: dict[int, TransferJobStatus] = {}
-
-        # block_id -> pending store job_ids. Used to track jobs that needs
-        # flushing in case a block is re-allocated by the KV cache manager.
-        # Populated only for finished requests (running-request blocks are
-        # protected by their ref_cnt) and for sliding window blocks (which can
-        # be freed before a request finishes).
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
-
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+
+    def start_prefetch(
+        self,
+        prefetch_id: str,
+        prompt_block_hashes: Sequence[Sequence[BlockHash]],
+    ) -> PrefetchResult:
+        """Start CPU-tier promotion for complete offload chunks."""
+        keys: list[OffloadKey] = []
+        for block_hashes in prompt_block_hashes:
+            for group_config in self.config.kv_group_configs:
+                keys.extend(
+                    make_offload_key(block_hash, group_config.group_idx)
+                    for block_hash in islice(
+                        block_hashes,
+                        group_config.hashes_per_chunk - 1,
+                        None,
+                        group_config.hashes_per_chunk,
+                    )
+                )
+        return self.prefetch_coordinator.start(prefetch_id, keys)
+
+    def poll_prefetch(self, prefetch_id: str) -> PrefetchResult:
+        return self.prefetch_coordinator.poll(prefetch_id)
+
+    def cancel_prefetch(self, prefetch_id: str) -> PrefetchResult:
+        return self.prefetch_coordinator.cancel(prefetch_id)
 
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState
@@ -1443,6 +1497,7 @@ class OffloadingConnectorScheduler:
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        self.prefetch_coordinator.expire()
         self._update_req_states(scheduler_output)
         schedule_end_context = ScheduleEndContext(
             new_req_ids=[req.req_id for req in scheduler_output.scheduled_new_reqs],

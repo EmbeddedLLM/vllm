@@ -33,6 +33,7 @@ from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import MultiModalCacheMissError
+from vllm.sampling_params import SamplingParams
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -86,6 +87,11 @@ from vllm.v1.fault_tolerance.engine_core_sentinel import (
     fault_tolerant_wrapper,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
+from vllm.v1.kv_offload.prefetch import (
+    PrefetchMMFeature,
+    PrefetchResult,
+    hash_token_prefix,
+)
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -222,11 +228,14 @@ class EngineCore:
         self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
 
         self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
+        self._prefetch_hash_fn: Callable[[Any], bytes] | None = None
+        self._prefetch_hash_block_size = hash_block_size
         if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
             caching_hash_fn = get_hash_fn_by_name(
                 vllm_config.cache_config.prefix_caching_hash_algo
             )
             init_none_hash(caching_hash_fn)
+            self._prefetch_hash_fn = caching_hash_fn
 
             self.request_block_hasher = get_request_block_hasher(
                 hash_block_size, caching_hash_fn
@@ -803,6 +812,145 @@ class EngineCore:
         return self.scheduler.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    @staticmethod
+    def _prefetch_result_dict(result: PrefetchResult) -> dict[str, Any]:
+        return {
+            "prefetch_id": result.prefetch_id,
+            "status": result.status.value,
+            "total_blocks": result.total_blocks,
+            "ready_blocks": result.ready_blocks,
+        }
+
+    def start_kv_prefetch(
+        self,
+        prefetch_id: str,
+        prompts: list[list[int]],
+        cache_salt: str | None = None,
+        lora_name: str | None = None,
+        multimodal_features: list[list[dict[str, Any]]] | None = None,
+        target_tier: str = "cpu",
+    ) -> dict[str, Any]:
+        if target_tier == "gpu":
+            if lora_name or any(multimodal_features or []):
+                raise ValueError("GPU prefetch currently supports token-only prompts")
+            if len(prompts) != 1:
+                raise ValueError("GPU prefetch currently requires one prompt")
+            block_tokens = (
+                len(prompts[0]) // self._prefetch_hash_block_size
+            ) * self._prefetch_hash_block_size
+            if not block_tokens:
+                raise ValueError("prefetch requires at least one complete cache block")
+            request_id = f"hbm-prefetch:{prefetch_id}"
+            if self.scheduler.has_hbm_prefetch(request_id):
+                status, total_blocks = self.scheduler.poll_hbm_prefetch(request_id)
+                return {
+                    "prefetch_id": prefetch_id,
+                    "status": status,
+                    "total_blocks": total_blocks,
+                    "ready_blocks": total_blocks if status == "ready" else 0,
+                    "target_tier": "gpu",
+                }
+            request = Request(
+                request_id=request_id,
+                prompt_token_ids=prompts[0][:block_tokens],
+                sampling_params=SamplingParams(max_tokens=1),
+                pooling_params=None,
+                cache_salt=cache_salt,
+                block_hasher=self.request_block_hasher,
+                hbm_prefetch_only=True,
+            )
+            self.scheduler.add_hbm_prefetch(request)
+            return {
+                "prefetch_id": prefetch_id,
+                "status": "pending",
+                "total_blocks": block_tokens // self._prefetch_hash_block_size,
+                "ready_blocks": 0,
+                "target_tier": "gpu",
+            }
+        if target_tier != "cpu":
+            raise ValueError(f"unsupported prefetch target tier: {target_tier}")
+        connector = getattr(self.scheduler, "connector", None)
+        start_prefetch = getattr(connector, "start_prefetch", None)
+        if start_prefetch is None or self._prefetch_hash_fn is None:
+            raise RuntimeError("KV prefetch requires the offloading connector")
+        if lora_name and self.vllm_config.lora_config is None:
+            raise ValueError("lora_name requires LoRA to be enabled")
+        raw_features = multimodal_features or [[] for _ in prompts]
+        if len(raw_features) != len(prompts):
+            raise ValueError("multimodal_features must align with prompts")
+        tower_lora = bool(
+            lora_name
+            and self.vllm_config.lora_config is not None
+            and self.vllm_config.lora_config.enable_tower_connector_lora
+        )
+        prompt_features = []
+        for features in raw_features:
+            offsets = [feature["offset"] for feature in features]
+            if offsets != sorted(offsets):
+                raise ValueError("multimodal features must be ordered by offset")
+            prompt_features.append(
+                [
+                    PrefetchMMFeature(
+                        identifier=(
+                            f"{lora_name}:{feature['hash']}"
+                            if tower_lora
+                            else feature["hash"]
+                        ),
+                        offset=feature["offset"],
+                        length=feature["length"],
+                    )
+                    for feature in features
+                ]
+            )
+        prompt_hashes = [
+            hash_token_prefix(
+                token_ids,
+                self._prefetch_hash_block_size,
+                self._prefetch_hash_fn,
+                cache_salt,
+                lora_name,
+                features,
+            )
+            for token_ids, features in zip(prompts, prompt_features)
+        ]
+        if not any(prompt_hashes):
+            raise ValueError("prefetch requires at least one complete cache block")
+        return self._prefetch_result_dict(start_prefetch(prefetch_id, prompt_hashes))
+
+    def poll_kv_prefetch(self, prefetch_id: str) -> dict[str, Any]:
+        hbm_request_id = f"hbm-prefetch:{prefetch_id}"
+        if self.scheduler.has_hbm_prefetch(hbm_request_id):
+            status, total_blocks = self.scheduler.poll_hbm_prefetch(hbm_request_id)
+            return {
+                "prefetch_id": prefetch_id,
+                "status": status,
+                "total_blocks": total_blocks,
+                "ready_blocks": total_blocks if status == "ready" else 0,
+                "target_tier": "gpu",
+            }
+        connector = getattr(self.scheduler, "connector", None)
+        poll_prefetch = getattr(connector, "poll_prefetch", None)
+        if poll_prefetch is None:
+            raise RuntimeError("KV prefetch requires the offloading connector")
+        return self._prefetch_result_dict(poll_prefetch(prefetch_id))
+
+    def cancel_kv_prefetch(self, prefetch_id: str) -> dict[str, Any]:
+        hbm_request_id = f"hbm-prefetch:{prefetch_id}"
+        if self.scheduler.has_hbm_prefetch(hbm_request_id):
+            status, total_blocks = self.scheduler.cancel_hbm_prefetch(hbm_request_id)
+            return {
+                "prefetch_id": prefetch_id,
+                "status": status,
+                "total_blocks": total_blocks,
+                "ready_blocks": total_blocks if status == "ready" else 0,
+                "target_tier": "gpu",
+            }
+        connector = getattr(self.scheduler, "connector", None)
+        cancel_prefetch = getattr(connector, "cancel_prefetch", None)
+        if cancel_prefetch is None:
+            raise RuntimeError("KV prefetch requires the offloading connector")
+        return self._prefetch_result_dict(cancel_prefetch(prefetch_id))
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.

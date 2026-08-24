@@ -39,9 +39,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
 from vllm.forward_context import ForwardContext
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+from vllm.v1.kv_offload.prefetch import PrefetchResult
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
@@ -191,6 +193,22 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         self.connector_scheduler.reset_cache()
         return True
+
+    def start_prefetch(
+        self,
+        prefetch_id: str,
+        prompt_block_hashes: list[list[BlockHash]],
+    ) -> PrefetchResult:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.start_prefetch(prefetch_id, prompt_block_hashes)
+
+    def poll_prefetch(self, prefetch_id: str) -> PrefetchResult:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.poll_prefetch(prefetch_id)
+
+    def cancel_prefetch(self, prefetch_id: str) -> PrefetchResult:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.cancel_prefetch(prefetch_id)
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         if self.connector_scheduler is not None:

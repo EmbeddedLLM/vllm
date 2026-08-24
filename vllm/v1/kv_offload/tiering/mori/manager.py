@@ -59,9 +59,22 @@ class MoriSecondaryTierManager(SecondaryTierManager):
         primary_kv_view: memoryview,
         tier_type: str,
         dram_capacity_bytes: int,
+        dram_high_watermark: float | None = None,
+        dram_low_watermark: float | None = None,
+        dram_use_hugepages: bool | None = None,
+        dram_hugepage_size: int | None = None,
+        dram_numa_node: int | None = None,
+        dram_prefault: bool | None = None,
         ssd_enabled: bool = False,
         ssd_storage_dir: str = "/tmp/vllm_umbp",
         ssd_capacity_bytes: int = 0,
+        ssd_high_watermark: float | None = None,
+        ssd_low_watermark: float | None = None,
+        ssd_backend: str | None = None,
+        ssd_segment_size_bytes: int | None = None,
+        copy_pipeline_worker_threads: int | None = None,
+        copy_pipeline_queue_depth: int | None = None,
+        copy_pipeline_batch_max_ops: int | None = None,
         eviction_policy: str = "lru",
         auto_promote_on_read: bool = True,
         master_address: str | None = None,
@@ -72,6 +85,9 @@ class MoriSecondaryTierManager(SecondaryTierManager):
         staging_buffer_size: int = 256 * 1024 * 1024,
         ssd_staging_buffer_size: int = 256 * 1024 * 1024,
         ssd_staging_buffer_slots: int = 16,
+        cache_remote_fetches: bool | None = None,
+        cache_remote_admission: bool | None = None,
+        dram_page_size: int | None = None,
         io_threads: int = 4,
         key_prefix: str | None = None,
         locality: str | None = None,
@@ -93,11 +109,30 @@ class MoriSecondaryTierManager(SecondaryTierManager):
                 "The MoRI UMBP tier requires amd-mori built with BUILD_UMBP=ON"
             ) from exc
 
-        config = UMBPConfig()
+        config = UMBPConfig.from_environment()
         config.dram.capacity_bytes = dram_capacity_bytes
+        self._set_if_not_none(config.dram, "high_watermark", dram_high_watermark)
+        self._set_if_not_none(config.dram, "low_watermark", dram_low_watermark)
+        self._set_if_not_none(config.dram, "use_hugepages", dram_use_hugepages)
+        self._set_if_not_none(config.dram, "hugepage_size", dram_hugepage_size)
+        self._set_if_not_none(config.dram, "numa_node", dram_numa_node)
+        self._set_if_not_none(config.dram, "prefault", dram_prefault)
         config.ssd.enabled = ssd_enabled
         config.ssd.storage_dir = ssd_storage_dir
         config.ssd.capacity_bytes = ssd_capacity_bytes
+        self._set_if_not_none(config.ssd, "high_watermark", ssd_high_watermark)
+        self._set_if_not_none(config.ssd, "low_watermark", ssd_low_watermark)
+        self._set_if_not_none(config.ssd, "ssd_backend", ssd_backend)
+        self._set_if_not_none(config.ssd, "segment_size_bytes", ssd_segment_size_bytes)
+        self._set_if_not_none(
+            config.copy_pipeline, "worker_threads", copy_pipeline_worker_threads
+        )
+        self._set_if_not_none(
+            config.copy_pipeline, "queue_depth", copy_pipeline_queue_depth
+        )
+        self._set_if_not_none(
+            config.copy_pipeline, "batch_max_ops", copy_pipeline_batch_max_ops
+        )
         config.eviction.policy = eviction_policy
         config.eviction.auto_promote_on_read = auto_promote_on_read
         if master_address:
@@ -113,6 +148,13 @@ class MoriSecondaryTierManager(SecondaryTierManager):
             distributed.staging_buffer_size = staging_buffer_size
             distributed.ssd_staging_buffer_size = ssd_staging_buffer_size
             distributed.ssd_staging_buffer_slots = ssd_staging_buffer_slots
+            self._set_if_not_none(
+                distributed, "cache_remote_fetches", cache_remote_fetches
+            )
+            self._set_if_not_none(
+                distributed, "cache_remote_admission", cache_remote_admission
+            )
+            self._set_if_not_none(distributed, "dram_page_size", dram_page_size)
             config.distributed = distributed
 
         self.locality = Locality(locality) if locality is not None else None
@@ -137,6 +179,11 @@ class MoriSecondaryTierManager(SecondaryTierManager):
             self._executor.shutdown(wait=False, cancel_futures=True)
             raise RuntimeError("MoRI failed to register the primary KV buffer")
         self._key_prefix = key_prefix or self._default_key_prefix(offloading_spec)
+
+    @staticmethod
+    def _set_if_not_none(target: Any, name: str, value: Any) -> None:
+        if value is not None:
+            setattr(target, name, value)
 
     @staticmethod
     def _default_key_prefix(offloading_spec: "OffloadingSpec") -> str:

@@ -161,6 +161,7 @@ steps:
   - pytest -v -s -m 'cpu_test' v1/kv_connector/unit
   - pytest -v -s -m 'cpu_test' v1/ec_connector/unit
   - pytest -v -s -m 'cpu_test' v1/metrics
+  - pytest -v -s v1/kv_offload/tiering/test_mori_tier.py v1/kv_offload/tiering/test_mori_placement.py v1/kv_offload/tiering/test_mori_routing.py
 
 - label: ":computer: (CPU) Async Engine, Inputs, Utils, Worker, Config" # TBD
   timeout_in_minutes: 180
@@ -518,6 +519,37 @@ steps:
   - pytest -v -s basic_correctness/test_mem.py
   - VLLM_TARGET_TEST_SUITE=MI300 pytest -v -s basic_correctness/test_basic_correctness.py
   - pytest -v -s basic_correctness/test_cpu_offload.py
+
+- label: ":amd: (MI300) MoRI UMBP KV Offload Integration"
+  timeout_in_minutes: 30
+  mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]
+  dind: false
+  agent_pool: mi300_1
+  optional: true
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+  - vllm/v1/kv_offload/
+  - tests/v1/kv_offload/tiering/test_mori_gpu_integration.py
+  commands:
+  - RUN_UMBP_INTEGRATION_TEST=1 pytest -v -s v1/kv_offload/tiering/test_mori_gpu_integration.py
+
+- label: ":amd: (MI300, 2 GPUs) MoRI UMBP TP=2 Integration"
+  timeout_in_minutes: 30
+  mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]
+  dind: false
+  agent_pool: mi300_2
+  num_gpus: 2
+  optional: true
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+  - vllm/v1/kv_offload/
+  - tests/v1/kv_offload/tiering/test_mori_gpu_integration.py
+  commands:
+  - RUN_UMBP_TP2_INTEGRATION_TEST=1 pytest -v -s v1/kv_offload/tiering/test_mori_gpu_integration.py::test_mori_restores_evicted_tp2_kv_from_umbp
+
+# TODO(umbp): Add a two-node AMD job with one vLLM replica per node. Populate
+# UMBP from replica A, then require replica B to restore the same prefix through
+# MoRI's remote data path and verify remote BatchRouteGet/read-byte metrics.
 
 - label: ":amd: (MI300) Distributed Models" # TBD
   timeout_in_minutes: 180

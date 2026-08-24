@@ -163,6 +163,25 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def start_kv_prefetch(
+        self,
+        prefetch_id: str,
+        prompts: list[list[int]],
+        cache_salt: str | None = None,
+        lora_name: str | None = None,
+        multimodal_features: list[list[dict[str, Any]]] | None = None,
+        target_tier: str = "cpu",
+    ) -> dict[str, Any]:
+        """Start an offloaded KV prefetch without admitting model execution."""
+        ...
+
+    @abstractmethod
+    async def poll_kv_prefetch(self, prefetch_id: str) -> dict[str, Any]: ...
+
+    @abstractmethod
+    async def cancel_kv_prefetch(self, prefetch_id: str) -> dict[str, Any]: ...
+
+    @abstractmethod
     async def sleep(self, level: int = 1, mode: "PauseMode" = "abort") -> None:
         """Sleep the engine"""
         ...

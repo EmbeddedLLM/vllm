@@ -4733,6 +4733,83 @@ def test_prepend_skipped_requests_order():
     assert waiting_reqs == expected_waiting_reqs
 
 
+def test_hbm_prefetch_completion_caches_then_releases_without_output():
+    """A remote preload publishes prefix blocks but emits no client finish."""
+    scheduler = create_scheduler(use_kv_connector=True)
+    request = create_requests(num_requests=1)[0]
+    request.hbm_prefetch_only = True
+    scheduler.add_hbm_prefetch(request)
+    scheduler.waiting.remove_requests([request])
+    scheduler.skipped_waiting.add_request(request)
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    request.num_computed_tokens = request.num_tokens
+    scheduler.finished_recving_kv_req_ids.add(request.request_id)
+    scheduler.kv_cache_manager.cache_blocks = Mock()
+    scheduler._free_request = Mock()
+
+    output = scheduler.schedule()
+
+    scheduler.kv_cache_manager.cache_blocks.assert_called_once_with(
+        request, request.num_tokens
+    )
+    scheduler._free_request.assert_called_once_with(request)
+    assert scheduler.poll_hbm_prefetch(request.request_id)[0] == "ready"
+    assert not output.scheduled_new_reqs
+    assert request.request_id not in scheduler.finished_req_ids
+
+
+def test_hbm_prefetch_admission_caps_pending_blocks_and_requests():
+    scheduler = create_scheduler(use_kv_connector=True, block_size=16)
+    scheduler.hbm_prefetch_max_pending_requests = 1
+    scheduler.hbm_prefetch_max_pending_blocks = 2
+    first, second = create_requests(num_requests=2, num_tokens=32)
+    first.hbm_prefetch_only = True
+    second.hbm_prefetch_only = True
+
+    scheduler.add_hbm_prefetch(first)
+
+    with pytest.raises(RuntimeError, match="request capacity"):
+        scheduler.add_hbm_prefetch(second)
+    scheduler.hbm_prefetch_max_pending_requests = 2
+    with pytest.raises(RuntimeError, match="block capacity"):
+        scheduler.add_hbm_prefetch(second)
+
+
+def test_hbm_prefetch_admission_caps_gpu_bytes():
+    scheduler = create_scheduler(use_kv_connector=True, block_size=16)
+    scheduler.hbm_prefetch_bytes_per_block = 10
+    scheduler.hbm_prefetch_max_pending_gpu_bytes = 15
+    request = create_requests(num_requests=1, num_tokens=32)[0]
+    request.hbm_prefetch_only = True
+
+    with pytest.raises(RuntimeError, match="byte capacity"):
+        scheduler.add_hbm_prefetch(request)
+
+
+def test_hbm_prefetch_expiry_cancels_pending_and_discards_terminal():
+    scheduler = create_scheduler(use_kv_connector=True, block_size=16)
+    now = [10.0]
+    scheduler._hbm_prefetch_time = lambda: now[0]
+    scheduler.hbm_prefetch_pending_ttl_seconds = 2.0
+    scheduler.hbm_prefetch_terminal_ttl_seconds = 3.0
+    pending, terminal = create_requests(num_requests=2, num_tokens=16)
+    pending.hbm_prefetch_only = True
+    terminal.hbm_prefetch_only = True
+    scheduler.add_hbm_prefetch(pending)
+    scheduler.add_hbm_prefetch(terminal)
+    scheduler.hbm_prefetch_results[terminal.request_id].status = "ready"
+    scheduler.finish_requests(terminal.request_id, RequestStatus.FINISHED_STOPPED)
+    scheduler.finished_req_ids.discard(terminal.request_id)
+
+    now[0] = 14.0
+    scheduler.expire_hbm_prefetches()
+
+    assert pending.request_id not in scheduler.requests
+    assert pending.request_id not in scheduler.hbm_prefetch_results
+    assert terminal.request_id not in scheduler.hbm_prefetch_results
+    assert pending.request_id not in scheduler.finished_req_ids
+
+
 def test_remote_kv_promotion_keeps_fcfs_with_grammar_prefix():
     scheduler = create_scheduler(max_num_seqs=1)
     scheduler.connector = Mock()

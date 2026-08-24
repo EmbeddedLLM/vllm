@@ -142,6 +142,26 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def add_hbm_prefetch(self, request: "Request") -> None:
+        """Admit an internal request that only populates the HBM prefix cache."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def has_hbm_prefetch(self, request_id: str) -> bool:
+        """Return whether a non-expired HBM prefetch record exists."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def poll_hbm_prefetch(self, request_id: str) -> tuple[str, int]:
+        """Return HBM prefetch status and total logical blocks."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def cancel_hbm_prefetch(self, request_id: str) -> tuple[str, int]:
+        """Cancel an HBM prefetch and return status and total blocks."""
+        raise NotImplementedError
+
+    @abstractmethod
     def finish_requests(
         self,
         request_ids: str | Iterable[str] | None,

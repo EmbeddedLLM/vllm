@@ -965,6 +965,30 @@ class AsyncLLM(EngineClient):
             reset_running_requests, reset_connector
         )
 
+    async def start_kv_prefetch(
+        self,
+        prefetch_id: str,
+        prompts: list[list[int]],
+        cache_salt: str | None = None,
+        lora_name: str | None = None,
+        multimodal_features: list[list[dict[str, Any]]] | None = None,
+        target_tier: str = "cpu",
+    ) -> dict[str, Any]:
+        return await self.engine_core.start_kv_prefetch_async(
+            prefetch_id,
+            prompts,
+            cache_salt,
+            lora_name,
+            multimodal_features,
+            target_tier,
+        )
+
+    async def poll_kv_prefetch(self, prefetch_id: str) -> dict[str, Any]:
+        return await self.engine_core.poll_kv_prefetch_async(prefetch_id)
+
+    async def cancel_kv_prefetch(self, prefetch_id: str) -> dict[str, Any]:
+        return await self.engine_core.cancel_kv_prefetch_async(prefetch_id)
+
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 
