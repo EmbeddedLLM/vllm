@@ -188,3 +188,34 @@ from this local latency benchmark.
    p99 TTFT, hit rate, recomputed tokens, CPU utilization, and device IOPS.
 5. Run two replicas and two nodes to quantify cross-replica hits and remote
    reads against the filesystem tier's local-miss behavior.
+
+## AMD GPU correctness checkpoint (2026-08-26)
+
+The current container exposes eight gfx950 GPUs with 309,220,868,096 bytes of
+VRAM each. The host has two NUMA nodes, 18,432 free 2 MiB hugepages, eight NVMe
+devices, and both Ionic and mlx5 RDMA devices. These facts establish available
+test capacity; they are not performance results.
+
+The opt-in Qwen/Qwen3-0.6B UMBP integration tests passed on TP=1 and TP=2. Each
+test generated a prefix, forced it out of the 16-block GPU cache with six other
+prompts, restored the prefix through UMBP, checked exact generated-output
+equality, and required tier-read plus CPU-to-GPU byte counters to increase.
+
+```bash
+RUN_UMBP_INTEGRATION_TEST=1 HIP_VISIBLE_DEVICES=0 \
+  .venv/bin/python -m pytest \
+  tests/v1/kv_offload/tiering/test_mori_gpu_integration.py::\
+test_mori_restores_evicted_gpu_kv_from_umbp -v -s
+
+RUN_UMBP_TP2_INTEGRATION_TEST=1 HIP_VISIBLE_DEVICES=0,1 \
+  .venv/bin/python -m pytest \
+  tests/v1/kv_offload/tiering/test_mori_gpu_integration.py::\
+test_mori_restores_evicted_tp2_kv_from_umbp -v -s
+```
+
+The TP=2 run reported 77,070,336 UMBP write bytes and 11,010,048 UMBP read
+bytes. The CPU-to-GPU load counter also reported 11,010,048 bytes. The UMBP
+read timer accumulated 0.001362 seconds and the CPU-to-GPU load timer
+accumulated 0.004674 seconds. This is a single correctness workload with JIT,
+startup, and test orchestration effects. It must not be used as a steady-state
+bandwidth or latency result.

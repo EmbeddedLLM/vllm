@@ -395,5 +395,11 @@ an acknowledgement. The local two-process-equivalent run passed with 8,192
 bytes. Cross-node RDMA and failure fallback remain unchecked until the harness
 is run on the target network.
 
+Real AMD validation on 2026-08-26 passed the Qwen/Qwen3-0.6B UMBP restoration
+test on TP=1 and TP=2. Both runs forced GPU eviction, required UMBP tier-read
+and CPU-to-GPU counters, and checked generated-output equality. The TP=2 run
+restored 11,010,048 bytes through both measured stages. These runs close local
+GPU correctness only; they do not replace the Phase 4 sweep or profiling.
+
 1. Whether SDMA loadback belongs in the generic CPU offload worker so all
    secondary tiers benefit.
