@@ -137,6 +137,10 @@ unbounded cache capacity, and can overlap restore with queue/model work.
 
 ### Phase 4: transfer-path optimization
 
+Phase 4 is not complete. Distributed correctness harnesses may be implemented
+before it, but the concurrency matrix and performance claims require Phase 4
+profiling and tuning first.
+
 - [ ] Sweep `blocks_per_chunk` and UMBP batch sizes.
 - [ ] Verify pinned, hugepage-backed, NUMA-local CPU buffers.
 - [ ] Profile ROCm SDMA use and synchronization granularity.
@@ -383,6 +387,13 @@ both `mori_umbp_ssd_read_total{status="ok"}` and
 `mori_umbp_ssd_read_bytes_total` to advance. A missing delta fails the run.
 Other UMBP results are labeled `logical-umbp-only`; released MoRI has no DRAM
 read counter, so absence of an SSD delta is not used to infer DRAM placement.
+
+The remote-read validator supports separate source and reader processes for
+two physical hosts. The source publishes its deterministic block before the
+reader joins and remains alive until the reader verifies every byte and stores
+an acknowledgement. The local two-process-equivalent run passed with 8,192
+bytes. Cross-node RDMA and failure fallback remain unchecked until the harness
+is run on the target network.
 
 1. Whether SDMA loadback belongs in the generic CPU offload worker so all
    secondary tiers benefit.

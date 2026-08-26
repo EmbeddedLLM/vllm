@@ -253,6 +253,34 @@ This proves remote-read correctness and logical event integration. Because both
 clients run on one host, it does not prove RDMA transport, NIC selection,
 physical placement, or cross-node performance.
 
+For two physical nodes, start `umbp_master` on a reachable host. Start the
+source first and leave it running so it retains ownership of the validation
+block:
+
+```bash
+.venv/bin/python \
+  examples/features/kv_events/validate_umbp_remote_placement.py \
+  --role source --master-address 10.0.0.1:15558 \
+  --node-id replica-a --node-address 10.0.0.2 \
+  --io-engine-port 16000 --peer-service-port 17000
+```
+
+After it prints `READY`, run the reader on the other node with distinct ports:
+
+```bash
+.venv/bin/python \
+  examples/features/kv_events/validate_umbp_remote_placement.py \
+  --role reader --master-address 10.0.0.1:15558 \
+  --node-id replica-b --node-address 10.0.0.3 \
+  --io-engine-port 16000 --peer-service-port 17000
+```
+
+The reader verifies every byte and writes an acknowledgement through UMBP; the
+source waits for that acknowledgement before exiting. Permit the master, I/O
+engine, and peer-service ports through host firewalls. A passing run proves
+cross-node correctness. Verify the selected RDMA provider and byte counters in
+MoRI logs or transport metrics before recording it as an RDMA result.
+
 Routers can use `MoriPlacementClient.match(..., count_as_hit=True)` to query
 which registered nodes hold a request's block hashes. The returned MoRI match
 objects include the node ID, peer address, and matched hashes grouped by HBM,
