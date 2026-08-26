@@ -377,5 +377,12 @@ could not run because Docker and Podman are unavailable; its earlier signature
 gate also rejects six unsigned checkpoint commits already present on the
 branch.
 
+The forced-eviction benchmark can consume the unmodified MoRI master's
+Prometheus endpoint. Strict SSD mode brackets every timed request and waits for
+both `mori_umbp_ssd_read_total{status="ok"}` and
+`mori_umbp_ssd_read_bytes_total` to advance. A missing delta fails the run.
+Other UMBP results are labeled `logical-umbp-only`; released MoRI has no DRAM
+read counter, so absence of an SSD delta is not used to infer DRAM placement.
+
 1. Whether SDMA loadback belongs in the generic CPU offload worker so all
    secondary tiers benefit.

@@ -113,6 +113,22 @@ evaluated for capacity-weighted hit rate, aggregate concurrency, SSD spill, and
 cross-replica reuse; those benefits can avoid recomputation even when an
 individual hit has higher latency.
 
+For an SSD-spill run, start the MoRI master with a nonzero metrics port and
+require existing MoRI counters to prove every timed SSD read:
+
+```bash
+.venv/bin/python benchmarks/kv_offload/benchmark_umbp_vs_cpu.py \
+  --base-url http://127.0.0.1:8000 --mode umbp --trials 10 \
+  --mori-metrics-url http://127.0.0.1:9091/metrics \
+  --expect-umbp-ssd
+```
+
+The benchmark waits for MoRI's asynchronous metrics flush and requires both a
+successful SSD-read counter increment and positive SSD-read bytes for every
+trial. Without `--expect-umbp-ssd`, results are labeled `logical-umbp-only`.
+Released MoRI has no equivalent DRAM-read counter, so zero SSD activity is not
+accepted as proof of a physical DRAM read.
+
 ## Longer prefixes
 
 To test whether transfer overhead is amortized by avoided prefill work, repeat

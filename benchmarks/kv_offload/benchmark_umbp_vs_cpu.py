@@ -37,6 +37,9 @@ class Result:
     lookup_async_time_s: float
     request_queue_time_s: float
     server_e2e_time_s: float
+    mori_ssd_reads: float
+    mori_ssd_read_bytes: float
+    physical_tier_attribution: str
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -88,6 +91,36 @@ def _metrics(base_url: str) -> dict[str, float]:
         ),
         "server_e2e_time": _metric_total(body, "vllm:e2e_request_latency_seconds_sum"),
     }
+
+
+def _mori_metrics(metrics_url: str) -> dict[str, float]:
+    response = requests.get(metrics_url, timeout=30)
+    response.raise_for_status()
+    body = response.text
+    return {
+        "ssd_reads": _metric_total(body, "mori_umbp_ssd_read_total", 'status="ok"'),
+        "ssd_read_bytes": _metric_total(body, "mori_umbp_ssd_read_bytes_total"),
+    }
+
+
+def _wait_for_mori_ssd_read(
+    metrics_url: str,
+    before: dict[str, float],
+    timeout: float,
+) -> dict[str, float]:
+    deadline = time.monotonic() + timeout
+    after = _mori_metrics(metrics_url)
+    while (
+        after["ssd_reads"] <= before["ssd_reads"]
+        or after["ssd_read_bytes"] <= before["ssd_read_bytes"]
+    ):
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "MoRI metrics did not prove a successful SSD read before timeout"
+            )
+        time.sleep(0.1)
+        after = _mori_metrics(metrics_url)
+    return after
 
 
 def _completion(
@@ -151,9 +184,18 @@ def main() -> None:
     parser.add_argument("--trials", type=int, default=10)
     parser.add_argument("--prompt-tokens", type=int, default=128)
     parser.add_argument("--eviction-prompts", type=int, default=3)
+    parser.add_argument("--mori-metrics-url")
+    parser.add_argument("--expect-umbp-ssd", action="store_true")
+    parser.add_argument("--metrics-settle-timeout", type=float, default=5.0)
     args = parser.parse_args()
     if args.trials < 1 or args.eviction_prompts < 1:
         parser.error("trials and eviction-prompts must be positive")
+    if args.metrics_settle_timeout <= 0:
+        parser.error("metrics-settle-timeout must be positive")
+    if args.expect_umbp_ssd and args.mode != "umbp":
+        parser.error("expect-umbp-ssd requires --mode umbp")
+    if args.expect_umbp_ssd and not args.mori_metrics_url:
+        parser.error("expect-umbp-ssd requires --mori-metrics-url")
 
     prompts = _make_prompts(
         args.model,
@@ -163,6 +205,9 @@ def main() -> None:
     target = prompts[0]
     _completion(args.base_url, args.model, target, stream=False)
     metrics_before = _metrics(args.base_url)
+    mori_before = (
+        _mori_metrics(args.mori_metrics_url) if args.mori_metrics_url else None
+    )
     ttfts = []
     latencies = []
     trial_cpu_to_gpu_bytes = []
@@ -180,8 +225,18 @@ def main() -> None:
             )
             next_prompt += 1
         trial_metrics_before = _metrics(args.base_url)
+        trial_mori_before = (
+            _mori_metrics(args.mori_metrics_url) if args.mori_metrics_url else None
+        )
         ttft, latency = _completion(args.base_url, args.model, target, stream=True)
         trial_metrics_after = _metrics(args.base_url)
+        if args.expect_umbp_ssd:
+            assert trial_mori_before is not None
+            _wait_for_mori_ssd_read(
+                args.mori_metrics_url,
+                trial_mori_before,
+                args.metrics_settle_timeout,
+            )
         cpu_restore_bytes = (
             trial_metrics_after["cpu_to_gpu"] - trial_metrics_before["cpu_to_gpu"]
         )
@@ -208,6 +263,7 @@ def main() -> None:
         )
 
     metrics_after = _metrics(args.base_url)
+    mori_after = _mori_metrics(args.mori_metrics_url) if args.mori_metrics_url else None
     cpu_to_gpu_bytes = metrics_after["cpu_to_gpu"] - metrics_before["cpu_to_gpu"]
     cpu_to_gpu_time = (
         metrics_after["cpu_to_gpu_time"] - metrics_before["cpu_to_gpu_time"]
@@ -249,6 +305,23 @@ def main() -> None:
         ),
         server_e2e_time_s=(
             metrics_after["server_e2e_time"] - metrics_before["server_e2e_time"]
+        ),
+        mori_ssd_reads=(
+            mori_after["ssd_reads"] - mori_before["ssd_reads"]
+            if mori_after is not None and mori_before is not None
+            else 0
+        ),
+        mori_ssd_read_bytes=(
+            mori_after["ssd_read_bytes"] - mori_before["ssd_read_bytes"]
+            if mori_after is not None and mori_before is not None
+            else 0
+        ),
+        physical_tier_attribution=(
+            "ssd-proven"
+            if args.expect_umbp_ssd
+            else "logical-umbp-only"
+            if args.mode == "umbp"
+            else "not-applicable"
         ),
     )
     if args.mode != "recompute" and result.cpu_to_gpu_bytes <= 0:
