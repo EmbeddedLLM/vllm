@@ -401,5 +401,14 @@ and CPU-to-GPU counters, and checked generated-output equality. The TP=2 run
 restored 11,010,048 bytes through both measured stages. These runs close local
 GPU correctness only; they do not replace the Phase 4 sweep or profiling.
 
+The reproducible node bootstrap is
+`tools/umbp/bootstrap_distributed_node.sh`. It pins the three validated project
+revisions, builds the released MoRI source without local patches, installs vLLM
+and its test dependencies in a Python 3.12 uv environment, checks GPU and UMBP
+imports, and reports visible RDMA addresses. It deliberately leaves privileged
+host networking, hugepage, and NVMe configuration to the operator. The script
+and accompanying usage documentation passed `bash -n` and the targeted
+pre-commit suite, including ShellCheck.
+
 1. Whether SDMA loadback belongs in the generic CPU offload worker so all
    secondary tiers benefit.

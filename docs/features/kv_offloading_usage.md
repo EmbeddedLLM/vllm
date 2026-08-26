@@ -123,6 +123,35 @@ The MoRI tier (`type: "mori"`) uses UMBP as a distributed DRAM and optional
 SSD pool. Install `amd-mori` with `BUILD_UMBP=ON`. For distributed mode, start
 the packaged master before vLLM:
 
+For a fresh ROCm/RDMA node, install the host prerequisites first. On
+Debian/Ubuntu, the minimum MoRI packages are:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential cmake ninja-build curl git libpci-dev \
+  libibverbs-dev ibverbs-utils
+```
+
+ROCm, the GPU driver, and the NIC vendor's userspace RDMA library must already
+match the host kernel and hardware. Then run the pinned, non-privileged
+bootstrap from a checkout of this branch:
+
+```bash
+git clone --branch umbp https://github.com/EmbeddedLLM/vllm.git vllm-bootstrap
+cd vllm-bootstrap
+tools/umbp/bootstrap_distributed_node.sh /app/umbp
+source /app/umbp/.venv/bin/activate
+```
+
+The script clones the tested vLLM, unmodified MoRI, and llm-d Router commits;
+creates a Python 3.12 uv environment; builds MoRI with UMBP and without SPDK;
+installs editable vLLM plus test dependencies; checks PyTorch GPU and UMBP
+imports; and prints the RDMA device-to-interface/IP mapping. Existing clones
+are reused and placed at detached pinned commits. Override `VLLM_REF`,
+`MORI_REF`, or `LLMD_REF` only when intentionally validating another revision.
+The script does not change firewall, hugepage, RDMA, or NVMe configuration.
+
 ```bash
 umbp_master 0.0.0.0:15558
 ```
