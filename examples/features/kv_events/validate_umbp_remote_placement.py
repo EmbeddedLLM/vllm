@@ -5,6 +5,7 @@
 import argparse
 import contextlib
 import ctypes
+import hashlib
 import socket
 import subprocess
 import time
@@ -75,6 +76,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--io-engine-port", type=int, default=0)
     parser.add_argument("--peer-service-port", type=int, default=0)
     parser.add_argument("--size", type=int, default=4096)
+    parser.add_argument(
+        "--reader-staging",
+        action="store_true",
+        help="read through Mori's registered staging buffer instead of zero-copy",
+    )
     parser.add_argument("--key-prefix", default="vllm:validation:")
     parser.add_argument("--timeout", type=float, default=60.0)
     return parser.parse_args()
@@ -82,6 +88,31 @@ def parse_args() -> argparse.Namespace:
 
 def _payload(size: int) -> ctypes.Array:
     return (ctypes.c_ubyte * size)(*((index * 131 + 17) % 256 for index in range(size)))
+
+
+def _assert_payload(restored: ctypes.Array, expected: ctypes.Array) -> None:
+    actual_bytes = bytes(restored)
+    expected_bytes = bytes(expected)
+    if actual_bytes == expected_bytes:
+        return
+    first = next(
+        index
+        for index, (actual, wanted) in enumerate(zip(actual_bytes, expected_bytes))
+        if actual != wanted
+    )
+    start = max(0, first - 8)
+    end = min(len(actual_bytes), first + 24)
+    mismatch_count = sum(
+        actual != wanted for actual, wanted in zip(actual_bytes, expected_bytes)
+    )
+    raise AssertionError(
+        "remote data mismatch: "
+        f"first_offset={first} mismatched_bytes={mismatch_count}/{len(actual_bytes)} "
+        f"actual_sha256={hashlib.sha256(actual_bytes).hexdigest()} "
+        f"expected_sha256={hashlib.sha256(expected_bytes).hexdigest()} "
+        f"actual[{start}:{end}]={actual_bytes[start:end].hex()} "
+        f"expected[{start}:{end}]={expected_bytes[start:end].hex()}"
+    )
 
 
 def _keys(key_prefix: str) -> tuple[bytes, str, str]:
@@ -151,14 +182,20 @@ def _run_reader(args: argparse.Namespace) -> None:
         expected = _payload(args.size)
         restored = (ctypes.c_ubyte * args.size)()
         restored_ptr = ctypes.addressof(restored)
-        assert client.register_memory(restored_ptr, args.size)
+        ctypes.memset(restored_ptr, 0xA5, args.size)
+        if not args.reader_staging:
+            assert client.register_memory(restored_ptr, args.size)
         assert client.get_into_ptr(key, restored_ptr, args.size)
-        assert bytes(restored) == bytes(expected), "remote data mismatch"
+        _assert_payload(restored, expected)
         ack = (ctypes.c_ubyte * 1)(1)
         assert client.register_memory(ctypes.addressof(ack), 1)
         assert client.put_from_ptr(ack_key, ctypes.addressof(ack), 1)
         client.flush()
-        print(f"PASS: restored {args.size} byte-correct bytes; availability=UMBP")
+        path = "staging" if args.reader_staging else "zero-copy"
+        print(
+            f"PASS: restored {args.size} byte-correct bytes; "
+            f"availability=UMBP path={path}"
+        )
     finally:
         close_client(client)
 
@@ -193,14 +230,17 @@ def _run_local(args: argparse.Namespace) -> None:
         wait_until(lambda: source.exists(key), args.timeout)
 
         destination = make_client(master_address, "replica-b", "127.0.0.1")
-        assert destination.register_memory(restored_b_ptr, args.size)
+        ctypes.memset(restored_b_ptr, 0xA5, args.size)
+        if not args.reader_staging:
+            assert destination.register_memory(restored_b_ptr, args.size)
         assert destination.get_into_ptr(key, restored_b_ptr, args.size)
-        assert bytes(restored_b) == bytes(source_data), "remote data mismatch"
+        _assert_payload(restored_b, source_data)
 
         _validate_logical_event(block_hash)
+        path = "staging" if args.reader_staging else "zero-copy"
         print(
             f"PASS: replica-b restored {args.size} correct bytes from "
-            "replica-a; availability=UMBP"
+            f"replica-a; availability=UMBP path={path}"
         )
     finally:
         for client in (destination, source):
