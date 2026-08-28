@@ -62,3 +62,33 @@ only then the tier-2 performance comparison.
 
 Do not copy an example PCI address from another host. Resolve and approve the
 device independently on every machine.
+
+## Checking two-node RDMA connectivity
+
+`check_rdma_peer.sh` contains the interface and address maps for local host
+`192.168.0.69` and remote host `192.168.0.185`. From the local host, check the
+management route and all eight routed RoCE IPv6 paths:
+
+```bash
+tools/umbp/check_rdma_peer.sh ip
+```
+
+The two hosts use different routed `/64` prefixes, so the script verifies the
+selected egress interface instead of requiring identical prefixes. ICMP only
+proves IP connectivity. To test an actual RDMA read, first use `show_gids` on
+each host to find the GID index for `ionic_0`. On the remote host, run:
+
+```bash
+tools/umbp/check_rdma_peer.sh rdma-server 0 <remote-gid-index>
+```
+
+Then, on the local host, run:
+
+```bash
+tools/umbp/check_rdma_peer.sh rdma-client 0 <local-gid-index>
+```
+
+The link index ranges from `0` to `7` and selects the corresponding
+`ionic_<index>` device. GID indexes can differ between hosts and must be
+resolved independently. The `ip` and `ping` commands are provided by
+`iproute2` and `iputils-ping`; `ib_read_bw` is provided by `perftest`.
