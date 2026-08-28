@@ -88,6 +88,11 @@ Then, on the local host, run:
 tools/umbp/check_rdma_peer.sh rdma-client 0 <local-gid-index>
 ```
 
+The script passes both `--ipv6` and `--ipv6-addr` to `ib_read_bw`. The first
+selects an IPv6 GID and the second makes perftest use IPv6 for its TCP parameter
+exchange. Omitting `--ipv6-addr` makes perftest resolve the IPv6 peer with
+`AF_INET` and fail before it creates the RDMA connection.
+
 The link index ranges from `0` to `7` and selects the corresponding
 `ionic_<index>` device. GID indexes can differ between hosts and must be
 resolved independently. The `ip` and `ping` commands are provided by

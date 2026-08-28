@@ -115,7 +115,7 @@ run_rdma_server() {
 
   local device=${RDMA_DEVICES[$index]}
   echo "Listening for an RDMA read test on $device with GID index $gid_index"
-  exec ib_read_bw -d "$device" -x "$gid_index" --report_gbits
+  exec ib_read_bw --ipv6 --ipv6-addr -d "$device" -x "$gid_index" --report_gbits
 }
 
 run_rdma_client() {
@@ -127,7 +127,8 @@ run_rdma_client() {
   local device=${RDMA_DEVICES[$index]}
   local remote_ip=${REMOTE_IPS[$index]}
   echo "Testing RDMA reads to $remote_ip on $device with GID index $gid_index"
-  exec ib_read_bw -d "$device" -x "$gid_index" --report_gbits "$remote_ip"
+  exec ib_read_bw --ipv6 --ipv6-addr -d "$device" -x "$gid_index" \
+    --report_gbits "$remote_ip"
 }
 
 case ${1:-} in
