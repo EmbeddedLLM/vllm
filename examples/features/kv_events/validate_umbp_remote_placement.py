@@ -160,7 +160,14 @@ def _run_source(args: argparse.Namespace) -> None:
         assert client.put_from_ptr(key, source_ptr, args.size)
         client.flush()
         wait_until(lambda: client.exists(key), args.timeout)
+        source_check = (ctypes.c_ubyte * args.size)()
+        source_check_ptr = ctypes.addressof(source_check)
+        ctypes.memset(source_check_ptr, 0xA5, args.size)
+        assert client.register_memory(source_check_ptr, args.size)
+        assert client.get_into_ptr(key, source_check_ptr, args.size)
+        _assert_payload(source_check, source_data)
         _validate_logical_event(block_hash)
+        print(f"SELF-CHECK: source restored {args.size} byte-correct bytes", flush=True)
         print(f"READY: source owns {args.size} bytes at key={key}", flush=True)
         wait_until(lambda: client.exists(ack_key), args.timeout)
         print("PASS: reader acknowledged byte-correct restore", flush=True)
@@ -185,13 +192,14 @@ def _run_reader(args: argparse.Namespace) -> None:
         ctypes.memset(restored_ptr, 0xA5, args.size)
         if not args.reader_staging:
             assert client.register_memory(restored_ptr, args.size)
+        path = "staging" if args.reader_staging else "zero-copy"
+        print(f"READ: requesting {args.size} bytes through path={path}", flush=True)
         assert client.get_into_ptr(key, restored_ptr, args.size)
         _assert_payload(restored, expected)
         ack = (ctypes.c_ubyte * 1)(1)
         assert client.register_memory(ctypes.addressof(ack), 1)
         assert client.put_from_ptr(ack_key, ctypes.addressof(ack), 1)
         client.flush()
-        path = "staging" if args.reader_staging else "zero-copy"
         print(
             f"PASS: restored {args.size} byte-correct bytes; "
             f"availability=UMBP path={path}"
