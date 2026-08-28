@@ -34,6 +34,12 @@ def wait_until(predicate, timeout: float) -> None:
     raise TimeoutError("timed out waiting for UMBP placement")
 
 
+def close_client(client: UMBPClient) -> None:
+    close = getattr(client, "close", None)
+    if close is not None:
+        close()
+
+
 def make_client(
     master_address: str,
     node_id: str,
@@ -128,7 +134,7 @@ def _run_source(args: argparse.Namespace) -> None:
         wait_until(lambda: client.exists(ack_key), args.timeout)
         print("PASS: reader acknowledged byte-correct restore", flush=True)
     finally:
-        client.close()
+        close_client(client)
 
 
 def _run_reader(args: argparse.Namespace) -> None:
@@ -154,7 +160,7 @@ def _run_reader(args: argparse.Namespace) -> None:
         client.flush()
         print(f"PASS: restored {args.size} byte-correct bytes; availability=UMBP")
     finally:
-        client.close()
+        close_client(client)
 
 
 def _run_local(args: argparse.Namespace) -> None:
@@ -200,7 +206,7 @@ def _run_local(args: argparse.Namespace) -> None:
         for client in (destination, source):
             if client is not None:
                 with contextlib.suppress(Exception):
-                    client.close()
+                    close_client(client)
         master.terminate()
         with contextlib.suppress(subprocess.TimeoutExpired):
             master.wait(timeout=5)
