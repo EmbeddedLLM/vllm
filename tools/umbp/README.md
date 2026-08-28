@@ -122,3 +122,43 @@ exchange. Omitting `--ipv6-addr` makes perftest resolve the IPv6 peer with
 The link index ranges from `0` to `7` and selects the corresponding
 `ionic_<index>` device. The `ip` and `ping` commands are provided by `iproute2`
 and `iputils-ping`; `ib_read_bw` is provided by `perftest`.
+
+### Stressing all eight links
+
+After the single-link test passes, `stress_rdma_links.sh` runs all eight Ionic
+links concurrently. Its default `MODE=both` starts independent RDMA read and
+write tests on every link for 60 seconds. This is an aggressive connection and
+bidirectional-throughput stress test, not an isolated peak-bandwidth result.
+
+On remote host `192.168.0.185`, start the servers:
+
+```bash
+tools/umbp/stress_rdma_links.sh server
+```
+
+Then start the clients on local host `192.168.0.69`:
+
+```bash
+tools/umbp/stress_rdma_links.sh client
+```
+
+Each process uses a distinct port and writes a separate file under
+`rdma-stress-logs/`. The command fails if any process fails and prints each
+client's result row when all processes finish. Override the duration or run
+only one direction when isolating performance:
+
+```bash
+DURATION=300 MODE=read tools/umbp/stress_rdma_links.sh server
+DURATION=300 MODE=read tools/umbp/stress_rdma_links.sh client
+```
+
+The default assumes global RoCE v2 GID index `1` on every link. If indexes
+differ, pass eight comma-separated values on both hosts, using each host's own
+indexes:
+
+```bash
+GID_INDEXES=1,1,1,1,1,1,1,1 tools/umbp/stress_rdma_links.sh server
+```
+
+Server and client values need not match. Keep `MODE`, `DURATION`,
+`MESSAGE_SIZE`, and port-base settings identical on both hosts.
