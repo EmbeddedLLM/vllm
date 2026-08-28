@@ -75,8 +75,34 @@ tools/umbp/check_rdma_peer.sh ip
 
 The two hosts use different routed `/64` prefixes, so the script verifies the
 selected egress interface instead of requiring identical prefixes. ICMP only
-proves IP connectivity. To test an actual RDMA read, first use `show_gids` on
-each host to find the GID index for `ionic_0`. On the remote host, run:
+proves IP connectivity. To test an actual RDMA read, first find the GID index
+for `ionic_0` independently on each host. When `show_gids` is available, use:
+
+```bash
+show_gids | grep ionic_0
+```
+
+The command name contains an underscore, not a hyphen. It is normally provided
+by the `ibverbs-utils` or `rdma-core` package. If `show_gids` is unavailable,
+query the device directly:
+
+```bash
+ibv_devinfo -d ionic_0 -v | grep -A8 -B2 'GID'
+```
+
+Select the entry containing the interface's global `fc01:` address with type
+`RoCE v2`. Do not select an entry containing `fe80::`; that is link-local and
+cannot represent this routed connection. For example, this output selects
+index `1`, not index `0`:
+
+```text
+GID[  0]: fe80::690:81ff:fe47:a6a9, RoCE v2
+GID[  1]: fc01:800:8803:8a50:690:81ff:fe47:a6a9, RoCE v2
+```
+
+The global GID indexes can differ between hosts. Use the remote host's index
+for the server and the local host's index for the client. On the remote host,
+run:
 
 ```bash
 tools/umbp/check_rdma_peer.sh rdma-server 0 <remote-gid-index>
@@ -94,6 +120,5 @@ exchange. Omitting `--ipv6-addr` makes perftest resolve the IPv6 peer with
 `AF_INET` and fail before it creates the RDMA connection.
 
 The link index ranges from `0` to `7` and selects the corresponding
-`ionic_<index>` device. GID indexes can differ between hosts and must be
-resolved independently. The `ip` and `ping` commands are provided by
-`iproute2` and `iputils-ping`; `ib_read_bw` is provided by `perftest`.
+`ionic_<index>` device. The `ip` and `ping` commands are provided by `iproute2`
+and `iputils-ping`; `ib_read_bw` is provided by `perftest`.
