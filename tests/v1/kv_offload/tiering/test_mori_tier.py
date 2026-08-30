@@ -148,6 +148,7 @@ def test_mori_tier_builds_distributed_config(monkeypatch):
     assert distributed.master_config.master_address == "master:15558"
     assert distributed.master_config.node_id == "engine-0"
     assert distributed.master_config.node_address == "10.0.0.2"
+    assert distributed.io_engine.host == "10.0.0.2"
     assert distributed.io_engine.port == 16000
     assert distributed.peer_service_port == 17000
     tier.shutdown()

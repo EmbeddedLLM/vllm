@@ -57,7 +57,7 @@ def make_client(
     distributed.master_config.node_address = node_address
     distributed.master_config.auto_heartbeat = True
     distributed.peer_service_port = peer_service_port or free_port()
-    distributed.io_engine.host = "0.0.0.0"
+    distributed.io_engine.host = node_address
     distributed.io_engine.port = io_engine_port
     distributed.cache_remote_fetches = False
     config.distributed = distributed
@@ -204,6 +204,9 @@ def _run_reader(args: argparse.Namespace) -> None:
             f"PASS: restored {args.size} byte-correct bytes; "
             f"availability=UMBP path={path}"
         )
+        # Keep the acknowledgement resident long enough for the source's
+        # polling loop to observe it before this client unregisters.
+        time.sleep(2.0)
     finally:
         close_client(client)
 
