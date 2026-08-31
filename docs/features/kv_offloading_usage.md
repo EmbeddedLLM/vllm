@@ -282,11 +282,13 @@ may precede the master's view of that block.
 
 UMBP can also index blocks that remain in vLLM-managed GPU or CPU caches. This
 is the scheduler-visible path in the UMBP architecture. The bridge is a proxy:
-it consumes vLLM's event stream, forwards it to a different endpoint, and
-labels successful storage events as logical `UMBP` availability. Physical
-node, locality, and DRAM/SSD tier remain unspecified because released MoRI does
-not expose them through a read-only API. Enable vLLM's ZMQ KV events and run
-the bridge before sending requests:
+it consumes vLLM's event stream, forwards it to a different endpoint, and uses
+MoRI's side-effect-free `BatchLookupLocations` API to annotate successful
+storage events with the selected physical tier, source node, and locality. The
+API is provided by MoRI commit
+`6bacfcc952a490f8782998a17b2ddf6b4878641d`; an older MoRI build cannot run the
+physical bridge. Enable vLLM's ZMQ KV events and start the bridge before sending
+requests:
 
 ```bash
 .venv/bin/python examples/features/kv_events/umbp_kv_event_bridge.py \
@@ -295,7 +297,11 @@ the bridge before sending requests:
   --topic 'kv@<pod-name>@<model-name>' \
   --master-address 10.0.0.1:15558 \
   --node-id <the-tier-node-id> \
-  --key-prefix vllm:kimi:
+  --key-prefix vllm:kimi: \
+  --local-dram-bandwidth-bps 5.6e10 \
+  --remote-dram-bandwidth-bps <measured-value> \
+  --local-ssd-bandwidth-bps <measured-value> \
+  --remote-ssd-bandwidth-bps <measured-value>
 ```
 
 Add the publisher configuration to the vLLM command:
@@ -314,10 +320,13 @@ when `node_id` is omitted), and `key-prefix` must equal the tier's explicit
 `key_prefix`. Configure llm-d to subscribe to the bridge output on port 5558,
 not directly to vLLM on port 5557. Its placement TTL should be at least three
 times the expected event delay. The bridge continues to register GPU/CPU
-advisory placement and marks vLLM-observed storage events as UMBP. llm-d must
-use deployment-calibrated UMBP restore cost rather than interpreting the event
-as proof of a particular physical tier. Start the bridge before vLLM traffic
-because the live stream does not replay events emitted before it subscribed.
+advisory placement. It queries the physical location without recording access
+or granting a MoRI lease, selects one best live source, and retains that choice
+long enough to emit a symmetric removal. Bandwidth flags are optional and must
+come from measurements on the deployed path; when omitted, llm-d falls back to
+its configured tier and locality costs. A timed-out query emits logical `UMBP`
+instead of fabricating placement. Start the bridge before vLLM traffic because
+the live stream does not replay events emitted before it subscribed.
 
 To validate the distributed data and placement paths without GPUs, launch the
 same-host two-replica harness against an unmodified MoRI build:
@@ -329,17 +338,18 @@ same-host two-replica harness against an unmodified MoRI build:
 ```
 
 The harness starts an ephemeral master and two clients, writes a deterministic
-4 KiB payload before the second replica joins, reads it through that second
-replica, compares every byte, and checks that vLLM emits logical `UMBP`
-availability without fabricated physical hints. A successful run ends with:
+4 KiB payload before the second replica joins, flushes the placement heartbeat,
+checks that MoRI reports local DRAM ownership, reads through the second replica,
+and compares every byte. A successful run includes:
 
 ```text
-PASS: replica-b restored 4096 correct bytes from replica-a; availability=UMBP
+PLACEMENT: tier=DRAM source=replica-a locality=LOCAL
+PASS: replica-b restored 4096 correct bytes from replica-a; availability=UMBP path=zero-copy
 ```
 
-This proves remote-read correctness and logical event integration. Because both
-clients run on one host, it does not prove RDMA transport, NIC selection,
-physical placement, or cross-node performance.
+This proves the physical control-plane query and same-host remote-read
+correctness. Because both clients run on one host, it does not prove RDMA
+transport, NIC selection, or cross-node performance.
 
 For two physical nodes, start `umbp_master` on a reachable host. Start the
 source first and leave it running so it retains ownership of the validation
@@ -368,6 +378,11 @@ source waits for that acknowledgement before exiting. Permit the master, I/O
 engine, and peer-service ports through host firewalls. A passing run proves
 cross-node correctness. Verify the selected RDMA provider and byte counters in
 MoRI logs or transport metrics before recording it as an RDMA result.
+
+On 2026-08-31 this sequence passed between the two MI355X hosts in the pinned
+nightly image. The source query reported `DRAM`,
+`physical-source-evidence-003`, and `LOCAL`; the remote reader restored a 1 MiB
+payload byte-for-byte through the registered zero-copy destination.
 
 Routers can use `MoriPlacementClient.match(..., count_as_hit=True)` to query
 which registered nodes hold a request's block hashes. The returned MoRI match

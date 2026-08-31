@@ -17,12 +17,31 @@ revisions:
 
 | Repository | Branch | Revision |
 | --- | --- | --- |
-| vLLM | `umbp` | [`314bbc6b26912ce665f5a40c275adcfc805a90dc`](https://github.com/EmbeddedLLM/vllm/commit/314bbc6b26912ce665f5a40c275adcfc805a90dc) (`Publish successful MoRI tier cache events`) |
+| vLLM | `umbp` | `4946ab98e8ee01b712c8eb4c4d699395a7560156` (`Publish physical UMBP placement`) |
+| MoRI | `umbp-physical-placement` | `6bacfcc952a490f8782998a17b2ddf6b4878641d` (`expose read-only physical placement`) |
 | llm-d-router | `umbp-prefetch-checkpoint` | [`36feca6d27c1ee5ac9b388c4606653941218361c`](https://github.com/EmbeddedLLM/llm-d-router/commit/36feca6d27c1ee5ac9b388c4606653941218361c) (`Add bare-metal MoRI scheduler validation`) |
 
-The vLLM revision is the implementation baseline and parent of the
-documentation-only commit that adds this file. The llm-d-router revision is
-the matching router and validation baseline.
+The vLLM and MoRI revisions are local commits and have not been pushed. The
+llm-d-router revision is the matching router and validation baseline. The vLLM
+tip includes the host-allocator parent commit
+`aa57d4a569b6366f71b38d85690d51a254c40f85`.
+
+## RFC-parity status
+
+The zero-copy allocator and authoritative placement slices are implemented.
+The remaining work is performance proof and production hardening, not a
+missing host-memory or placement primitive.
+
+| Capability | Current state |
+| --- | --- |
+| Shared zero-copy CPU primary region | Complete. Scheduler and workers map the same pages; MoRI and GPU host registration use that region. |
+| Hugepage, NUMA, and prefault controls | Complete. `default`, `shm`, and `hugetlbfs` backends are supported with strict NUMA failure. |
+| Side-effect-free physical placement | Complete in the local MoRI commit through `BatchLookupLocations`; it returns every live node/tier/size/peer replica without access or lease mutation. |
+| Physical KV-event enrichment | Complete. The bridge emits selected `HBM`/`DRAM`/`SSD`, source node, locality, and optional calibrated bandwidth, with logical `UMBP` fallback. |
+| llm-d restore-cost consumption | Complete. The retained llm-d branch indexes physical hints and scores tier, locality, and bandwidth. |
+| Cross-node zero-copy correctness | Complete for the 1 MiB deterministic smoke on the two MI355X hosts. |
+| Scheduler effectiveness | Not demonstrated. Three controlled aware-versus-random repetitions were correct, but the median p50 change was -0.58% and the median local-compute reduction was only 0.079 percentage points. |
+| Production readiness | Pending replay/resync, stale/conflicting-placement failure injection, measured cost calibration, and the model/concurrency/policy sweep. |
 
 ## Component architecture
 
@@ -106,6 +125,8 @@ flowchart LR
     BridgeB -->|enriched KV events| Index
     BridgeA -->|GPU and CPU placement reports| Master
     BridgeB -->|GPU and CPU placement reports| Master
+    BridgeA -->|read-only physical location lookup| Master
+    BridgeB -->|read-only physical location lookup| Master
 
     Prefetch -. POST and poll /v1/kv_cache/prefetch .-> APIA
     Prefetch -. POST and poll /v1/kv_cache/prefetch .-> APIB
@@ -197,6 +218,7 @@ sequenceDiagram
     TM->>MT: submit_store(keys, slot IDs)
     MT->>U: batch_put(keys, registered pointers)
     U-->>MT: per-block status
+    MT->>U: wake placement heartbeat
     MT-->>TM: completed JobResult
     TM->>CPU: release transfer references
     MT->>EV: successful contiguous BlockStored prefix
@@ -306,19 +328,35 @@ For llm-d integration, the UMBP bridge:
 
 1. Subscribes to the private vLLM ZMQ event endpoint.
 2. Reports vLLM-managed GPU and CPU placement to the UMBP master.
-3. Labels successful `STORAGE` events as logical `UMBP` availability.
-4. Republishes the enriched batch on a separate ZMQ endpoint.
+3. Uses the final block hash in each successful `STORAGE` chunk to query
+   MoRI's side-effect-free `BatchLookupLocations` RPC.
+4. Selects a deterministic source by MoRI tier priority, publisher locality,
+   and node ID, then annotates `storage_tier`, `source_node`, `locality`, and an
+   optional configured bandwidth.
+5. Caches the store observation so a later removal can evict the exact indexed
+   identity, splitting a combined removal when its chunks had different
+   physical sources.
+6. Falls back to logical `UMBP` when placement is still absent after a bounded
+   heartbeat-aware polling window.
+7. Republishes the enriched batch on a separate ZMQ endpoint.
 
 llm-d subscribes to the bridge output, reconstructs consecutive prefixes from
 self-describing events, estimates restore cost, and selects a replica. The
 bridge has no replay channel, so it must be running before traffic begins.
 
-Logical `UMBP` availability means that the key is addressable through the UMBP
-data plane. Released MoRI does not expose an authoritative read-only feed for
-the key's current physical owner, DRAM-versus-SSD location, locality, or
-bandwidth. The bridge therefore does not fabricate those fields. Deployment
-costs for logical UMBP must be calibrated rather than treated as measured
-physical placement.
+`BatchLookupLocations` returns all currently live physical replicas without
+recording an access, granting a lease, or incrementing RouteGet counters. The
+current KV-event schema carries one placement per store event, so the bridge
+publishes the best observed source for the destination endpoint rather than
+all replicas. This is a point-in-time observation, not a reservation. llm-d's
+physical-placement TTL must therefore expire it if no refresh or removal
+arrives. Logical `UMBP` fallback still means only that vLLM observed a
+successful UMBP store; it must use calibrated logical-tier cost.
+
+The MoRI manager calls `UMBPClient.flush()` before publishing a successful
+storage event when KV events are enabled. In distributed mode this wakes the
+heartbeat shipper, reducing the normal placement lag from the periodic
+heartbeat interval to the bridge's short retry loop.
 
 ## Configuration shape
 
@@ -395,8 +433,9 @@ the SSD filesystem must be mounted into the container and
   primary tier.
 - The production cross-replica scheduler belongs in llm-d. The vLLM reference
   proxy is a development and validation tool, not a second production router.
-- Logical UMBP events prove addressability, not physical DRAM/SSD placement or
-  a specific RDMA route.
+- Physical event hints are point-in-time observations and select one best
+  source from the all-replica response; they do not reserve a route.
+- Logical UMBP fallback proves addressability, not a physical DRAM/SSD source.
 - The live ZMQ bridge does not replay events that were published before it
   subscribed.
 - File-backed SSD works on a mounted filesystem. SPDK is a separate MoRI build

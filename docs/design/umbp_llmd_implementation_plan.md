@@ -63,14 +63,14 @@ must not become a second production router alongside llm-d.
 | Blog capability | Existing state | Required work | Status |
 | --- | --- | --- | --- |
 | Pointer-based batched L3 I/O | Registered CPU buffer and UMBP batch APIs | Benchmark chunk sizes | In progress |
-| KV placement feed | Self-describing vLLM events plus UMBP bridge | Feed tier/locality into llm-d index directly | Partial |
-| Precise prefix routing | llm-d precise scorer retains `DeviceTier` | Add measured restore cost, not another tier index | Partial |
+| KV placement feed | Self-describing vLLM events plus authoritative MoRI location lookup | Add replay/resync and stale-placement failure tests | Implemented, hardening pending |
+| Precise prefix routing | llm-d retains tier, locality, source, and bandwidth | Calibrate measured restore costs | Implemented, calibration pending |
 | Load-aware routing | llm-d queue/utilization scorers | Compose with tier-cost scorer | Upstream llm-d |
 | Restore-versus-recompute decision | llm-d measured-cost scorer | Calibrate from deployment measurements | Partial |
 | Loadback prefetch | Async demand promotion plus scheduler coordinator | Add engine control endpoint and key resolver | Partial |
 | Admission after prefetch | Coordinator reports ready/partial/miss | Integrate with engine control endpoint | Partial |
 | Zero-CU SDMA restore | Generic CPU-to-GPU copy | Profile ROCm copy path, then add dedicated transfer stream/path | Planned |
-| Remote DRAM reads | MoRI distributed client | Two-node correctness and performance validation | TODO |
+| Remote DRAM reads | MoRI distributed client | Failure fallback and performance matrix | Correctness passed |
 | SSD spill | MoRI copy-on-commit | Expose tuning and per-medium proof; fix burst admission | In progress |
 | Incremental P/D transfer | vLLM KV transfer framework | Reuse decode-side prefix and send only missing blocks | Separate project |
 | Agent TTL/session hints | Not present | Extend request metadata, events, llm-d policy, and MoRI policy | Future |
@@ -107,6 +107,10 @@ and explicit JSON values take precedence over environment values.
 - [x] UMBP bridge can register HBM/DRAM placement with the master.
 - [x] Define event representation for UMBP DRAM and SSD location, locality,
   source node, and estimated bandwidth.
+- [x] Add a side-effect-free MoRI `BatchLookupLocations` RPC and Python binding
+  that return every live physical replica.
+- [x] Enrich storage lifecycle events from authoritative MoRI placement, with
+  bounded polling, symmetric removals, and logical `UMBP` fallback.
 - [x] Confirm llm-d's precise index and scorer retain per-replica `DeviceTier`.
 - [x] Add a measured tier restore-versus-recompute scorer and compose it with
   llm-d's existing queue/utilization scorers in the scheduling profile.
@@ -155,7 +159,8 @@ roofline, and prefetch removes most restore time from request TTFT.
 
 - [x] Optional AMD TP=2 local UMBP test.
 - [x] Two-replica same-node remote-placement test.
-- [ ] Two-node RDMA read and failure-fallback test.
+- [x] Two-node zero-copy RDMA read correctness test.
+- [ ] Two-node failure-fallback test.
 - [ ] llm-d routing integration test with stale and conflicting placements.
 - [ ] Concurrency 1/8/32/128 performance matrix.
 - [ ] Long-context production-model evaluation and accuracy check.
@@ -304,17 +309,15 @@ and keeps cluster policy out of the vLLM engine.
 
 1. Whether the HTTP control endpoint should remain public or move behind a
    dedicated authenticated internal listener before production enablement.
-2. Whether llm-d should consume authoritative MoRI placement by polling the
-   master, subscribing to a future placement feed, or through a sidecar that
-   emits the optional standard KV-event placement hints.
+2. Whether the standard KV-event schema should carry every physical replica;
+   the current bridge selects one best source from MoRI's all-replica result.
 3. How llm-d communicates a recompute-versus-restore decision without adding
    UMBP-specific fields to the OpenAI request schema.
 
-## Why authoritative placement requires a MoRI change
+## Authoritative physical placement
 
 The router must distinguish real, currently servable UMBP placement from
-advisory cache metadata. The existing MoRI APIs do not provide a safe way to do
-that from a periodically polling control plane:
+advisory cache metadata. The original MoRI APIs could not do that safely:
 
 - `MatchExternalKv` queries the external KV index populated by vLLM cache
   events. MoRI documents these entries as advisory and not servable through
@@ -329,71 +332,39 @@ that from a periodically polling control plane:
   the owning node, physical tier, size, or peer address required for locality-
   and bandwidth-aware routing.
 
-An experimental cross-project implementation therefore added a read-only
-`BatchInspect` RPC to MoRI. It returns the actual servable node, tier, size, and
-peer address without recording access or granting a lease. The Python
-`UMBPMasterClient` exposes the same operation for a bounded placement polling
-adapter. This keeps the MoRI master authoritative while allowing llm-d's
-placement TTL to fail closed if refresh stops.
+MoRI commit `6bacfcc952a490f8782998a17b2ddf6b4878641d` adds
+`BatchLookupLocations`. The RPC returns a CSR-style columnar result containing
+every live node, physical tier, size, and peer address for each key. It reads
+the authoritative global block index but does not record access, grant a lease,
+or increment per-node RouteGet counters. `UMBPMasterClient` exposes the same
+operation to Python.
 
-The experiment was committed locally as `8521f3dc`, validated, and never
-pushed. It was subsequently reverted by `a1bbcf20` so MoRI remains unchanged.
-The rationale stays here because exact physical placement would still require
-an equivalent upstream API. Validation completed before the revert:
+vLLM commit `4946ab98e8ee01b712c8eb4c4d699395a7560156` adds the bridge
+resolver. It queries the final block hash that identifies each completed MoRI
+chunk, selects a deterministic best source, emits physical placement hints,
+and caches the choice so combined removals can be split by exact index
+identity. Store completion wakes MoRI's heartbeat shipper before the event is
+published. A bounded lookup miss fails closed to logical `UMBP` rather than
+using the advisory external index or mutating `BatchRouteGet`.
 
-- `cmake --build build -j2` passed, including protobuf regeneration, the master,
-  client, and Python bindings.
-- The full Python master-client suite passed (`45 passed`).
-- The new integration test performs a real distributed UMBP put, flushes its
-  heartbeat, observes its servable DRAM placement through `BatchInspect`,
-  verifies a missing key remains absent, and verifies the advisory external KV
-  index remains empty.
-
-Without this MoRI API addition, exact DRAM/SSD-aware routing must remain
-disabled. Falling back to `MatchExternalKv` would be inaccurate, while polling
-`BatchRouteGet` would change the behavior being measured.
-
-### Logical availability proxy
-
-The production design keeps MoRI unchanged. The vLLM bridge retains the
-original KV-event stream and labels successful storage events as logical
-`UMBP` availability. It deliberately leaves physical tier, owner, locality,
-and bandwidth empty. llm-d can route to an endpoint with UMBP availability
-using calibrated restore cost, but cannot claim exact DRAM/SSD placement.
-
-The proxy remains intentionally outside the vLLM engine. That keeps master
-integration and llm-d-specific policy out of the inference data path while
-preserving the standard KV-event boundary. The next distributed validation is
-to run the correctness sequence on two physical nodes and use existing MoRI
-transport and aggregate tier metrics to validate the path.
-
-The same-host validator stores before the second UMBP client joins, restores
-through that second client, verifies all payload bytes, and checks the logical
-`UMBP` event. This completes the two-replica functional item only; it does not
-close physical placement, two-node RDMA, or performance validation.
-
-llm-d checkpoint `761016e` recognizes this distinction. Logical `UMBP`
-lifecycle entries remain indexed until their remove event, while physical DRAM
-and SSD hints retain fail-closed placement expiry. The sample restore-cost
-profile includes a deployment-calibrated `umbp` tier entry. Full Go package
-tests, `go vet`, and the KV-event race suite passed. Container-backed presubmit
-could not run because Docker and Podman are unavailable; its earlier signature
-gate also rejects six unsigned checkpoint commits already present on the
-branch.
+The proxy remains outside the inference engine. llm-d checkpoint `761016e`
+keeps logical UMBP lifecycle entries until removal while applying fail-closed
+TTL expiry to physical DRAM/SSD hints. The remaining schema limitation is that
+one KV store event carries one selected physical source even when MoRI returns
+several replicas.
 
 The forced-eviction benchmark can consume the unmodified MoRI master's
 Prometheus endpoint. Strict SSD mode brackets every timed request and waits for
 both `mori_umbp_ssd_read_total{status="ok"}` and
 `mori_umbp_ssd_read_bytes_total` to advance. A missing delta fails the run.
-Other UMBP results are labeled `logical-umbp-only`; released MoRI has no DRAM
+Other UMBP results are labeled `logical-umbp-only`; MoRI has no DRAM
 read counter, so absence of an SSD delta is not used to infer DRAM placement.
 
 The remote-read validator supports separate source and reader processes for
-two physical hosts. The source publishes its deterministic block before the
-reader joins and remains alive until the reader verifies every byte and stores
-an acknowledgement. The local two-process-equivalent run passed with 8,192
-bytes. Cross-node RDMA and failure fallback remain unchecked until the harness
-is run on the target network.
+two physical hosts. On 2026-08-31, the source on the first MI355X host reported
+authoritative local DRAM placement, and the second host restored a 1 MiB payload
+byte-for-byte through a registered zero-copy destination over the selected
+`ionic_0` RDMA path. Failure fallback and cross-node performance remain open.
 
 Real AMD validation on 2026-08-26 passed the Qwen/Qwen3-0.6B UMBP restoration
 test on TP=1 and TP=2. Both runs forced GPU eviction, required UMBP tier-read
@@ -411,8 +382,8 @@ bandwidth. These single-size smokes close the allocator verification item but
 are not the required block/batch/concurrency performance sweep.
 
 The reproducible node bootstrap is
-`tools/umbp/bootstrap_distributed_node.sh`. It pins the three validated project
-revisions, builds the released MoRI source without local patches, installs vLLM
+`tools/umbp/bootstrap_distributed_node.sh`. It pins the validated project
+revisions, builds MoRI, installs vLLM
 and its test dependencies in a Python 3.12 uv environment, checks GPU and UMBP
 imports, and reports visible RDMA addresses. It deliberately leaves privileged
 host networking, hugepage, and NVMe configuration to the operator. The script
