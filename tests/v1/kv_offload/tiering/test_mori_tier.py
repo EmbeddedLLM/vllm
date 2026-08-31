@@ -9,7 +9,7 @@ from typing import Any, cast
 
 import numpy as np
 
-from vllm.v1.kv_offload.base import OffloadKey, ReqContext
+from vllm.v1.kv_offload.base import Medium, OffloadKey, ReqContext
 from vllm.v1.kv_offload.tiering.base import TransferJob
 from vllm.v1.kv_offload.tiering.mori.manager import MoriSecondaryTierManager
 
@@ -38,6 +38,7 @@ class FakeDistributedConfig:
 
 class FakeClient:
     instances: list["FakeClient"] = []
+    put_results: list[bool] | None = None
 
     def __init__(self, config):
         self.config = config
@@ -61,7 +62,7 @@ class FakeClient:
 
         for key, ptr, size in zip(keys, ptrs, sizes):
             self.data[key] = ctypes.string_at(ptr, size)
-        return [True] * len(keys)
+        return [True] * len(keys) if self.put_results is None else self.put_results
 
     def batch_get_into_ptr(self, keys, ptrs, sizes):
         import ctypes
@@ -83,9 +84,10 @@ def _install_fake_mori(monkeypatch):
     dynamic_module.UMBPDistributedConfig = FakeDistributedConfig
     monkeypatch.setitem(sys.modules, "mori.umbp", module)
     FakeClient.instances.clear()
+    FakeClient.put_results = None
 
 
-def _make_spec():
+def _make_spec(*, enable_kv_cache_events=False):
     config = SimpleNamespace(
         engine_id="engine-0",
         model=SimpleNamespace(name="model", dtype="float16"),
@@ -93,7 +95,11 @@ def _make_spec():
         cache=SimpleNamespace(blocks_per_chunk=1),
         parallel=SimpleNamespace(is_parallelism_agnostic=True),
     )
-    return SimpleNamespace(config=config, kv_bytes_per_chunk=16)
+    return SimpleNamespace(
+        config=config,
+        kv_bytes_per_chunk=16,
+        kv_events_config=SimpleNamespace(enable_kv_cache_events=enable_kv_cache_events),
+    )
 
 
 def _wait_for_result(tier):
@@ -200,4 +206,95 @@ def test_mori_tier_applies_tuning_over_environment(monkeypatch):
     assert not config.distributed.cache_remote_fetches
     assert not config.distributed.cache_remote_admission
     assert config.distributed.dram_page_size == 2 * 1024 * 1024
+    tier.shutdown()
+
+
+def test_mori_tier_emits_event_only_after_successful_store(monkeypatch):
+    _install_fake_mori(monkeypatch)
+    view = memoryview(bytearray(32)).cast("B", shape=(2, 16))
+    tier = MoriSecondaryTierManager(
+        _make_spec(enable_kv_cache_events=True),
+        view,
+        "mori",
+        dram_capacity_bytes=1024,
+        enable_kv_events=True,
+        io_threads=1,
+    )
+    key = OffloadKey(b"hash" + (0).to_bytes(4, "big"))
+    other_key = OffloadKey(b"other" + (0).to_bytes(4, "big"))
+
+    tier.submit_store(
+        TransferJob(1, [key], np.array([0]), False, ReqContext("request"))
+    )
+    assert _wait_for_result(tier).success
+    events = list(tier.take_events())
+    assert len(events) == 1
+    assert events[0].keys == [key]
+    assert events[0].medium is Medium.STORAGE
+    assert not events[0].removed
+    assert list(tier.take_events()) == []
+
+    FakeClient.put_results = [True, False]
+    tier.submit_store(
+        TransferJob(
+            2,
+            [key, other_key],
+            np.array([0, 1]),
+            False,
+            ReqContext("request"),
+        )
+    )
+    assert not _wait_for_result(tier).success
+    events = list(tier.take_events())
+    assert len(events) == 1
+    assert events[0].keys == [key]
+
+    FakeClient.put_results = [True]
+    tier.submit_store(
+        TransferJob(
+            3,
+            [key, other_key],
+            np.array([0, 1]),
+            False,
+            ReqContext("request"),
+        )
+    )
+    assert not _wait_for_result(tier).success
+    events = list(tier.take_events())
+    assert len(events) == 1
+    assert events[0].keys == [key]
+
+    FakeClient.put_results = [False, True]
+    tier.submit_store(
+        TransferJob(
+            4,
+            [key, other_key],
+            np.array([0, 1]),
+            False,
+            ReqContext("request"),
+        )
+    )
+    assert not _wait_for_result(tier).success
+    assert list(tier.take_events()) == []
+    tier.shutdown()
+
+
+def test_mori_tier_events_require_global_enable(monkeypatch):
+    _install_fake_mori(monkeypatch)
+    tier = MoriSecondaryTierManager(
+        _make_spec(enable_kv_cache_events=False),
+        memoryview(bytearray(16)).cast("B", shape=(1, 16)),
+        "mori",
+        dram_capacity_bytes=1024,
+        enable_kv_events=True,
+        io_threads=1,
+    )
+    key = OffloadKey(b"hash" + (0).to_bytes(4, "big"))
+
+    tier.submit_store(
+        TransferJob(1, [key], np.array([0]), False, ReqContext("request"))
+    )
+    assert _wait_for_result(tier).success
+    assert tier.events is None
+    assert list(tier.take_events()) == []
     tier.shutdown()

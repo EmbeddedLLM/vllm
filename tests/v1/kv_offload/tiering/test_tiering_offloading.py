@@ -361,6 +361,18 @@ class TestTieringOffloadingManager:
         self.secondary_tier1.take_events.assert_called_once_with()
         self.secondary_tier2.take_events.assert_called_once_with()
 
+    def test_take_events_yields_stores_before_removals(self, manager_setup):
+        primary_removed = OffloadingEvent(to_keys([1]), Medium.CPU, removed=True)
+        secondary_stored = OffloadingEvent(to_keys([1]), Medium.STORAGE, removed=False)
+
+        self.primary_tier.take_events = MagicMock(return_value=[primary_removed])
+        self.secondary_tier1.take_events = MagicMock(return_value=[secondary_stored])
+
+        assert list(self.manager.take_events()) == [
+            secondary_stored,
+            primary_removed,
+        ]
+
     def test_basic_store_to_primary(self, manager_setup):
         """Test basic store operation to primary tier."""
         blocks = to_keys(range(3))

@@ -15,7 +15,13 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorRole,
 )
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
-from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
+from vllm.distributed.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    EventPublisherFactory,
+    KVCacheEvent,
+    KVEventBatch,
+)
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
@@ -68,6 +74,14 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def stores_before_removals(events: list[KVCacheEvent]) -> list[KVCacheEvent]:
+    """Keep replacement placements visible before retiring old placements."""
+    return sorted(
+        events,
+        key=lambda event: isinstance(event, (BlockRemoved, AllBlocksCleared)),
+    )
 
 
 @dataclass
@@ -2201,7 +2215,7 @@ class Scheduler(SchedulerInterface):
 
         # publish collected KV cache events
         if events:
-            batch = KVEventBatch(ts=time.time(), events=events)
+            batch = KVEventBatch(ts=time.time(), events=stores_before_removals(events))
             self.kv_event_publisher.publish(batch)
 
         # Create EngineCoreOutputs for all clients that have requests with

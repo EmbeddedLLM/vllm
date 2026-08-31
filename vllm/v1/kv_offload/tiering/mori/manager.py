@@ -18,6 +18,7 @@ from vllm.v1.kv_offload.base import (
     Locality,
     LookupResult,
     Medium,
+    OffloadingEvent,
     OffloadKey,
     ReqContext,
 )
@@ -90,6 +91,7 @@ class MoriSecondaryTierManager(SecondaryTierManager):
         dram_page_size: int | None = None,
         io_threads: int = 4,
         key_prefix: str | None = None,
+        enable_kv_events: bool = False,
         locality: str | None = None,
     ) -> None:
         super().__init__(offloading_spec, primary_kv_view, tier_type)
@@ -158,6 +160,17 @@ class MoriSecondaryTierManager(SecondaryTierManager):
             config.distributed = distributed
 
         self.locality = Locality(locality) if locality is not None else None
+        self.events: list[OffloadingEvent] | None = None
+        if enable_kv_events:
+            if offloading_spec.kv_events_config.enable_kv_cache_events:
+                self.events = []
+            else:
+                logger.warning(
+                    "enable_kv_events is set on secondary tier '%s' but KV "
+                    "cache events are disabled globally; the tier will not "
+                    "emit events.",
+                    tier_type,
+                )
         self._client = UMBPClient(config)
         self._executor = ThreadPoolExecutor(
             max_workers=io_threads, thread_name_prefix="vllm_kv_mori"
@@ -260,16 +273,45 @@ class MoriSecondaryTierManager(SecondaryTierManager):
             successful_keys = None
             try:
                 statuses = future.result()
-                success = bool(statuses) and all(statuses)
+                success = len(statuses) == len(keys) and all(statuses)
+                completed_keys = tuple(
+                    key for key, status in zip(keys, statuses) if status
+                )
                 if is_load and not success:
-                    successful_keys = tuple(
-                        key for key, status in zip(keys, statuses) if status
-                    )
+                    successful_keys = completed_keys
                     failed_keys = [
                         key for key, status in zip(keys, statuses) if not status
                     ]
+                    if len(statuses) < len(keys):
+                        failed_keys.extend(keys[len(statuses) :])
                     self._lookup_manager.mark_miss(failed_keys)
                     logger.warning("MoRI UMBP load job %d had missing blocks", job_id)
+                elif not is_load and self.events is not None:
+                    # Prefix reuse stops at the first unavailable block. Do not
+                    # advertise successful suffix blocks after a failed store:
+                    # consumers cannot resolve their parent chain or use them
+                    # for prefix-cache routing.
+                    prefix_length = 0
+                    for status in statuses[: len(keys)]:
+                        if not status:
+                            break
+                        prefix_length += 1
+                    if prefix_length:
+                        self.events.append(
+                            OffloadingEvent(
+                                keys=list(keys[:prefix_length]),
+                                medium=self.medium,
+                                removed=False,
+                                locality=self.locality,
+                            )
+                        )
+                if len(statuses) != len(keys):
+                    logger.warning(
+                        "MoRI UMBP transfer job %d returned %d statuses for %d blocks",
+                        job_id,
+                        len(statuses),
+                        len(keys),
+                    )
             except Exception:
                 logger.exception("MoRI UMBP transfer job %d failed", job_id)
                 success = False
@@ -284,6 +326,12 @@ class MoriSecondaryTierManager(SecondaryTierManager):
                 )
             )
         return results
+
+    @override
+    def take_events(self) -> Iterable[OffloadingEvent]:
+        if self.events is not None:
+            yield from self.events
+            self.events.clear()
 
     @override
     def has_pending_work(self) -> bool:

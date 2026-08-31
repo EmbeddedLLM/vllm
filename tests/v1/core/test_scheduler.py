@@ -17,6 +17,13 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.distributed.kv_events import (
+    MEDIUM_CPU,
+    MEDIUM_GPU,
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -29,7 +36,7 @@ from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.scheduler import Scheduler, stores_before_removals
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
@@ -51,6 +58,18 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_kv_event_publication_orders_stores_before_removals():
+    stored = BlockStored([1], None, [1], 1, None, MEDIUM_CPU, None)
+    removed = BlockRemoved([1], MEDIUM_GPU)
+    cleared = AllBlocksCleared()
+
+    assert stores_before_removals([removed, stored, cleared]) == [
+        stored,
+        removed,
+        cleared,
+    ]
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():

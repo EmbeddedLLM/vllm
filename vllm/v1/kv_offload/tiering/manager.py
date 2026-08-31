@@ -810,12 +810,20 @@ class TieringOffloadingManager(OffloadingManager):
     def take_events(self) -> Iterable[OffloadingEvent]:
         """Yield events owned by the primary and secondary tiers.
 
+        Stores are emitted before removals across all tiers. A completed
+        cascade can make the secondary copy visible and release/evict the
+        primary copy in the same scheduler step. Publishing the primary
+        removal first creates a transient placement gap and discards the
+        self-describing metadata needed to translate the secondary store.
+
         Yields:
             New OffloadingEvents collected by each tier since the last call.
         """
-        yield from self.primary_tier.take_events()
+        events = list(self.primary_tier.take_events())
         for tier in self.secondary_tiers:
-            yield from tier.take_events()
+            events.extend(tier.take_events())
+        yield from (event for event in events if not event.removed)
+        yield from (event for event in events if event.removed)
 
     @override
     def reset_cache(self) -> None:
