@@ -21,6 +21,7 @@ from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.memory import CPUOffloadMemoryConfig
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 
@@ -76,6 +77,10 @@ class CPUOffloadingSpec(OffloadingSpec):
 
     def __init__(self, config: OffloadingConfig):
         super().__init__(config)
+
+        self.cpu_memory_config = CPUOffloadMemoryConfig.from_extra_config(
+            self.extra_config
+        )
 
         cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
         if not cpu_bytes_to_use:
@@ -164,6 +169,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 rank=rank,
                 kv_bytes_per_block=self.kv_bytes_per_chunk,
                 cpu_page_size=self.cpu_page_size_per_worker,
+                memory_config=self.cpu_memory_config,
             )
         try:
             return CPUOffloadingWorker(

@@ -74,10 +74,65 @@ vllm serve <model> \
 | `cache_policy_module_path` | no | — | both | Python import path for a custom `CachePolicy` not in the built-in registry. Required only when `eviction_policy` is not built-in and wasn't pre-registered via `CachePolicyFactory` (advanced). |
 | `store_threshold` | no | `0` | single-tier | Min lookups before a block is offloaded. Values ≥ 2 are rejected by `TieringOffloadingSpec`. |
 | `max_tracker_size` | no | `64000` | single-tier | Max entries in the lookup tracker. |
+| `cpu_memory_backend` | no | `default` | both | Backing for the shared CPU region on CUDA/ROCm: `default`/`shm` use the existing shared mmap path; `hugetlbfs` uses explicit hugepages. |
+| `cpu_memory_path` | for `hugetlbfs` | `/dev/shm` | both | Existing writable directory used for the shared mmap. For `hugetlbfs`, this must be a hugetlbfs mount visible inside the container. |
+| `cpu_hugepage_block_size` | no | `2MB` | both | Hugepage size for `hugetlbfs`: `2MB` or `1GB`. It must match the mount's `pagesize`. |
+| `cpu_numa_node` | no | `-1` | both | Bind the shared mapping to one NUMA node before prefault. `-1`/omission keeps the kernel's default policy. Explicit binding fails closed if `mbind` cannot be applied. |
+| `cpu_prefault` | no | `true` | both | Populate the mapping at startup after applying its NUMA policy. Disabling this defers page faults to first use. |
 | `secondary_tiers` | no | `[]` | multi-tier | List of secondary tier configs (see below). |
 | `offload_prompt_only` | no | `true` | both | If `true`, only prompt (prefill) blocks are offloaded; decode blocks are skipped. |
 | `self_describing_kv_events` | no | `false` | both | Opt-in. When `true` *and* KV cache events are enabled (`--kv-events-config` with `enable_kv_cache_events`), the connector emits self-describing block-granular `BlockStored`/`BlockRemoved` payloads (constituent block hashes, whole-chunk `token_ids`, per-block `block_size`, parent hash, LoRA + group/cache-spec metadata) instead of the placeholder fallback, so external KV-event consumers can index offloaded blocks. Inert unless events are enabled. With `TieringOffloadingSpec`, a CPU promotion is self-describing when a local request observes its primary-tier `HIT` before event translation; otherwise its stored event may retain the placeholder, while a later `HIT` can backfill metadata for removal. Pending-removal/re-promotion races and externally initiated promotions may also produce placeholders, and consumers must ignore removals for unknown hashes. Partial recurrent tails emit the hash-aligned portion from the physical block start through the tail boundary. Other sliding-window/SSM chunks keep the placeholder fallback. In chunk mode (`block_size` > GPU block size, or `blocks_per_chunk` > 1), overlapping chunks re-announce shared per-block hashes, so consumers must reference-count (deduplicate) repeated store/remove announcements. |
 | `spec_module_path` | no | — | both | Python import path for a custom `OffloadingSpec` not in the built-in registry. Required only when `spec_name` is not built-in (advanced). |
+
+## Hugepage- and NUMA-Backed CPU Primary Memory
+
+The CUDA/ROCm CPU offload path uses one file-backed region shared by the
+scheduler and GPU workers. `hugetlbfs` changes the physical backing without
+adding a Python staging copy: workers register their mapping with ROCm/CUDA,
+and a MoRI secondary tier registers the scheduler's view of the same pages.
+The logical CPU-cache capacity remains `cpu_bytes_to_use`; only the backing
+file is rounded up to a whole hugepage.
+
+For example, reserve and mount 2 MiB hugepages on the host, expose that mount
+inside the vLLM container, and configure a node-local replica:
+
+```json
+{
+  "spec_name": "TieringOffloadingSpec",
+  "cpu_bytes_to_use": 68719476736,
+  "cpu_memory_backend": "hugetlbfs",
+  "cpu_memory_path": "/dev/hugepages",
+  "cpu_hugepage_block_size": "2MB",
+  "cpu_numa_node": 0,
+  "cpu_prefault": true
+}
+```
+
+The container must bind-mount `/dev/hugepages`. An explicit NUMA node also
+requires `mbind` to be allowed; with Docker's default security policy this
+normally means `--cap-add SYS_NICE`. vLLM intentionally raises an error instead
+of silently losing the requested placement. Ensure the selected NUMA node has
+enough free hugepages for the rounded mapping before launch.
+
+One vLLM engine has one shared CPU-primary region and therefore one NUMA
+binding. On a host where GPUs span NUMA domains, use node-local GPU groups (for
+example, two TP=4 replicas on an eight-GPU host) and bind each engine to its
+GPU/NIC-local node. A single TP=8 engine cannot make the same physical pages
+local to both sockets.
+
+Validate the exact container, mount, GPU, and policy before serving a model:
+
+```bash
+python tools/umbp/validate_host_allocator.py \
+  --backend hugetlbfs --path /dev/hugepages \
+  --bytes 67108864 --numa-node 0 --device 0
+```
+
+The validator checks the actual kernel page size and `/proc/self/numa_maps`,
+registers the mapping as pinned host memory, performs a byte-exact GPU round
+trip, reports H2D/D2H bandwidth, and removes its backing file. These smoke
+measurements should be repeated across sizes and iterations before making a
+performance claim.
 
 ## Custom Eviction Policies
 
@@ -167,6 +222,10 @@ vllm serve <model> \
     "kv_connector_extra_config": {
       "spec_name": "TieringOffloadingSpec",
       "cpu_bytes_to_use": 68719476736,
+      "cpu_memory_backend": "hugetlbfs",
+      "cpu_memory_path": "/dev/hugepages",
+      "cpu_hugepage_block_size": "2MB",
+      "cpu_numa_node": 0,
       "secondary_tiers": [{
         "type": "mori",
         "dram_capacity_bytes": 34359738368,

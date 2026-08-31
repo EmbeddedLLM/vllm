@@ -142,7 +142,7 @@ before it, but the concurrency matrix and performance claims require Phase 4
 profiling and tuning first.
 
 - [ ] Sweep `blocks_per_chunk` and UMBP batch sizes.
-- [ ] Verify pinned, hugepage-backed, NUMA-local CPU buffers.
+- [x] Verify pinned, hugepage-backed, NUMA-local CPU buffers.
 - [ ] Profile ROCm SDMA use and synchronization granularity.
 - [ ] Batch CPU-to-GPU copies on a dedicated stream.
 - [ ] Tune remote QPs and NIC selection; start with four QPs from the blog.
@@ -400,6 +400,15 @@ test on TP=1 and TP=2. Both runs forced GPU eviction, required UMBP tier-read
 and CPU-to-GPU counters, and checked generated-output equality. The TP=2 run
 restored 11,010,048 bytes through both measured stages. These runs close local
 GPU correctness only; they do not replace the Phase 4 sweep or profiling.
+
+On 2026-08-31, the shared CPU-primary allocator passed 97 focused tests in the
+exact ROCm nightly image and real 2 MiB hugetlbfs/NUMA placement checks on an
+MI355X host. Separate 64 MiB GPU 0/node 0 and GPU 4/node 1 smokes verified
+`cudaHostRegister`, byte-exact GPU round trips, and approximately 56.7 GB/s H2D
+and 56.4 GB/s D2H. The retained `tools/umbp/validate_host_allocator.py` tool
+checks `/proc/self/numa_maps`, physical page size, cleanup, correctness, and
+bandwidth. These single-size smokes close the allocator verification item but
+are not the required block/batch/concurrency performance sweep.
 
 The reproducible node bootstrap is
 `tools/umbp/bootstrap_distributed_node.sh`. It pins the three validated project

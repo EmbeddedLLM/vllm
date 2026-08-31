@@ -13,11 +13,22 @@ import uuid
 from unittest.mock import MagicMock
 
 import pytest
+import regex as re
 
 from vllm.utils.system_utils import get_mp_context
+from vllm.v1.kv_offload.cpu import memory as memory_module
+from vllm.v1.kv_offload.cpu import shared_offload_region as region_module
+from vllm.v1.kv_offload.cpu.memory import (
+    HUGEPAGE_1GB,
+    HUGEPAGE_2MB,
+    CPUOffloadMemoryBackend,
+    CPUOffloadMemoryConfig,
+    MountInfo,
+    _wait_for_file_size,
+    bind_memory_to_numa_node,
+)
 from vllm.v1.kv_offload.cpu.shared_offload_region import (
     SharedOffloadRegion,
-    _wait_for_file_size,
 )
 
 PAGE_SIZE = mmap.PAGESIZE
@@ -42,6 +53,7 @@ def _make_region(
     cpu_page_size: int = PAGE_SIZE,
     num_workers: int = 1,
     rank: int = 0,
+    memory_config: CPUOffloadMemoryConfig | None = None,
 ) -> SharedOffloadRegion:
     assert cpu_page_size % PAGE_SIZE == 0
     return SharedOffloadRegion(
@@ -50,6 +62,7 @@ def _make_region(
         rank=rank,
         kv_bytes_per_block=num_workers * cpu_page_size,
         cpu_page_size=cpu_page_size,
+        memory_config=memory_config,
     )
 
 
@@ -187,6 +200,274 @@ def _mp_race_construct_and_write(
 def iid():
     """Fresh instance ID for each test."""
     return str(uuid.uuid4())
+
+
+# ---------------------------------------------------------------------------
+# CPU offload backing memory configuration
+# ---------------------------------------------------------------------------
+
+
+def test_memory_config_defaults_preserve_existing_shm_behavior(iid):
+    config = CPUOffloadMemoryConfig.from_extra_config({})
+
+    assert config.backend == CPUOffloadMemoryBackend.DEFAULT
+    assert config.effective_backend == CPUOffloadMemoryBackend.SHM
+    assert config.mmap_path(iid) == f"/dev/shm/vllm_offload_{iid}.mmap"
+    assert config.mapped_size(PAGE_SIZE) == PAGE_SIZE
+    assert config.numa_node is None
+    assert config.prefault is True
+
+
+def test_memory_config_parses_hugetlbfs_numa_and_prefault(tmp_path):
+    config = CPUOffloadMemoryConfig.from_extra_config(
+        {
+            "cpu_memory_backend": "hugetlbfs",
+            "cpu_memory_path": str(tmp_path),
+            "cpu_hugepage_block_size": "1GB",
+            "cpu_numa_node": "2",
+            "cpu_prefault": "off",
+        }
+    )
+
+    assert config.effective_backend == CPUOffloadMemoryBackend.HUGETLBFS
+    assert config.hugepage_block_size == HUGEPAGE_1GB
+    assert config.numa_node == 2
+    assert config.prefault is False
+
+
+@pytest.mark.parametrize(
+    ("extra_config", "match"),
+    [
+        ({"cpu_memory_backend": "invalid"}, "Invalid cpu_memory_backend"),
+        ({"cpu_memory_backend": "hugetlbfs"}, "cpu_memory_path is required"),
+        ({"cpu_hugepage_block_size": "4MB"}, "cpu_hugepage_block_size"),
+        ({"cpu_numa_node": -2}, "cpu_numa_node"),
+        ({"cpu_numa_node": True}, "cpu_numa_node"),
+        ({"cpu_prefault": "sometimes"}, "cpu_prefault"),
+    ],
+)
+def test_memory_config_rejects_invalid_values(extra_config, match):
+    with pytest.raises(ValueError, match=match):
+        CPUOffloadMemoryConfig.from_extra_config(extra_config)
+
+
+def test_shm_memory_path_relocates_shared_file(tmp_path, iid):
+    config = CPUOffloadMemoryConfig.from_extra_config(
+        {"cpu_memory_backend": "shm", "cpu_memory_path": str(tmp_path)}
+    )
+
+    with _region(iid, memory_config=config) as r:
+        assert r.mmap_path == str(tmp_path / f"vllm_offload_{iid}.mmap")
+        assert os.path.getsize(r.mmap_path) == r.total_size_bytes
+
+
+def test_hugetlbfs_rejects_dev_shm(iid):
+    config = CPUOffloadMemoryConfig.from_extra_config(
+        {"cpu_memory_backend": "hugetlbfs", "cpu_memory_path": "/dev/shm"}
+    )
+
+    with pytest.raises(ValueError, match="must not be under /dev/shm"):
+        _make_region(iid, memory_config=config)
+
+
+def test_hugetlbfs_rejects_mount_page_size_mismatch(monkeypatch, tmp_path, iid):
+    config = CPUOffloadMemoryConfig(
+        backend=CPUOffloadMemoryBackend.HUGETLBFS,
+        path=str(tmp_path),
+        hugepage_block_size=HUGEPAGE_1GB,
+    )
+    monkeypatch.setattr(
+        memory_module,
+        "_get_mount_info",
+        lambda _: MountInfo(
+            mount_point=str(tmp_path),
+            fs_type="hugetlbfs",
+            options=("pagesize=2M",),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="does not match hugetlbfs mount"):
+        _make_region(iid, memory_config=config)
+
+
+def test_hugetlbfs_maps_aligned_size_but_exposes_logical_view(
+    monkeypatch, tmp_path, iid
+):
+    config = CPUOffloadMemoryConfig.from_extra_config(
+        {"cpu_memory_backend": "hugetlbfs", "cpu_memory_path": str(tmp_path)}
+    )
+    monkeypatch.setattr(
+        memory_module,
+        "_get_mount_info",
+        lambda _: MountInfo(
+            mount_point=str(tmp_path),
+            fs_type="hugetlbfs",
+            options=("pagesize=2M",),
+        ),
+    )
+
+    with _region(iid, num_blocks=1, memory_config=config) as r:
+        assert r.total_size_bytes == PAGE_SIZE
+        assert r.mapped_size_bytes == HUGEPAGE_2MB
+        assert r.mmap_obj is not None
+        assert len(r.mmap_obj) == HUGEPAGE_2MB
+        assert os.path.getsize(r.mmap_path) == HUGEPAGE_2MB
+        assert r._base is not None
+        assert r._base.numel() == PAGE_SIZE
+
+        view = r.create_kv_memoryview()
+        assert view.nbytes == PAGE_SIZE
+        assert view.shape == (1, PAGE_SIZE)
+        del view
+
+
+def test_numa_policy_is_bound_before_prefault(monkeypatch, tmp_path, iid):
+    calls: list[str] = []
+    config = CPUOffloadMemoryConfig(
+        backend=CPUOffloadMemoryBackend.SHM,
+        path=str(tmp_path),
+        numa_node=1,
+    )
+    monkeypatch.setattr(
+        region_module,
+        "bind_memory_to_numa_node",
+        lambda *args: calls.append("bind"),
+    )
+    monkeypatch.setattr(
+        region_module,
+        "_get_populate_write_fn",
+        lambda _: lambda *args: calls.append("prefault"),
+    )
+
+    with _region(iid, num_blocks=1, memory_config=config):
+        assert calls == ["bind", "prefault"]
+
+
+def test_prefault_can_be_disabled(monkeypatch, tmp_path, iid):
+    config = CPUOffloadMemoryConfig(
+        backend=CPUOffloadMemoryBackend.SHM,
+        path=str(tmp_path),
+        prefault=False,
+    )
+    populate = MagicMock(side_effect=AssertionError("prefault must be skipped"))
+    monkeypatch.setattr(region_module, "_get_populate_write_fn", populate)
+
+    with _region(iid, num_blocks=1, memory_config=config):
+        populate.assert_not_called()
+
+
+def test_numa_binding_failure_removes_creator_file(monkeypatch, tmp_path, iid):
+    config = CPUOffloadMemoryConfig(
+        backend=CPUOffloadMemoryBackend.SHM,
+        path=str(tmp_path),
+        numa_node=0,
+    )
+    monkeypatch.setattr(
+        region_module,
+        "bind_memory_to_numa_node",
+        MagicMock(side_effect=OSError("mbind denied")),
+    )
+
+    with pytest.raises(OSError, match="mbind denied"):
+        _make_region(iid, num_blocks=1, memory_config=config)
+
+    assert not os.path.exists(config.mmap_path(iid))
+
+
+def test_bind_memory_to_numa_node_calls_mbind(monkeypatch):
+    mapped_region = mmap.mmap(-1, PAGE_SIZE)
+    mbind = MagicMock(return_value=0)
+    libnuma = MagicMock(mbind=mbind)
+    monkeypatch.setattr(memory_module.ctypes, "CDLL", lambda *args, **kwargs: libnuma)
+    try:
+        bind_memory_to_numa_node(mapped_region, PAGE_SIZE, 1)
+    finally:
+        mapped_region.close()
+
+    assert mbind.call_count == 1
+    args = mbind.call_args.args
+    assert args[1] == PAGE_SIZE
+    assert args[2] == memory_module._MPOL_BIND
+
+
+def test_hugetlbfs_allocation_with_env_path(iid):
+    hugepage_path = os.environ.get("VLLM_TEST_HUGETLBFS_PATH")
+    if not hugepage_path:
+        pytest.skip("VLLM_TEST_HUGETLBFS_PATH is not set")
+    assert hugepage_path is not None
+
+    config = CPUOffloadMemoryConfig.from_extra_config(
+        {
+            "cpu_memory_backend": "hugetlbfs",
+            "cpu_memory_path": hugepage_path,
+            "cpu_hugepage_block_size": os.environ.get(
+                "VLLM_TEST_HUGETLBFS_BLOCK_SIZE", "2MB"
+            ),
+            "cpu_numa_node": os.environ.get("VLLM_TEST_NUMA_NODE"),
+        }
+    )
+
+    with _region(iid, num_blocks=1, memory_config=config) as r:
+        assert r.mmap_path == os.path.join(hugepage_path, f"vllm_offload_{iid}.mmap")
+        assert r.total_size_bytes == PAGE_SIZE
+        assert r.mapped_size_bytes == config.hugepage_block_size
+        assert os.path.exists(r.mmap_path)
+        if config.numa_node is not None:
+            with open("/proc/self/numa_maps", encoding="utf-8") as numa_maps:
+                mapping = next(line for line in numa_maps if r.mmap_path in line)
+            pages_by_node = {
+                int(node): int(pages)
+                for node, pages in re.findall(r"\bN(\d+)=(\d+)\b", mapping)
+            }
+            assert pages_by_node == {
+                config.numa_node: r.mapped_size_bytes // config.hugepage_block_size
+            }
+
+
+def test_hugetlbfs_is_shared_by_scheduler_and_worker_with_env_path(iid):
+    hugepage_path = os.environ.get("VLLM_TEST_HUGETLBFS_PATH")
+    if not hugepage_path:
+        pytest.skip("VLLM_TEST_HUGETLBFS_PATH is not set")
+
+    config = CPUOffloadMemoryConfig.from_extra_config(
+        {
+            "cpu_memory_backend": "hugetlbfs",
+            "cpu_memory_path": hugepage_path,
+            "cpu_hugepage_block_size": os.environ.get(
+                "VLLM_TEST_HUGETLBFS_BLOCK_SIZE", "2MB"
+            ),
+            "cpu_numa_node": os.environ.get("VLLM_TEST_NUMA_NODE"),
+        }
+    )
+    scheduler = SharedOffloadRegion(
+        engine_id=iid,
+        num_blocks=1,
+        rank=None,
+        kv_bytes_per_block=PAGE_SIZE,
+        cpu_page_size=PAGE_SIZE,
+        memory_config=config,
+    )
+    worker: SharedOffloadRegion | None = None
+    try:
+        worker = SharedOffloadRegion(
+            engine_id=iid,
+            num_blocks=1,
+            rank=0,
+            kv_bytes_per_block=PAGE_SIZE,
+            cpu_page_size=PAGE_SIZE,
+            memory_config=config,
+        )
+        assert scheduler._base is not None
+        assert worker._base is not None
+        scheduler._base.fill_(23)
+        assert bool((worker._base == 23).all())
+        worker._base.fill_(41)
+        assert bool((scheduler._base == 41).all())
+    finally:
+        if worker is not None:
+            worker.cleanup()
+        scheduler.cleanup()
+        _cleanup_file(config.mmap_path(iid))
 
 
 # ---------------------------------------------------------------------------
@@ -780,25 +1061,23 @@ def test_wait_for_file_size_timeout(tmp_path):
 
 def test_insufficient_space_raises_clear_error(monkeypatch):
     """A failed creator capacity check must clean up and give a clear error."""
-    import vllm.v1.kv_offload.cpu.shared_offload_region as region
-
     engine_id = str(uuid.uuid4())
     mmap_path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
     mock_open = MagicMock(return_value=9999)
     mock_unlink = MagicMock()
     mock_close = MagicMock()
-    monkeypatch.setattr(region.os, "open", mock_open)
-    monkeypatch.setattr(region.os, "unlink", mock_unlink)
-    monkeypatch.setattr(region.os, "close", mock_close)
+    monkeypatch.setattr(memory_module.os, "open", mock_open)
+    monkeypatch.setattr(memory_module.os, "unlink", mock_unlink)
+    monkeypatch.setattr(memory_module.os, "close", mock_close)
     monkeypatch.setattr(
-        region,
+        memory_module,
         "check_shm_free_space",
         lambda *a, **kw: (_ for _ in ()).throw(
             RuntimeError("Insufficient space in /dev/shm: 30 GB required.")
         ),
     )
 
-    with pytest.raises(RuntimeError, match="Insufficient space"):
+    with pytest.raises(OSError, match="Failed to size offload mmap file") as exc_info:
         SharedOffloadRegion(
             engine_id=engine_id,
             num_blocks=4,
@@ -806,6 +1085,8 @@ def test_insufficient_space_raises_clear_error(monkeypatch):
             kv_bytes_per_block=PAGE_SIZE,
             cpu_page_size=PAGE_SIZE,
         )
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert "Insufficient space" in str(exc_info.value.__cause__)
 
     mock_unlink.assert_called_once_with(mmap_path)
     mock_close.assert_called_once_with(9999)
@@ -813,23 +1094,21 @@ def test_insufficient_space_raises_clear_error(monkeypatch):
 
 def test_ftruncate_failure_cleans_up_creator(monkeypatch):
     """A failed creator ftruncate must close and unlink before re-raising."""
-    import vllm.v1.kv_offload.cpu.shared_offload_region as region
-
     engine_id = str(uuid.uuid4())
     mmap_path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
     mock_unlink = MagicMock()
     mock_close = MagicMock()
-    monkeypatch.setattr(region.os, "open", MagicMock(return_value=9999))
-    monkeypatch.setattr(region.os, "unlink", mock_unlink)
-    monkeypatch.setattr(region.os, "close", mock_close)
-    monkeypatch.setattr(region, "check_shm_free_space", MagicMock())
+    monkeypatch.setattr(memory_module.os, "open", MagicMock(return_value=9999))
+    monkeypatch.setattr(memory_module.os, "unlink", mock_unlink)
+    monkeypatch.setattr(memory_module.os, "close", mock_close)
+    monkeypatch.setattr(memory_module, "check_shm_free_space", MagicMock())
     monkeypatch.setattr(
-        region.os,
+        memory_module.os,
         "ftruncate",
         MagicMock(side_effect=OSError("ftruncate failed")),
     )
 
-    with pytest.raises(OSError, match="ftruncate failed"):
+    with pytest.raises(OSError, match="Failed to size offload mmap file") as exc_info:
         SharedOffloadRegion(
             engine_id=engine_id,
             num_blocks=4,
@@ -837,6 +1116,8 @@ def test_ftruncate_failure_cleans_up_creator(monkeypatch):
             kv_bytes_per_block=PAGE_SIZE,
             cpu_page_size=PAGE_SIZE,
         )
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert "ftruncate failed" in str(exc_info.value.__cause__)
 
     mock_unlink.assert_called_once_with(mmap_path)
     mock_close.assert_called_once_with(9999)

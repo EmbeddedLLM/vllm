@@ -152,6 +152,32 @@ The CPU tier is backed by a shared offload region. During initialization,
 load jobs therefore pass addresses of CPU slots to MoRI instead of copying
 through an additional Python buffer.
 
+The host allocator is file-backed because the scheduler and independently
+spawned GPU workers must map the same physical bytes. This differs from an
+anonymous per-process host allocator while retaining the same important
+properties: optional hugetlbfs backing, NUMA policy applied before faults,
+startup prefaulting, and GPU host registration.
+
+```mermaid
+flowchart LR
+    Config["CPU memory config<br/>backend / path / page size<br/>NUMA node / prefault"]
+    File["Shared backing file<br/>tmpfs or hugetlbfs"]
+    Policy["mmap MAP_SHARED<br/>mbind before prefault"]
+    Sched["Scheduler mapping<br/>MoRI registered pointer"]
+    Workers["GPU-worker mappings<br/>ROCm/CUDA host registered"]
+
+    Config --> File --> Policy
+    Policy --> Sched
+    Policy --> Workers
+    Sched <-->|same physical pages| Workers
+```
+
+The logical region exposed to vLLM remains exactly the configured CPU-cache
+capacity. A hugetlbfs backing file is rounded up to a whole hugepage, and the
+padding is never exposed as KV slots. Explicit NUMA binding fails closed. One
+engine has one binding policy, so a two-socket eight-GPU host should normally
+run node-local GPU groups/replicas when strict locality is required.
+
 ### Store lifecycle
 
 ```mermaid
@@ -305,6 +331,10 @@ The essential vLLM configuration is:
   "kv_connector_extra_config": {
     "spec_name": "TieringOffloadingSpec",
     "cpu_bytes_to_use": 1073741824,
+    "cpu_memory_backend": "hugetlbfs",
+    "cpu_memory_path": "/dev/hugepages",
+    "cpu_hugepage_block_size": "2MB",
+    "cpu_numa_node": 0,
     "self_describing_kv_events": true,
     "secondary_tiers": [
       {
@@ -348,6 +378,7 @@ the SSD filesystem must be mounted into the container and
 | Responsibility | Implementation |
 | --- | --- |
 | Connector scheduler and event translation | `vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py` |
+| Shared hugepage/NUMA host allocator | `vllm/v1/kv_offload/cpu/memory.py`, `shared_offload_region.py` |
 | Tier construction and registered CPU region | `vllm/v1/kv_offload/tiering/spec.py` |
 | Cascade, promotion, completion, and event ordering | `vllm/v1/kv_offload/tiering/manager.py` |
 | MoRI UMBP lookup, put, get, and event generation | `vllm/v1/kv_offload/tiering/mori/manager.py` |

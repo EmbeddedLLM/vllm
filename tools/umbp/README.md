@@ -34,6 +34,12 @@ The bootstrap therefore stops at the safe software baseline. It does not:
 - change hugepage allocation, memory-lock limits, or container privileges; or
 - change firewall, RDMA, IOMMU, or VFIO configuration.
 
+After that initial inspection, the operator explicitly approved
+`/dev/nvme0n1` on each validation host for an ext4 filesystem. It is now
+mounted at `/mnt/umbp-ssd0` with `noatime` and is used only through a container
+bind mount and MoRI's file backend. This does not authorize SPDK use of that
+controller or any action on `/dev/nvme1n1` through `/dev/nvme7n1`.
+
 This is a safety boundary, not an AMD or UMBP hardware limitation. DRAM and
 RDMA UMBP correctness can be tested with this build, but the SPDK/NVMe tier
 cannot.
@@ -162,3 +168,30 @@ GID_INDEXES=1,1,1,1,1,1,1,1 tools/umbp/stress_rdma_links.sh server
 
 Server and client values need not match. Keep `MODE`, `DURATION`,
 `MESSAGE_SIZE`, and port-base settings identical on both hosts.
+
+## Validating the shared host allocator
+
+`validate_host_allocator.py` checks the CPU-primary backing independently of a
+model. Run it inside the exact vLLM container with the same GPU and hugetlbfs
+mounts intended for serving:
+
+```bash
+python tools/umbp/validate_host_allocator.py \
+  --backend hugetlbfs \
+  --path /dev/hugepages \
+  --bytes 67108864 \
+  --numa-node 0 \
+  --device 0
+```
+
+When `--numa-node` is set, the container must permit `mbind` (Docker normally
+needs `--cap-add SYS_NICE`). The tool fails unless the requested bytes are on
+the selected node and the observed kernel page size matches the hugetlbfs
+mount. Unless `--skip-gpu` is used, it also registers the host range with
+ROCm/CUDA, checks a byte-exact GPU round trip, and reports H2D/D2H bandwidth.
+Its unique backing file is removed even when validation fails.
+
+Run a matching `--backend shm --path /dev/shm` case for a same-process
+baseline. Repeat several sizes and enough iterations for performance work;
+one smoke result proves configuration and correctness, not production
+throughput.
