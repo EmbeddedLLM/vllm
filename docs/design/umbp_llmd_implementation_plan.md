@@ -1,6 +1,6 @@
 # UMBP and llm-d implementation plan
 
-Last updated: 2026-08-23
+Last updated: 2026-08-31
 
 ## Direct pre-admission HBM preload progress
 
@@ -160,6 +160,7 @@ roofline, and prefetch removes most restore time from request TTFT.
 - [x] Optional AMD TP=2 local UMBP test.
 - [x] Two-replica same-node remote-placement test.
 - [x] Two-node zero-copy RDMA read correctness test.
+- [x] Three-pair llm-d physical-placement routing and correctness evaluation.
 - [ ] Two-node failure-fallback test.
 - [ ] llm-d routing integration test with stale and conflicting placements.
 - [ ] Concurrency 1/8/32/128 performance matrix.
@@ -186,6 +187,27 @@ This follows llm-d's existing EPP parser → data producer → scorer → picker
 and keeps cluster policy out of the vLLM engine.
 
 ## Execution log
+
+### 2026-08-31
+
+- Added a shared, file-backed CPU-primary allocator with `shm` and
+  `hugetlbfs` backends, strict NUMA placement, prefaulting, and GPU host
+  registration. MoRI registers the same mapping for pointer-based UMBP I/O.
+- Added side-effect-free physical placement lookup in MoRI and enriched vLLM
+  storage events with tier, locality, source node, and calibrated bandwidth.
+- Required lossless SHA-256 block hashes for physical placement. Legacy
+  low-64-bit event hashes fall back to logical UMBP availability.
+- Validated llm-d routing on two MI355X hosts. Three clean-state pairs produced
+  36/36 native-cache-reference output matches per policy, 100% physical-owner
+  affinity for MoRI-aware routing versus 55.6% random, 1.90 GB fewer secondary
+  reads, and a median 22.5% p50 latency reduction across repetitions.
+- Corrected the evaluator's output oracle. Cold prefill and native GPU
+  prefix-cache replay can select different greedy tokens when logits are
+  nearly tied; external restore is compared with the native cached-prefix
+  result and the cold output is retained for diagnosis.
+- Recorded two deployment limits: 4 GiB RDMA memory registration returned
+  `ENOMEM` while 2 GiB succeeded, and an over-capacity SSD-pressure test
+  produced a restore mismatch that still requires per-medium isolation.
 
 ### 2026-08-23
 

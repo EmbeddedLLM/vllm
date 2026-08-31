@@ -17,13 +17,12 @@ revisions:
 
 | Repository | Branch | Revision |
 | --- | --- | --- |
-| vLLM | `umbp` | `4946ab98e8ee01b712c8eb4c4d699395a7560156` (`Publish physical UMBP placement`) |
+| vLLM | `umbp` | `1f440d65d26024857b336ae455c24ba48894add2` (`require lossless hashes for placement`) |
 | MoRI | `umbp-physical-placement` | `6bacfcc952a490f8782998a17b2ddf6b4878641d` (`expose read-only physical placement`) |
-| llm-d-router | `umbp-prefetch-checkpoint` | [`36feca6d27c1ee5ac9b388c4606653941218361c`](https://github.com/EmbeddedLLM/llm-d-router/commit/36feca6d27c1ee5ac9b388c4606653941218361c) (`Add bare-metal MoRI scheduler validation`) |
+| llm-d-router | `umbp-prefetch-checkpoint` | `b0201b2c20c45ef57d915f2aea0930984b3c55ae` (`Use native cache replay as UMBP correctness reference`) |
 
-The vLLM and MoRI revisions are local commits and have not been pushed. The
-llm-d-router revision is the matching router and validation baseline. The vLLM
-tip includes the host-allocator parent commit
+These revisions are local commits and have not all been pushed. The vLLM tip
+includes the host-allocator parent commit
 `aa57d4a569b6366f71b38d85690d51a254c40f85`.
 
 ## RFC-parity status
@@ -39,9 +38,39 @@ missing host-memory or placement primitive.
 | Side-effect-free physical placement | Complete in the local MoRI commit through `BatchLookupLocations`; it returns every live node/tier/size/peer replica without access or lease mutation. |
 | Physical KV-event enrichment | Complete. The bridge emits selected `HBM`/`DRAM`/`SSD`, source node, locality, and optional calibrated bandwidth, with logical `UMBP` fallback. |
 | llm-d restore-cost consumption | Complete. The retained llm-d branch indexes physical hints and scores tier, locality, and bandwidth. |
-| Cross-node zero-copy correctness | Complete for the 1 MiB deterministic smoke on the two MI355X hosts. |
-| Scheduler effectiveness | Not demonstrated. Three controlled aware-versus-random repetitions were correct, but the median p50 change was -0.58% and the median local-compute reduction was only 0.079 percentage points. |
-| Production readiness | Pending replay/resync, stale/conflicting-placement failure injection, measured cost calibration, and the model/concurrency/policy sweep. |
+| Cross-node zero-copy correctness | Complete for the 1 MiB deterministic smoke and 36 bounded-workload restores per policy on the two MI355X hosts. |
+| Scheduler effectiveness | Demonstrated in three clean-state aware-versus-random pairs. Aware routing selected the physical owner for 100% of requests versus 55.6% random, avoided 1.90 GB of secondary reads, and reduced p50 latency by a median 22.5% across runs. |
+| Production readiness | Pending replay/resync, stale/conflicting-placement failure injection, measured cost calibration, SSD pressure hardening, and the model/concurrency/policy sweep. |
+
+## MI355X validation
+
+The paired evaluation used two eight-GPU MI355X hosts, one GPU and one local
+NVMe filesystem per replica, and image
+`vllm/vllm-openai-rocm:nightly-1dc464d42681d22f38caf1fdc1eb632dc4421c45`.
+Each policy ran from a clean UMBP state. The bounded workload used a 2 GiB
+UMBP DRAM region, 95%/80% watermarks, a 1 GiB CPU primary, 136 GPU blocks,
+12 fixtures, and three local-cache eviction prompts.
+
+| Result | MoRI-aware | Random |
+| --- | ---: | ---: |
+| Native-prefix-reference output matches | 36/36 | 36/36 |
+| Physical-owner route affinity | 100% | 55.6% |
+| Restored prompt tokens | 31,296 | 31,296 |
+| Secondary-tier read bytes | 0 | 1,902,903,296 |
+| Per-run p50 latency change versus random | -1.4%, 25.0%, 22.5% | Baseline |
+
+Correctness uses an immediate native GPU prefix-cache replay as the expected
+output. A cold prefill is not a valid exact-text oracle for a cached-prefix
+request: on this model, one deterministic prompt changed from `-003` on cold
+prefill to `-000` on an immediate local GPU cache hit because the final-token
+logits were nearly tied. CPU-only and MoRI-backed restores both reproduced the
+native cached result. The evaluator retains the cold output for diagnostics.
+
+A separate pressure test exceeded UMBP DRAM admission and observed a restored
+output mismatch. That path remains a production blocker until SSD spill and
+burst-admission behavior are isolated with per-medium read telemetry. A 4 GiB
+DRAM region also failed RDMA memory registration with `ENOMEM` on this runtime;
+2 GiB registration is verified.
 
 ## Component architecture
 
