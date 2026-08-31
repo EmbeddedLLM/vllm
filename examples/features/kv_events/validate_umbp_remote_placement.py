@@ -11,10 +11,12 @@ import subprocess
 import time
 from pathlib import Path
 
-from mori.cpp import UMBPClient, UMBPConfig, UMBPDistributedConfig
+from mori.cpp import UMBPClient, UMBPConfig, UMBPDistributedConfig, UMBPMasterClient
 
 from vllm.distributed.kv_events import MEDIUM_STORAGE, BlockStored, KVEventBatch
 from vllm.v1.kv_offload.tiering.mori.placement import (
+    MoriPhysicalPlacementResolver,
+    MoriPlacementClient,
     encode_umbp_event_key,
     enrich_umbp_logical_placement,
 )
@@ -144,10 +146,57 @@ def _validate_logical_event(block_hash: bytes) -> None:
     assert event.locality is None
 
 
+def _validate_physical_event(
+    master_address: str,
+    key_prefix: str,
+    timeout: float,
+    block_hash: bytes,
+    source_node: str,
+) -> None:
+    placement = MoriPlacementClient(
+        master_address,
+        source_node,
+        key_prefix,
+        UMBPMasterClient(master_address),
+    )
+    resolver = MoriPhysicalPlacementResolver(
+        placement,
+        source_node,
+        lookup_timeout_s=timeout,
+        lookup_interval_s=0.02,
+    )
+    event = resolver.enrich_batch(
+        KVEventBatch(
+            ts=time.time(),
+            events=[
+                BlockStored(
+                    block_hashes=[block_hash],
+                    parent_block_hash=None,
+                    token_ids=[],
+                    block_size=0,
+                    lora_id=None,
+                    lora_name=None,
+                    medium=MEDIUM_STORAGE,
+                )
+            ],
+        )
+    ).events[0]
+    assert event.storage_tier == "DRAM"
+    assert event.source_node == source_node
+    assert event.locality == "LOCAL"
+    print(
+        "PLACEMENT: "
+        f"tier={event.storage_tier} source={event.source_node} "
+        f"locality={event.locality}",
+        flush=True,
+    )
+
+
 def _run_source(args: argparse.Namespace) -> None:
+    source_node = args.node_id or "replica-a"
     client = make_client(
         args.master_address,
-        args.node_id or "replica-a",
+        source_node,
         args.node_address,
         args.io_engine_port,
         args.peer_service_port,
@@ -167,6 +216,13 @@ def _run_source(args: argparse.Namespace) -> None:
         assert client.get_into_ptr(key, source_check_ptr, args.size)
         _assert_payload(source_check, source_data)
         _validate_logical_event(block_hash)
+        _validate_physical_event(
+            args.master_address,
+            args.key_prefix,
+            args.timeout,
+            block_hash,
+            source_node,
+        )
         print(f"SELF-CHECK: source restored {args.size} byte-correct bytes", flush=True)
         print(f"READY: source owns {args.size} bytes at key={key}", flush=True)
         wait_until(lambda: client.exists(ack_key), args.timeout)
@@ -239,6 +295,13 @@ def _run_local(args: argparse.Namespace) -> None:
         assert source.put_from_ptr(key, source_ptr, args.size)
         source.flush()
         wait_until(lambda: source.exists(key), args.timeout)
+        _validate_physical_event(
+            master_address,
+            args.key_prefix,
+            args.timeout,
+            block_hash,
+            "replica-a",
+        )
 
         destination = make_client(master_address, "replica-b", "127.0.0.1")
         ctypes.memset(restored_b_ptr, 0xA5, args.size)

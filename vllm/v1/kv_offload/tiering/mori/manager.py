@@ -297,6 +297,15 @@ class MoriSecondaryTierManager(SecondaryTierManager):
                             break
                         prefix_length += 1
                     if prefix_length:
+                        # Make the completed physical placement visible before
+                        # the KV event bridge's bounded lookup window expires.
+                        # DistributedClient.flush() wakes MoRI's heartbeat
+                        # shipper; standalone clients treat it as a storage
+                        # flush.
+                        if not self._client.flush():
+                            logger.warning(
+                                "MoRI UMBP placement flush failed for job %d", job_id
+                            )
                         self.events.append(
                             OffloadingEvent(
                                 keys=list(keys[:prefix_length]),

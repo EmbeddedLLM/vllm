@@ -45,6 +45,7 @@ class FakeClient:
         self.data = {}
         self.registration = None
         self.deregistered = None
+        self.flush_count = 0
         self.__class__.instances.append(self)
 
     def register_memory(self, ptr, size):
@@ -74,6 +75,10 @@ class FakeClient:
             if value is not None:
                 ctypes.memmove(ptr, value, size)
         return results
+
+    def flush(self):
+        self.flush_count += 1
+        return True
 
 
 def _install_fake_mori(monkeypatch):
@@ -276,6 +281,7 @@ def test_mori_tier_emits_event_only_after_successful_store(monkeypatch):
     )
     assert not _wait_for_result(tier).success
     assert list(tier.take_events()) == []
+    assert FakeClient.instances[0].flush_count == 3
     tier.shutdown()
 
 

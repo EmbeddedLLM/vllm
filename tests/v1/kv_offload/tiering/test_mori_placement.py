@@ -17,6 +17,7 @@ from vllm.distributed.kv_events import (
     KVEventBatch,
 )
 from vllm.v1.kv_offload.tiering.mori.placement import (
+    MoriPhysicalPlacementResolver,
     MoriPlacementClient,
     encode_umbp_event_key,
     enrich_umbp_logical_placement,
@@ -26,6 +27,15 @@ from vllm.v1.kv_offload.tiering.mori.placement import (
 class FakeTierType:
     HBM = "HBM"
     DRAM = "DRAM"
+    SSD = "SSD"
+
+
+class FakeLocation:
+    def __init__(self, node_id, tier, size=4096, peer_address="peer:1"):
+        self.node_id = node_id
+        self.tier = tier
+        self.size = size
+        self.peer_address = peer_address
 
 
 class FakeMasterClient:
@@ -34,6 +44,8 @@ class FakeMasterClient:
         self.revoked = []
         self.cleared = []
         self.matches = []
+        self.locations = {}
+        self.location_queries = []
 
     def report_external_kv_blocks(self, node_id, keys, tier):
         self.reported.append((node_id, keys, tier))
@@ -50,6 +62,10 @@ class FakeMasterClient:
 
     def get_external_kv_hit_counts(self, keys):
         return keys
+
+    def batch_lookup_locations(self, keys):
+        self.location_queries.append(keys)
+        return [self.locations.get(key, []) for key in keys]
 
 
 def _install_fake_mori(monkeypatch):
@@ -140,3 +156,75 @@ def test_logical_umbp_placement_survives_kv_event_wire_round_trip():
     assert [event.storage_tier for event in decoded.events] == ["UMBP", "UMBP", None]
     assert all(event.source_node is None for event in decoded.events)
     assert all(event.locality is None for event in decoded.events)
+
+
+def test_physical_placement_uses_chunk_key_and_prefers_local_best_tier(monkeypatch):
+    _install_fake_mori(monkeypatch)
+    master = FakeMasterClient()
+    placement = MoriPlacementClient("master:15558", "node-0", "prefix:", master)
+    chunk = _stored(block_hash=b"last", medium=MEDIUM_STORAGE, group_idx=2)
+    chunk = msgspec.structs.replace(chunk, block_hashes=[b"first", b"last"])
+    key = encode_umbp_event_key(b"last", 2, "prefix:")
+    master.locations[key] = [
+        FakeLocation("node-1", FakeTierType.DRAM),
+        FakeLocation("node-0", FakeTierType.SSD),
+        FakeLocation("node-0", FakeTierType.DRAM),
+    ]
+    resolver = MoriPhysicalPlacementResolver(
+        placement,
+        "node-0",
+        lookup_timeout_s=0,
+        bandwidth_bps={("LOCAL", "DRAM"): 12.5e9},
+    )
+
+    enriched = resolver.enrich_batch(KVEventBatch(0.0, [chunk]))
+
+    assert master.location_queries == [[key]]
+    event = enriched.events[0]
+    assert event.storage_tier == "DRAM"
+    assert event.locality == "LOCAL"
+    assert event.source_node == "node-0"
+    assert event.estimated_bandwidth_bps == 12.5e9
+
+
+def test_physical_placement_cache_splits_removals_by_source(monkeypatch):
+    _install_fake_mori(monkeypatch)
+    master = FakeMasterClient()
+    placement = MoriPlacementClient("master:15558", "reader", "prefix:", master)
+    first = _stored(block_hash=b"a", medium=MEDIUM_STORAGE, group_idx=3)
+    second = _stored(block_hash=b"b", medium=MEDIUM_STORAGE, group_idx=3)
+    master.locations[encode_umbp_event_key(b"a", 3, "prefix:")] = [
+        FakeLocation("node-a", FakeTierType.DRAM)
+    ]
+    master.locations[encode_umbp_event_key(b"b", 3, "prefix:")] = [
+        FakeLocation("node-b", FakeTierType.SSD)
+    ]
+    resolver = MoriPhysicalPlacementResolver(placement, "reader", lookup_timeout_s=0)
+    resolver.enrich_batch(KVEventBatch(0.0, [first, second]))
+
+    removed = BlockRemoved([b"a", b"b"], medium=MEDIUM_STORAGE, group_idx=3)
+    events = resolver.enrich_batch(KVEventBatch(1.0, [removed])).events
+
+    assert len(events) == 2
+    assert [
+        (event.block_hashes, event.storage_tier, event.source_node) for event in events
+    ] == [
+        ([b"a"], "DRAM", "node-a"),
+        ([b"b"], "SSD", "node-b"),
+    ]
+    assert all(event.locality == "REMOTE" for event in events)
+
+
+def test_physical_placement_falls_back_to_logical_umbp(monkeypatch):
+    _install_fake_mori(monkeypatch)
+    master = FakeMasterClient()
+    placement = MoriPlacementClient("master:15558", "node-0", "prefix:", master)
+    resolver = MoriPhysicalPlacementResolver(placement, "node-0", lookup_timeout_s=0)
+
+    event = resolver.enrich_batch(
+        KVEventBatch(0.0, [_stored(medium=MEDIUM_STORAGE)])
+    ).events[0]
+
+    assert event.storage_tier == "UMBP"
+    assert event.locality is None
+    assert event.source_node is None
