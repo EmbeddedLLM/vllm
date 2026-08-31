@@ -358,6 +358,13 @@ storage event when KV events are enabled. In distributed mode this wakes the
 heartbeat shipper, reducing the normal placement lag from the periodic
 heartbeat interval to the bridge's short retry loop.
 
+The engine must run with `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` for physical
+lookup. MoRI stores the complete SHA-256 block hash plus group ID, whereas the
+legacy integer event format retains only the low 64 bits and cannot be reversed
+into the data key. The bridge detects that incompatible event shape, warns
+once, and emits logical `UMBP` placement without issuing a guaranteed-to-miss
+physical lookup.
+
 ## Configuration shape
 
 The essential vLLM configuration is:
@@ -404,6 +411,12 @@ KV-event publication must also be enabled globally:
   "endpoint": "tcp://*:5557",
   "topic": "kv@replica@model"
 }
+```
+
+The vLLM engine environment must include:
+
+```bash
+export VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0
 ```
 
 `node_id` and `key_prefix` must match the UMBP bridge. Every local vLLM process

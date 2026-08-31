@@ -290,6 +290,14 @@ API is provided by MoRI commit
 physical bridge. Enable vLLM's ZMQ KV events and start the bridge before sending
 requests:
 
+Physical lookup requires the engine to publish complete byte hashes. Export
+this in the vLLM engine environment before starting it (setting it only on the
+bridge process is not sufficient):
+
+```bash
+export VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0
+```
+
 ```bash
 .venv/bin/python examples/features/kv_events/umbp_kv_event_bridge.py \
   --endpoint tcp://127.0.0.1:5557 \
@@ -326,7 +334,11 @@ long enough to emit a symmetric removal. Bandwidth flags are optional and must
 come from measurements on the deployed path; when omitted, llm-d falls back to
 its configured tier and locality costs. A timed-out query emits logical `UMBP`
 instead of fabricating placement. Start the bridge before vLLM traffic because
-the live stream does not replay events emitted before it subscribed.
+the live stream does not replay events emitted before it subscribed. Legacy
+integer event hashes contain only the low 64 bits of the underlying SHA-256
+hash and therefore cannot identify the full MoRI data key. If the bridge
+receives one for a storage event, it warns once, skips the guaranteed miss, and
+emits logical `UMBP` placement.
 
 To validate the distributed data and placement paths without GPUs, launch the
 same-host two-replica harness against an unmodified MoRI build:

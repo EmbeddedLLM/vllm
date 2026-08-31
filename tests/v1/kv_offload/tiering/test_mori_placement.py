@@ -16,6 +16,7 @@ from vllm.distributed.kv_events import (
     BlockStored,
     KVEventBatch,
 )
+from vllm.v1.kv_offload.base import make_offload_key
 from vllm.v1.kv_offload.tiering.mori.placement import (
     MoriPhysicalPlacementResolver,
     MoriPlacementClient,
@@ -141,6 +142,13 @@ def test_legacy_integer_hashes_have_unambiguous_namespace():
     assert key == "prefix:legacy-int:000000000000002a:00000001"
 
 
+def test_byte_event_key_matches_mori_offload_key():
+    offload_key = make_offload_key(b"hash", 2)
+    assert encode_umbp_event_key(b"hash", 2, "prefix:") == (
+        f"prefix:{bytes(offload_key).hex()}"
+    )
+
+
 def test_logical_umbp_placement_survives_kv_event_wire_round_trip():
     batch = KVEventBatch(
         1.0,
@@ -225,6 +233,22 @@ def test_physical_placement_falls_back_to_logical_umbp(monkeypatch):
         KVEventBatch(0.0, [_stored(medium=MEDIUM_STORAGE)])
     ).events[0]
 
+    assert event.storage_tier == "UMBP"
+    assert event.locality is None
+    assert event.source_node is None
+
+
+def test_physical_placement_skips_lossy_integer_hashes(monkeypatch):
+    _install_fake_mori(monkeypatch)
+    master = FakeMasterClient()
+    placement = MoriPlacementClient("master:15558", "node-0", "prefix:", master)
+    resolver = MoriPhysicalPlacementResolver(placement, "node-0", lookup_timeout_s=0)
+
+    event = resolver.enrich_batch(
+        KVEventBatch(0.0, [_stored(block_hash=42, medium=MEDIUM_STORAGE)])
+    ).events[0]
+
+    assert master.location_queries == []
     assert event.storage_tier == "UMBP"
     assert event.locality is None
     assert event.source_node is None

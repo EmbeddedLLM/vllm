@@ -245,6 +245,21 @@ class MoriPhysicalPlacementResolver:
         results: list[UMBPPhysicalPlacement | None] = [None] * len(events)
         by_group: dict[int, list[int]] = {}
         for index, event in enumerate(events):
+            # Legacy integer KV-event hashes retain only the low 64 bits of
+            # vLLM's SHA-256 block hash. MoRI keys contain the complete hash,
+            # so physical placement cannot be recovered from that lossy wire
+            # representation. Keep the logical UMBP fallback and avoid a
+            # guaranteed-to-miss lookup. The engine that publishes events
+            # must set VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 for physical
+            # enrichment.
+            if isinstance(event.block_hashes[-1], int):
+                logger.warning_once(
+                    "Cannot resolve physical UMBP placement from legacy "
+                    "integer KV-event hashes; set "
+                    "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 on the vLLM "
+                    "engine. Publishing logical UMBP placement instead."
+                )
+                continue
             by_group.setdefault(event.group_idx or 0, []).append(index)
         for group_idx, indices in by_group.items():
             grouped = [events[index] for index in indices]
