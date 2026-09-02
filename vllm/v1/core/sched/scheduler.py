@@ -2528,13 +2528,14 @@ class Scheduler(SchedulerInterface):
     def _finish_hbm_prefetch(self, request: Request) -> None:
         """Release request ownership after publishing loaded prefix blocks."""
         request.status = RequestStatus.FINISHED_STOPPED
-        if request.num_computed_tokens == request.num_tokens:
+        record = self.hbm_prefetch_results[request.request_id]
+        requested_tokens = record.total_blocks * self.block_size
+        if request.num_computed_tokens >= requested_tokens:
             status = "ready"
         elif request.num_computed_tokens:
             status = "partial"
         else:
             status = "miss"
-        record = self.hbm_prefetch_results[request.request_id]
         record.status = status
         record.updated_at = self._hbm_prefetch_time()
         self._free_request(request)

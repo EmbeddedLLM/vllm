@@ -841,6 +841,16 @@ class EngineCore:
             ) * self._prefetch_hash_block_size
             if not block_tokens:
                 raise ValueError("prefetch requires at least one complete cache block")
+            # Prefix-cache lookup deliberately leaves one token uncomputed so a
+            # normal request can recompute logits. Keep a lookahead token on the
+            # synthetic request as well; otherwise an exactly block-aligned
+            # prompt loses its final cache block during lookup. The lookahead is
+            # never executed by an HBM-prefetch-only request.
+            lookahead_token = (
+                prompts[0][block_tokens]
+                if len(prompts[0]) > block_tokens
+                else prompts[0][-1]
+            )
             request_id = f"hbm-prefetch:{prefetch_id}"
             if self.scheduler.has_hbm_prefetch(request_id):
                 status, total_blocks = self.scheduler.poll_hbm_prefetch(request_id)
@@ -853,7 +863,7 @@ class EngineCore:
                 }
             request = Request(
                 request_id=request_id,
-                prompt_token_ids=prompts[0][:block_tokens],
+                prompt_token_ids=prompts[0][:block_tokens] + [lookahead_token],
                 sampling_params=SamplingParams(max_tokens=1),
                 pooling_params=None,
                 cache_salt=cache_salt,

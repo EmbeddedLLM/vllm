@@ -4777,6 +4777,20 @@ def test_hbm_prefetch_completion_caches_then_releases_without_output():
     assert request.request_id not in scheduler.finished_req_ids
 
 
+def test_hbm_prefetch_completion_ignores_synthetic_lookahead_token():
+    scheduler = create_scheduler(use_kv_connector=True, block_size=16)
+    request = create_requests(num_requests=1, num_tokens=33)[0]
+    request.hbm_prefetch_only = True
+    scheduler.add_hbm_prefetch(request)
+    request.num_computed_tokens = 32
+    scheduler._free_request = Mock()
+
+    scheduler._finish_hbm_prefetch(request)
+
+    assert scheduler.poll_hbm_prefetch(request.request_id) == ("ready", 2)
+    scheduler._free_request.assert_called_once_with(request)
+
+
 def test_hbm_prefetch_admission_caps_pending_blocks_and_requests():
     scheduler = create_scheduler(use_kv_connector=True, block_size=16)
     scheduler.hbm_prefetch_max_pending_requests = 1
