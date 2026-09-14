@@ -641,7 +641,7 @@ prefetch cannot consume every resource needed for demand reads and P/D.
 | Pool-mediated P/D | Separate prefill/decode engines, all-rank readiness, nonzero local-prefix reuse and missing-state-only reads |
 | Direct RDMA P/D | Verified producer-HBM to decoder-HBM transfer, no mandatory pool PUT/SSD I/O, compute fences, all-rank/group completion and observed staging/fallback |
 | Coordinated direct/pool/offload | Disjoint missing-range ownership, independent background persistence, partial-write/cancel/rank-failure tests and drain-before-fallback |
-| Direct-path performance preservation | Matched unchanged MoRIIO, direct UMBP, DRAM/SSD pool and combined modes; measured copies/overlap and a predefined numerical non-regression budget |
+| Three-case P/D effectiveness and direct-path preservation | Direct-only versus direct-plus-offload versus offload-only, plus unchanged MoRIIO reference; measured copies/overlap/backlog and a predefined numerical non-regression budget |
 | TP/hybrid state | Full attention, MLA and recurrent groups; boundary validity, group failures and exact supported shard mappings |
 | Model correctness | Qwen3-0.6B development tests, matched GSM8K baseline/offload/P-D; Kimi K3 TP8 hybrid and long-context acceptance |
 | Routing/prefetch | llm-d adapter, placement staleness/replay recovery, cancellation/expiry, no-model HBM preload and routing opt-out |
@@ -659,8 +659,38 @@ Direct-path evaluation must pin model/runtime/source, layout, parallelism,
 hardware/NIC allocation, transport tuning and workload against unchanged
 `MoRIIOConnector`. Compare layer-wise WRITE and READ behavior explicitly; report
 handoff latency and compute/transfer overlap in addition to serving metrics.
-Include forced direct, forced DRAM/SSD pool and direct-plus-background-offload
-arms. Poison receive buffers and verify bytes/tokens plus transport endpoints.
+The primary comparison must include these three cases:
+
+| Case | Fresh KV handoff | UMBP persistence and reuse |
+| --- | --- | --- |
+| Direct-only | Prefill HBM to decode HBM over MoRI-IO RDMA | Disabled: no pool PUT or GET |
+| Direct-plus-offload | Direct RDMA, without waiting for pool persistence | Background PUT of selected reusable KV; pool reuse enabled for subsequent requests |
+| Offload-only | Pool-mediated P/D: producer PUT, readiness, decoder GET | Enabled; direct HBM-to-HBM P/D disabled |
+
+Offload-only here means pool-mediated P/D, not single-engine offloading or
+disabling RDMA inside the pool. These are benchmark definitions, not current
+configuration flags. Unchanged MoRIIO and recompute baselines remain additional
+references; neither replaces one of the three cases.
+
+Use matched cold workloads to isolate background-persistence overhead
+(direct-plus-offload versus direct-only) and the storage-mediated handoff cost
+(offload-only versus direct-only). Then replay matched warm, partial-prefix
+and GPU-pressure workloads to measure reuse, distinguishing GPU-local hits,
+published pool hits and recomputation. Run both DRAM-only and SSD-only storage
+subcases for pool-enabled modes, holding placement, capacity, admission/dedup
+policy and selected KV bytes fixed within each comparison. Log actual paths
+and classify any fresh-KV pool fallback separately from direct success.
+
+The combined case must prove actual background persistence, not merely enable
+an idle option. Measure time until KV is reusable, PUT success/failure/deferral,
+source-block retention, memory use and queue backlog under sustained load.
+Record outstanding work at the measurement boundary and its drain time without
+presenting background drain as synchronous decode latency. This prevents
+asynchronous persistence cost from disappearing outside the measured window.
+The [three-case benchmark contract](umbp_kvconnector_reimplementation.md#three-case-benchmark-contract)
+defines the detailed controls and accounting.
+
+Poison receive buffers and verify bytes/tokens plus transport endpoints.
 A fastpath-required test must fail on hidden pool or host-staged fallback.
 Mixed-prefix, pressure, cancellation and failed-rank cases gate safe composition.
 Agree the numerical non-regression budget before performance acceptance;

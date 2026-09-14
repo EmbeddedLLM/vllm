@@ -176,9 +176,9 @@ Implement this milestone before claiming direct-P/D performance parity:
    buffers and compare restored bytes plus model tokens. Transport counters
    must prove HBM endpoints and expose staging/fallback; a fastpath-required
    test fails if it silently uses the pool or host payload staging.
-6. **Measure effectiveness.** Compare unchanged `MoRIIOConnector`, forced direct
-   UMBP, pool-mediated DRAM, pool-mediated SSD and combined direct-plus-offload
-   operation; include no-connector/recompute for end-to-end context. Pin source,
+6. **Measure effectiveness.** Run the three mandatory cases below: direct-only,
+   direct-plus-offload and offload-only. Keep unchanged `MoRIIOConnector` and
+   no-connector/recompute as additional references, not replacements. Pin source,
    runtime/model, attention/layout, TP, GPU/NIC allocation, transport tuning and
    workload. Separate cold, warm, partial-prefix and pressure cases. Record
    repeated-trial handoff latency, TTFT, ITL, throughput, tail latency, actual
@@ -186,6 +186,43 @@ Implement this milestone before claiming direct-P/D performance parity:
    overlap. Set a numerical non-regression budget against the matched direct
    baseline before judging results; do not infer parity from correctness smokes
    or fewer requested objects. Preserve failures and reproduction logs on VPS.
+
+#### Three-case benchmark contract
+
+| Case | Fresh KV handoff | UMBP persistence and reuse |
+| --- | --- | --- |
+| Direct-only | Prefill HBM to decode HBM over MoRI-IO RDMA | Disabled: no pool PUT or GET |
+| Direct-plus-offload | Direct RDMA, without waiting for pool persistence | Background PUT of selected reusable KV; pool reuse enabled for subsequent requests |
+| Offload-only | Pool-mediated P/D: producer PUT, readiness, decoder GET | Enabled; direct HBM-to-HBM P/D disabled |
+
+Here, offload-only names a P/D delivery mode, not a single-engine offload test
+and not a ban on RDMA: the pool's cross-host transport may still use MoRI-IO
+RDMA. These are proposed benchmark modes, not existing configuration flags.
+The combined case must actually persist the selected KV; a run with no
+background writes does not measure direct-plus-offload.
+
+- **Fresh-handoff comparison:** use the same cold prompts, local-prefix state,
+  hardware, model, parallelism, layout, request concurrency and transport
+  settings. Direct-plus-offload versus direct-only isolates persistence cost;
+  offload-only versus direct-only measures the storage-mediated handoff cost.
+  Record physical bytes and actual direct/pool paths, not only configured modes.
+- **Reuse comparison:** replay identical warm and partial-prefix workloads,
+  including controlled GPU eviction/pressure, under the same cache policy.
+  Verify pool publication before crediting a reusable copy; distinguish pool
+  hits from GPU-local hits and report recomputed tokens. Direct-only cannot
+  silently use a pool. For fresh ranges in the combined case, pool fallback
+  must be reported separately, not counted as a successful direct fast path.
+- **Storage subcases:** run DRAM-only and SSD-only pool variants for the two
+  pool-enabled cases, with matched placement, capacities, admission/dedup policy
+  and selected KV bytes. Keep producer/decoder-side persistence placement fixed
+  within each comparison; treat any alternative placement as a separate sweep.
+- **Account for asynchronous work:** report time until KV is reusable, completed
+  versus failed/deferred PUTs, outstanding queue bytes, GPU source-retention
+  time and host/GPU memory use, alongside handoff/TTFT/ITL, throughput, tails,
+  copies and NIC/storage bytes. Measure sustained load as well as isolated
+  handoffs. Record the end-of-window backlog and its drain time so deferred
+  persistence is not hidden outside the benchmark, without charging that drain
+  as synchronous decode latency. Preserve output/byte correctness in all cases.
 
 See the [RFC's dual-path protocol](umbp_kvconnector_rfc.md#direct-rdma-and-pool-mediated-pd)
 for the proposed public contract. These are planned tests and behavior, not new
@@ -230,7 +267,7 @@ validation results or authorization to run remote experiments.
 | Pool-mediated P/D handoff and incremental transfer | Producer/consumer protocol, all-rank commit, local-prefix reuse, two-engine transfer accounting | Same-host DRAM and two-host DRAM/SSD Qwen cold/partial P/D passed; native multi-rank, pressure/fault and hybrid handoff pending |
 | Direct HBM-to-HBM RDMA P/D | Shared MoRIIO transport, capability negotiation, fenced direct delivery and no mandatory pool write | Planned, not implemented; existing pool P/D results do not establish this path |
 | Coordinated direct/pool delivery and offload | Disjoint missing-range ownership, independent background persistence, drain-before-fallback and aggregate completion | Planned; not enabled by an existing connector option |
-| Direct P/D performance preservation | Matched MoRIIO/direct/pool/combined trials with endpoint, copy, physical-byte and overlap evidence | Pending; no direct-path parity or speedup claim |
+| Three-case P/D effectiveness and direct-path preservation | Direct-only versus direct-plus-offload versus offload-only, plus unchanged MoRIIO reference; endpoint, copy, physical-byte, backlog and overlap evidence | Pending; no direct-path parity or speedup claim |
 | Single-node DRAM and ext4 SSD offload | MoRI embedded deployment, forced eviction, byte/source reconciliation | Qwen local-cache-reset smoke passed at `2dc83e970`; forced HBM overwrite/pressure and performance pending |
 | Multi-node DRAM/SSD restore | Master-led deployment, peer failures, safe recompute and recovery | Forced cross-host native buffer reads and P/D smokes passed; ordinary multi-node offload, pressure and peer/master faults pending |
 | TP and hybrid cache geometry | Exact layouts, complete group/shard restoration, cancellation and preemption | Layout/rank barriers and unequal dense-group scheduler tests pass; native TP and hybrid boundary semantics pending |
