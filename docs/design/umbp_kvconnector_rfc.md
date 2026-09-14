@@ -374,6 +374,8 @@ The local prototype starts from `EmbeddedLLM/vllm:umbpkvconnector` at
 - `b4d667df1d2df175ca9892a1971da30423fd9746`: real KVConnector startup and dense
   offload request hooks, model-configuration identity, fresh-worker epoch
   binding, and composed Scheduler tests.
+- `5e4e04707979189a3258e5f24213580abd16c901`: dense pool-mediated P/D handoff,
+  all-rank readiness and release, missing-prefix receives and failure recovery.
 
 MoRI remains unchanged at release commit
 `67632e80e2e492184b589904b63225f82d45537c`. The preserved llm-d-router reference
@@ -381,7 +383,7 @@ is `7541552c71642f2756517a7aeb3c0c35720c06d0`; llm-d is
 `d557f83e1e5f1e5a6ed54ef154c554cf6c775e33`. Neither has yet been ported or
 validated against this new connector implementation.
 
-Current evidence at `b4d667df1`: **181 CPU tests passed** (178 UMBP tests and
+Current evidence at `5e4e04707`: **199 CPU tests passed** (196 UMBP tests and
 three existing connector/output-aggregation regressions). These cover physical
 layouts, generation/rank receipts, policy translation, private-path isolation
 and lifetime/failure cases using CPU buffers and a native-API fake. Composed
@@ -391,33 +393,30 @@ and Scheduler for dense offload: cold save, eviction, missing-prefix-only restor
 chunked prefill, unequal group sizes, lookup gaps, timeout, abort, failed receive
 recomputation and inter-engine model-identity isolation. Native I/O, GPU events
 and model execution are still fakes.
-They do not establish HIP/RDMA/SSD correctness, native TP, hybrid boundaries,
-complete P/D serving, model accuracy or performance. The connector is accessible
-via the development module-path mechanism, not the built-in registry. P/D roles
-and unsupported hybrid/parallel/quantized configurations are explicitly rejected
-at this checkpoint; implementing them remains required by this proposal.
-Earlier integration results from other
-branches/releases are not carried over as validation of this prototype.
 
-There is also **uncommitted P/D work** on top of documentation HEAD
-`9365daa2f63a87b97ac81e9295b48e7d0d481a6c`. A fresh run of the same eight
-CPU suites passed **184 tests** in 17.33 seconds, including three new P/D cases.
-These use separate producer/consumer Scheduler instances, one CPU worker each,
-and a shared native-store fake. They cover a handle returned through the actual
-engine output before readiness, byte-checked restoration with zero or nonzero
-decoder-local prefix, and failed export causing receive timeout/recomputation.
-The aligned 16-token prompt cases read only the missing prefix and compute the
-producer's first sampled token on the decoder; no GET starts before readiness.
-This is not a native two-engine deployment or a multi-rank P/D proof.
+The P/D suite includes a two-worker component test proving that a delayed rank
+prevents readiness and a failed export selects release. Separate single-worker
+producer/consumer Scheduler instances exercise the actual engine-output handle,
+byte-checked missing-prefix restoration, partial prompt tails and unequal dense
+groups. Additional cases cover invalid/expired handles, eviction after readiness,
+configured recompute/fail behavior and aborts while a native existence probe is
+blocked. Ordinary offload also runs with P/D enabled and disabled. All applicable
+code/commit hooks passed. The unrelated actionlint installer was skipped; no
+workflow files changed.
 
-This working draft enables dense P/D roles with an explicit shared-master
-configuration. It exports complete, jointly aligned prefix blocks; any partial
-prompt tail is recomputed on the decoder. It does not yet implement hybrid
-boundary-state handoff, heterogeneous topology, routing/prefetch integration,
-or end-to-end model validation. Its code pre-commit run also still reports a
-missing type annotation in the P/D test fixture. The uncommitted source must be
-reviewed, corrected and checkpointed before it can be pinned for reproduction;
-the 184-test result must not be attributed to the 181-test code commit above.
+The current connector enables dense P/D roles with explicit shared-master
+configuration and exports complete, jointly aligned prefix blocks. Any partial
+prompt tail is recomputed on the decoder. It is accessible via the development
+module-path mechanism, not the built-in registry. Unsupported hybrid/non-prefix,
+parallel/speculative and quantized configurations remain explicitly rejected;
+implementing their required semantics remains part of the full proposal.
+
+These tests do not establish HIP/RDMA/SSD correctness, native TP/P-D serving,
+hybrid boundaries, model accuracy or performance. Routing/prefetch and llm-d
+integration are not yet ported. Earlier integration results from other branches
+or releases are not carried over as validation of this prototype. The earlier
+181-test offload and 184-test uncommitted snapshots remain historical evidence,
+not the result attributed to the current code checkpoint.
 
 One native integrity gap needs explicit resolution: the pinned
 [SSD ranged-read interface](https://github.com/ROCm/mori/blob/67632e80e2e492184b589904b63225f82d45537c/src/umbp/include/umbp/local/tiers/ssd_tier.h)
