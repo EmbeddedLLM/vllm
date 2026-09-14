@@ -4,9 +4,12 @@
 
 import ctypes
 import gc
+import os
+import tempfile
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -85,6 +88,102 @@ def region(data, *, device=None):
 
 def object_for(key, memory):
     return TransferObject(key, memory.size, (BufferSlice(memory, 0, memory.size, 0),))
+
+
+@pytest.mark.skipif(
+    not os.getenv("UMBP_NATIVE_TEST_ROOT"),
+    reason="Requires explicit native MoRI/GPU/ext4 runner and task-owned root",
+)
+@pytest.mark.parametrize("medium", ["dram", "ssd"])
+@pytest.mark.parametrize("source_device", ["cpu", "cuda:0"])
+@pytest.mark.parametrize("target_device", ["cpu", "cuda:0"])
+def test_native_ranged_store_preserves_bytes_and_releases_private_paths(
+    medium, source_device, target_device
+):
+    """Real native CPU/GPU I/O; an SSD pass does not establish direct GDS."""
+    import torch
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.umbp.config import (
+        UMBPNodeConfig,
+        UMBPStoreConfig,
+    )
+
+    root = Path(os.environ["UMBP_NATIVE_TEST_ROOT"])
+    assert root.is_absolute() and root.is_dir()
+    source_cpu = (torch.arange(8192) % 251).to(torch.uint8)
+    source = source_cpu.to(source_device)
+    target = torch.full((9216,), 239, dtype=torch.uint8, device=target_device)
+    torch.accelerator.synchronize()
+    expected = torch.cat((source_cpu[4096:], source_cpu[:4096]))
+    regions = tuple(
+        MemoryRegion(
+            value.data_ptr(),
+            value.numel(),
+            value,
+            0 if value.device.type == "cuda" else None,
+        )
+        for value in (source, target)
+    )
+    with tempfile.TemporaryDirectory(prefix="native-ranged-", dir=root) as case:
+        case_root = Path(case)
+        config = UMBPStoreConfig(
+            page_size_bytes=8192,
+            dram_capacity_bytes=32 << 20 if medium == "dram" else 0,
+            ssd_capacity_bytes=64 << 20 if medium == "ssd" else 0,
+            ssd_roots=(case,) if medium == "ssd" else (),
+            ranged_scratch_bytes=64 << 10,
+        )
+        store = config.open_store(
+            UMBPNodeConfig("native-ranged"), max_object_bytes=8192
+        )
+        try:
+            for memory in regions:
+                store.register_region(memory)
+            send = TransferObject(
+                "native-ranged",
+                8192,
+                (
+                    BufferSlice(regions[0], 0, 4096, 4096),
+                    BufferSlice(regions[0], 4096, 4096, 0),
+                ),
+            )
+            assert store.store((send,)).result(timeout=30) == (True,)
+            assert store.lookup((send.key, "absent")).result(timeout=30) == (
+                True,
+                False,
+            )
+            receive = TransferObject(
+                send.key,
+                8192,
+                (
+                    BufferSlice(regions[1], 512, 4096, 0),
+                    BufferSlice(regions[1], 4608, 4096, 4096),
+                ),
+            )
+            assert store.load((receive,)).result(timeout=30) == (True,)
+            actual = target.cpu()
+            assert torch.equal(actual[512:8704], expected)
+            assert torch.all(actual[:512] == 239) and torch.all(actual[8704:] == 239)
+            target.fill_(239)
+            torch.accelerator.synchronize()
+            partial = TransferObject(
+                send.key,
+                8192,
+                (
+                    BufferSlice(regions[1], 128, 256, 37),
+                    BufferSlice(regions[1], 5000, 257, 4103),
+                ),
+            )
+            assert store.load((partial,)).result(timeout=30) == (True,)
+            partial_expected = torch.full((9216,), 239, dtype=torch.uint8)
+            partial_expected[128:384] = expected[37:293]
+            partial_expected[5000:5257] = expected[4103:4360]
+            assert torch.equal(target.cpu(), partial_expected)
+            missing = TransferObject("absent", 8192, receive.slices)
+            assert store.load((missing,)).result(timeout=30) == (False,)
+        finally:
+            store.close()
+        assert not list(case_root.iterdir()), "Native SSD paths survived store.close"
 
 
 @pytest.fixture

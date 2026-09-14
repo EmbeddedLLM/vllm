@@ -691,3 +691,116 @@ Native GPU/DRAM/ext4 SSD and two-node serving, Qwen/GSM8K/Kimi, hybrid/non-prefi
 boundary semantics, parallel/speculative modes, routing and CPU/HBM prefetch
 remain required. No native MoRI, remote host or model workload was used for this
 checkpoint. All logs remain on the VPS; no remote residue was created.
+
+### Native ranged-store test design
+
+Extend the existing store suite with opt-in native cases requiring an explicit
+`UMBP_NATIVE_TEST_ROOT` on the validated ext4 task mount. Exercise real MoRI
+configuration/registration and ranged PUT/GET across CPU/GPU source and target
+combinations for DRAM-only and SSD-only policy. Verify reordered full-object
+assembly, unaligned partial reads, untouched destination padding, misses and
+private-path cleanup after close. This is native storage-adapter evidence, not
+full model serving, TP/P-D, corruption detection or direct-SSD fastpath proof.
+
+### Native runtime preparation (2026-09-14)
+
+The first native build uses the unchanged MoRI release commit
+`67632e80e2e492184b589904b63225f82d45537c` and vLLM code checkpoint
+`5e4e04707979189a3258e5f24213580abd16c901`. The eight opt-in tests are a separate
+source overlay, SHA256
+`4c723b125f838cdd3f1ef2a9ec869783f0e0d69f7d3eaeab146cdf9d11f31645`.
+The complete CPU suite remains **199 passed, 8 skipped**, 15 expected warnings,
+17.66 seconds (`cpu-tests-r17.log`); native tests are not counted as CPU passes.
+
+The authorized 003 runner's existing image is
+`vllm/vllm-openai-rocm:nightly-1dc464d42681d22f38caf1fdc1eb632dc4421c45`, image ID
+`sha256:40e19c756e3dc9ffc9117770904d40376c7d3bf529cc76ddc379cde7ac4dae2d`.
+It contains Python 3.12.13, glibc 2.35, ROCm 7.2.3 and Torch
+`2.12.0+git6bbd260`, but its installed MoRI distribution is only 1.0.0.
+The release's Python 3.12 wheel targets manylinux 2.39, so it is not used.
+
+Build the pinned source against the image instead. Freeze its spdlog submodule
+at `4a9ccf7e38e257feecce0c579a782741254eaeef` and msgpack-c at
+`9b801f087ab7434f2ab1ab3c0f48a966c19d3b70`. Resolve Ubuntu Jammy build packages
+on the VPS against the image's exported package status, then extract their DEBs
+into a task-local dependency prefix; do not install packages into either OS.
+This also avoids 003's broken default Docker bridge without reconfiguring it.
+
+CMake explicitly enables UMBP and gfx950, disables SPDK, examples, C++ tests,
+collectives and EP AOT compilation, and builds `mori_pybinds`, `umbp_master`
+and `umbp_standalone_server` with eight compile workers. This is a UMBP test
+runtime, not a claim that every MoRI feature was built. All 134 build steps
+succeeded. The initial source-import check then failed on Torch's default cache
+username lookup for container UID 1000. Explicit task-local
+`TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` redirect compiler caches, but a
+second unconditional Torch username lookup still needs a user entry. The next
+runner attempt mounts a task-authored, password-free `/etc/passwd` read-only
+with UID 1000 named `ubuntu`; the base image and host remain unchanged.
+CMake reports hipFile absent and
+the GDS engine disabled, so this runtime cannot validate direct SSD-to-HBM I/O.
+
+All prepared scripts, frozen inputs, package hashes, failure transcripts and
+recovered runtime archives are on the VPS under
+`local-logs/umbp-kvconnector-reimplementation-20260914/`. In particular:
+
+- `native-r1-manifest.md`: resource, isolation, mount and cleanup contract.
+- `native-r1-input/build.sh`: full CMake command and source-import checks.
+- `native-r1-input/native.sh`: source/GPU provenance assertions and native pytest.
+- `native-r1-controller.sh`: preflight, source staging, isolated execution,
+  evidence recovery, hash comparison and exact-target cleanup.
+- `native-r1-build-2.log`: compiler/dependency evidence and initial import error.
+- `native-r1-build-2-recovery.tar`: compiled runtime, SHA256
+  `7e69200124bea49f0bd1ca6d9bc68fdc867729e218e0558593f1b7a62a2ca9d0`.
+
+The controller uses a read-only, capability-dropped, non-root container with
+task sources read-only and only its marker-owned SSD0 runtime directory writable.
+GPU tests additionally expose only GPU 0's render node and KFD, with an existing
+SSD-directory `flock` and fresh occupancy checks; no lock file is left behind.
+The injected setup-failure test recovered matching evidence and removed its
+remote root. Native build artifacts are recovered to the VPS before deletion,
+not retained on 003. No model weights are needed or downloaded for this phase.
+
+### Native ranged-store results
+
+Attempt `native-4` passed the no-GPU source-import probe, then exposed one
+gfx950 GPU and imported the connector from `/src/vllm` and MoRI's newly compiled
+`/work/package/mori/libmori_pybinds.so`. **8 native tests passed**, 31 unrelated
+store cases deselected, 15 expected warnings, 7.21 seconds. The matrix covers
+CPU-to-CPU, CPU-to-GPU, GPU-to-CPU and GPU-to-GPU buffers through both DRAM-only
+and SSD-only policy. It checks byte-exact full assembly, unaligned partial
+loads, untouched padding, lookup/read misses and private SSD-path removal after
+normal `store.close()`. The final task SSD test directory was empty.
+
+The full transcript is `native-r1-native-4.log`; pytest XML is recovered from
+`runtime/evidence/native-ranged.xml` in the corresponding recovery archive.
+Earlier failed attempts remain recorded as failures, not native-test passes.
+The source snapshot lacks vLLM's compiled extensions and version file, and the
+import warnings are retained. These buffer tests do not require those vLLM
+extensions; installing/building and checking them is mandatory before model
+serving. MoRI's image distribution metadata still describes its old package:
+the tested native release is identified by source commit, import origins and
+compiled-library hashes, not that metadata.
+
+To replay from the retained VPS bundle, use a new attempt name (the controller
+refuses to overwrite an existing recovery archive):
+
+```bash
+cd /home/ubuntu/vllmumbp
+set -o pipefail
+task_bundle=/home/ubuntu/vllmumbp/local-logs/umbp-kvconnector-reimplementation-20260914
+bash "$task_bundle/native-r1-controller.sh" native replay-1 \
+  2>&1 | tee "$task_bundle/native-r1-replay-1.log"
+```
+
+This command rechecks the SSD mount, free space, device mapping and current GPU
+occupancy, verifies the recovered build's hash, runs both no-device probes and
+native tests, then recovers evidence before exact-root cleanup. It requires the
+same existing image and prepared VPS inputs; it is not a public clean-machine
+installer. Review the manifest before changing the host, image, paths or devices.
+
+Remaining native gates include cancellation/drain under in-flight native I/O,
+storage pressure, tier promotion/demotion, corruption detection, master/peer
+failures, multi-node transfers, and real scheduler/model execution. This result
+does not establish RDMA, GDS, TP/P-D serving, model accuracy or speedup. The full
+Qwen/GSM8K/Kimi, hybrid/non-prefix, parallel/speculative and routing/prefetch
+requirements remain unchanged.
