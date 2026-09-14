@@ -242,9 +242,14 @@ class UMBPConnectorMetadata(KVConnectorMetadata):
     jobs: tuple[TransferJob | LookupJob, ...] = ()
     cancelled: tuple[TransferId, ...] = ()
     finalized: tuple[JobOutcome, ...] = ()
+    worker_generations: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         TransferId(self.epoch, 0)
+        if not isinstance(self.worker_generations, tuple) or any(
+            not isinstance(value, str) or not value for value in self.worker_generations
+        ):
+            raise ValueError("Worker generations must be immutable nonempty strings")
         for values, types in (
             (self.jobs, (TransferJob, LookupJob)),
             (self.cancelled, (TransferId,)),

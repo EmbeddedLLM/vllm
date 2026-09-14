@@ -83,6 +83,10 @@ class UMBPTransferScheduler:
     def _has_capacity(self) -> bool:
         return len(self._pending) + len(self._retiring) < self._max_pending
 
+    def can_admit(self) -> bool:
+        """Check capacity on the scheduler thread before allocating a receive."""
+        return self._has_capacity()
+
     def lookup(self, request: Request, keys: tuple[BlockKey, ...]) -> LookupJob | None:
         job = LookupJob(
             TransferId(self._epoch, self._sequence), request.request_id, keys

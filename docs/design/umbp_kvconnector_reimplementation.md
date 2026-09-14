@@ -1,6 +1,6 @@
 # UMBP reimplementation through KVConnectors
 
-Status: **in progress; not yet a usable or validated connector**.
+Status: **in progress; offload request hooks CPU-tested, native serving and P/D pending**.
 
 ## Target and preserved baseline
 
@@ -134,13 +134,13 @@ completion behavior; it is not being relabeled as UMBP offloading.
 | --- | --- | --- |
 | Native API and owned ranged storage | `umbp/store.py`; CPU contracts, then real native pointer tests | CPU contracts implemented; native pending |
 | Explicit storage configuration | `umbp/config.py`; page/scratch checks, DRAM/SSD policy and private-path lifetime | CPU translation/lifetime tests pass; native policy lowering pending |
-| Compatible P/D/offload keys | `umbp/key.py`, `umbp/layout.py`; descriptor integration and identity isolation | Logical rank-local descriptors implemented; scheduler handshake pending |
-| Scheduler lookup and allocation | KVConnector lookup, metadata, block ownership, asynchronous feedback | Job lifecycle uses real cache-manager pins; request planner/startup wiring pending |
-| Worker load/store and errors | Registered cache views, compute fences, completion snapshots and error block IDs | All-rank finalization/error snapshots CPU-tested through both runner collectors; public connector wiring pending |
+| Compatible P/D/offload keys | `umbp/key.py`, `umbp/layout.py`; descriptor integration and identity isolation | Worker-derived namespace handshake and fresh generation exchange implemented for matching TP; native verification pending |
+| Scheduler lookup and allocation | KVConnector lookup, metadata, block ownership, asynchronous feedback | Dense offload planner exercised through real Scheduler; hybrid/P-D planners pending |
+| Worker load/store and errors | Registered cache views, compute fences, completion snapshots and error block IDs | Real connector hooks and post-forward event recording wired; CPU runner tests pass, native GPU ordering pending |
 | P/D handoff and incremental transfer | Producer/consumer protocol, all-rank commit, local-prefix reuse, two-engine transfer accounting | Pending |
 | Single-node DRAM and ext4 SSD offload | MoRI embedded deployment, forced eviction, byte/source reconciliation | Pending |
 | Multi-node DRAM/SSD restore | Master-led deployment, peer failures, safe recompute and recovery | Pending |
-| TP and hybrid cache geometry | Exact layouts, complete group/shard restoration, cancellation and preemption | Layout and rank-barrier CPU tests pass; real scheduler/hybrid semantics pending |
+| TP and hybrid cache geometry | Exact layouts, complete group/shard restoration, cancellation and preemption | Layout/rank barriers and unequal dense-group scheduler tests pass; native TP and hybrid boundary semantics pending |
 | Placement and MoRI scheduling | Current authoritative placement API, lifecycle events, tier/locality/cost routing | Pending |
 | CPU/HBM prefetch and admission | Token-identity control, connector-owned load, TTL/cancel/drain/no-model invariants | Pending |
 | llm-d integration and fault recovery | Routing, prefetch, replay/gaps, staleness, reconnect/fail-open tests | Pending |
@@ -447,7 +447,7 @@ HF_HUB_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 "$TEST_VENV/bin/python" -m pytest \
   tests/v1/kv_connector/unit/test_kv_connector_lifecycle.py -q
 ```
 
-There is still **no registered or usable UMBPConnector**. The next work must
+At that checkpoint there was **no registered or usable UMBPConnector**. The next work was to
 connect request planning, worker initialization/layout handshake and actual GPU
 event creation to these components, then implement the P/D handle/readiness
 protocol and missing-prefix-only loading. A transfer finalization is not a
@@ -455,3 +455,115 @@ published P/D readiness record. Hybrid boundary selection, request-scoped
 non-prefix state, host-pool-qualified IDs, native integrity and model/accuracy/
 performance evidence remain required. Do not treat unsupported configurations
 as waived requirements or offer a serving command that does not yet work.
+
+### Request-path and startup test design
+
+Wire the existing job owner into actual KVConnector hooks. Inputs are real
+Request hashes, allocated group tables, worker-derived layout identities and
+SchedulerOutput; outputs are asynchronous lookup/load/store metadata and the
+existing completion/error APIs. The cheapest composed test runs the real
+Scheduler and CPU allocation/native-store fixtures through a real connector,
+checking cold store, forced local eviction, missing-prefix-only restore, failed
+receive recomputation, final-logit recompute, admission pressure and abort.
+Extend the lifecycle suite and reuse core scheduler/request fixtures. Startup
+tests must reject incompatible shards/configurations before any storage writes.
+This step establishes the ordinary offload request path; P/D readiness, hybrid
+boundary state and native serving remain required subsequent integration work.
+
+## Fifth implementation checkpoint: offload request path and startup hooks
+
+`umbp/connector.py` now implements `KVConnectorBase_V1` and the all-group finish
+hook. The existing factory loads it using
+`kv_connector_module_path=vllm.distributed.kv_transfer.kv_connector.v1.umbp.connector`
+and `kv_connector=UMBPConnector`. It is not added to the built-in registry and
+has not been validated with a native vLLM/MoRI serving process.
+
+Worker registration resolves the actual allocation layout, opens the owned
+store, and registers the allocations before the existing startup handshake.
+Workers report the namespace derived from their layout, explicit deployment /
+model / revision identity, the resolved model-configuration hash and cache hash
+algorithm. The scheduler requires all TP worker identities and job limits to
+agree. Fresh per-worker nonces derive a new shared transfer epoch; worker or
+engine IDs do not enter storage keys. Immutable weight revision is an operator
+assertion, not a checksum of downloaded weights; verify that assertion at native
+preflight. Model-config hashing is conservative and can cause misses across
+otherwise equivalent configurations/paths; it must not be relaxed without tests.
+Every metadata batch carries the nonce vector. Before binding even its first
+epoch, each worker verifies its own fresh nonce and the derived epoch, rejecting
+old engine metadata before it can launch I/O.
+
+The worker uses `torch.Event(device=current_platform.device_type)` recorded
+when the existing runner calls asynchronous `start_load_kv` after its forward
+launch. Layer hooks perform no I/O, and `wait_for_save` does not block on native
+completion. The prior job owner/finalization protocol protects allocations until
+safe release. Actual ROCm event/zeroing/graph ordering is still a native test gate.
+
+`umbp/planner.py` now selects real Request hashes and full cache records:
+
+- Asynchronous lookup starts beyond the current local prefix and combines
+  every rank's per-object results. A hole limits the hit to the common contiguous
+  prefix, aligned across group block sizes. Read opt-out skips external lookup.
+- Allocation reserves a job slot before promising asynchronous tokens. The
+  existing scheduler owns the WAITING_FOR_REMOTE_KVS transition, publication,
+  invalid-block recovery and final-logit recompute.
+- Newly completed full blocks are pinned before post-forward stores. Save
+  cursors avoid scanning the whole saved prefix on each decode step. Successfully
+  restored objects are not immediately stored again.
+- Lookup deadlines trigger ordinary recompute without waiting for native I/O
+  to finish. They do not release native ownership. Aborted receives remain
+  owned through finalization/error-snapshot retirement.
+- Engine `has_requests()` keeps empty steps running through native completion
+  and retirement even when no user request remains.
+
+### Configuration surface at this checkpoint
+
+This is a development interface, not an approved MI355X serving recipe.
+Use `kv_role=kv_both` for the implemented ordinary offload path. The extra config
+accepts only the following fields:
+
+| Field | Contract |
+| --- | --- |
+| `deployment`, `model`, `revision` | Required nonempty compatibility identities; revision must identify the actual immutable weights |
+| `storage` | Required `UMBPStoreConfig` dictionary described above; capacities and scratch are per worker |
+| `nodes` | For a shared master, one explicit `UMBPNodeConfig` dictionary per TP rank; unique node IDs and peer endpoints |
+| `lookup_timeout` | Positive finite seconds, default 5; bounds lookup/admission waiting, not native I/O lifetime |
+
+Startup currently rejects P/D roles, hybrid/non-prefix/host-resident groups,
+PP/CP, speculative decoding, non-causal attention, disabled prefix caching,
+and KV formats requiring an unvalidated quantization-scale identity. Dense
+FullAttentionSpec and MLAAttentionSpec are wired. These exclusions are temporary
+implementation gaps, **not reductions of the required final scope**. In
+particular, Kimi K3 hybrid acceptance is not established by this checkpoint.
+
+### Evidence and next integration gate
+
+`cpu-tests-r14.log`: **181 passed**, 15 expected warnings, 17.00 seconds.
+This includes 178 UMBP tests plus three existing connector/output regressions.
+The full offline command in the fourth checkpoint is unchanged and now includes
+the extended lifecycle suite. To run just the request/startup tests:
+
+```bash
+HF_HUB_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 \
+  /home/ubuntu/vllmumbp/repos/vllm/.venv/bin/python -m pytest \
+  --confcutdir=tests/v1/kv_connector/unit \
+  tests/v1/kv_connector/unit/test_umbp_lifecycle.py \
+  -k 'full_scheduler or connector_ or pool_reuse or new_worker' -q
+```
+
+The composed tests instantiate the actual factory, connector, Scheduler,
+KVCacheManager/BlockPool and v1 runner collector. They demonstrate cold save,
+local-cache eviction, byte-checked missing-prefix restore, chunked prefill,
+unequal group sizes, lookup gaps, timeout recompute, failed receive recovery,
+abort/drain, read opt-out and model-identity isolation between separate engines.
+They use one CPU worker, synthetic forward bytes/tokens, a fake compute event,
+and an in-memory native-API fake. The earlier two-rank and v2 collector tests
+remain component evidence; this is not a real TP/GPU/model-accuracy result.
+Inter-engine pool reuse in these tests is ordinary offload, **not P/D**.
+
+Next implement the actual P/D handle/readiness record and consumer wait/fallback
+through these hooks, including missing-prefix-only delivery. Hybrid exact
+boundary/checkpoint and request-specific non-prefix state must then compose with
+that protocol; PP/CP/speculative support and integrity checks remain required.
+Native MoRI lifecycle, SSD/RDMA/TP, Qwen/GSM8K/Kimi, placement/routing/prefetch and
+llm-d gates are unchanged. No remote state or model weights were created by this
+checkpoint, and all evidence remains on the VPS.
