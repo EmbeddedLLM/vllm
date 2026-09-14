@@ -7,18 +7,28 @@ not publish a loaded block before its successful result. A failed read may
 have modified its destination. Cancelling a running future cannot cancel DMA.
 """
 
+import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from threading import Lock
+from math import isfinite
+from threading import Event, Lock
 from typing import Any, Literal
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 _MAX_ADDRESS = (1 << 64) - 1
 
 
 def _positive_int(value: int, name: str) -> None:
     if type(value) is not int or not 0 < value <= _MAX_ADDRESS:
         raise ValueError(f"{name} must be a positive 64-bit integer")
+
+
+def validate_store_retry_timeout(value: float) -> None:
+    if type(value) not in (int, float) or not 0 <= value <= 60 or not isfinite(value):
+        raise ValueError("store_retry_timeout_s must be finite and in [0, 60]")
 
 
 @dataclass(frozen=True)
@@ -98,6 +108,9 @@ class UMBPStore:
     No cache clear is issued: the store can contain another engine's KV.
     Data batches are split at object boundaries; the future remains pending
     through every chunk. The limit must fit all participating SSD arenas.
+    Failed immutable PUTs may be retried within one operation-wide budget;
+    successful objects are never resubmitted. This does not bound a native
+    call's duration or turn an unsuccessful write into a published cache entry.
     """
 
     def __init__(
@@ -108,12 +121,14 @@ class UMBPStore:
         workers: int = 2,
         max_pending: int = 8,
         max_batch_objects: int = 16,
+        store_retry_timeout_s: float = 0,
         cleanup: Callable[[], None] | None = None,
     ) -> None:
         try:
             _positive_int(workers, "workers")
             _positive_int(max_pending, "max_pending")
             _positive_int(max_batch_objects, "max_batch_objects")
+            validate_store_retry_timeout(store_retry_timeout_s)
             required = (
                 "batch_exists",
                 "batch_get_ranges_into_ptr",
@@ -146,6 +161,8 @@ class UMBPStore:
         self._pending = 0
         self._max_pending = max_pending
         self._max_batch_objects = max_batch_objects
+        self._store_retry_timeout_s = store_retry_timeout_s
+        self._stop_retries = Event()
 
     @classmethod
     def from_native_config(
@@ -155,11 +172,13 @@ class UMBPStore:
         workers: int = 2,
         max_pending: int = 8,
         max_batch_objects: int = 16,
+        store_retry_timeout_s: float = 0,
         cleanup: Callable[[], None] | None = None,
     ) -> "UMBPStore":
         _positive_int(workers, "workers")
         _positive_int(max_pending, "max_pending")
         _positive_int(max_batch_objects, "max_batch_objects")
+        validate_store_retry_timeout(store_retry_timeout_s)
         from mori.cpp import MemoryLocationType, UMBPClient
 
         return cls(
@@ -168,6 +187,7 @@ class UMBPStore:
             workers=workers,
             max_pending=max_pending,
             max_batch_objects=max_batch_objects,
+            store_retry_timeout_s=store_retry_timeout_s,
             cleanup=cleanup,
         )
 
@@ -270,11 +290,68 @@ class UMBPStore:
         if operation == "lookup":
             return self._execute_batch(operation, items)
         results: list[bool] = []
+        deadline = time.monotonic() + self._store_retry_timeout_s
         for start in range(0, len(items), self._max_batch_objects):
-            results.extend(
-                self._execute_batch(
-                    operation, items[start : start + self._max_batch_objects]
+            chunk = items[start : start + self._max_batch_objects]
+            try:
+                outcome = self._execute_batch(operation, chunk)
+                if operation == "store" and not all(outcome):
+                    outcome = self._retry_store(chunk, outcome, deadline, start)
+            except Exception as error:
+                logger.warning(
+                    "UMBP %s raised %s in chunk starting at %d (%d objects)",
+                    operation,
+                    type(error).__name__,
+                    start,
+                    len(chunk),
                 )
+                raise
+            failed = [start + i for i, success in enumerate(outcome) if not success]
+            if failed:
+                logger.warning(
+                    "UMBP %s failed for %d/%d objects in chunk starting at %d; "
+                    "failed indices (first 16): %s",
+                    operation,
+                    len(failed),
+                    len(chunk),
+                    start,
+                    failed[:16],
+                )
+            results.extend(outcome)
+        return tuple(results)
+
+    def _retry_store(
+        self,
+        items: tuple[TransferObject, ...],
+        outcome: tuple[bool, ...],
+        deadline: float,
+        start: int,
+    ) -> tuple[bool, ...]:
+        # SSD read leases can consume the arena even after GET completion.
+        # The pinned API reports only booleans, not a retryable error class.
+        results = list(outcome)
+        attempts = 0
+        delay = 0.01
+        while not all(results):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or self._stop_retries.wait(min(delay, remaining)):
+                break
+            if time.monotonic() >= deadline:
+                break
+            failed = [i for i, success in enumerate(results) if not success]
+            retried = self._execute_batch("store", tuple(items[i] for i in failed))
+            attempts += 1
+            for i, success in zip(failed, retried, strict=True):
+                results[i] = success
+            delay = min(delay * 2, 0.1)
+        if attempts:
+            logger.info(
+                "UMBP store retry: chunk_start=%d, attempts=%d, "
+                "initial_failed=%d, remaining_failed=%d",
+                start,
+                attempts,
+                outcome.count(False),
+                results.count(False),
             )
         return tuple(results)
 
@@ -310,6 +387,7 @@ class UMBPStore:
         with self._close_lock:
             with self._lock:
                 self._closing = True
+                self._stop_retries.set()
             self._executor.shutdown(wait=True, cancel_futures=False)
             # On deregistration failure retain the native client and allocation
             # owners. A later close can retry; unsafe release is never a fallback.

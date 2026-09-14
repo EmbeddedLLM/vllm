@@ -16,7 +16,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from vllm.distributed.kv_transfer.kv_connector.v1.umbp.store import UMBPStore
+from vllm.distributed.kv_transfer.kv_connector.v1.umbp.store import (
+    UMBPStore,
+    validate_store_retry_timeout,
+)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -107,6 +110,9 @@ class UMBPStoreConfig:
     ssd_staging_slots also bounds native data batches, including DRAM-only
     clients of remote SSD peers. Use a common limit no larger than the smallest
     peer arena. Every KV object fits one page by the open_store geometry check.
+    store_retry_timeout_s bounds retries across all chunks of an immutable PUT,
+    including DRAM-only clients writing remote SSDs; zero disables retries.
+    It does not bound a native call or extend a P/D handle's expiry.
     """
 
     page_size_bytes: int
@@ -118,6 +124,7 @@ class UMBPStoreConfig:
     master_address: str = ""
     workers: int = 2
     max_pending: int = 8
+    store_retry_timeout_s: float = 5.0
 
     def __post_init__(self) -> None:
         _integer(self.page_size_bytes, "page_size_bytes", 4096, _MAX_BYTES // 8)
@@ -145,6 +152,7 @@ class UMBPStoreConfig:
             _integer(getattr(self, name), name, 1, (1 << 31) - 1)
         if self.ssd_staging_slots * self.page_size_bytes > _MAX_BYTES:
             raise ValueError("SSD staging budget overflows the native byte range")
+        validate_store_retry_timeout(self.store_retry_timeout_s)
         _text(self.master_address, "master_address", empty=True)
         if self.master_address:
             address = urlsplit("//" + self.master_address)
@@ -270,6 +278,7 @@ class UMBPStoreConfig:
                 workers=self.workers,
                 max_pending=self.max_pending,
                 max_batch_objects=self.ssd_staging_slots,
+                store_retry_timeout_s=self.store_retry_timeout_s,
                 cleanup=owned.close,
             )
         except BaseException:

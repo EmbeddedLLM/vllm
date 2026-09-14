@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm.distributed.kv_transfer.kv_connector.v1.umbp import store as store_module
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.store import (
     BufferSlice,
     MemoryRegion,
@@ -230,9 +231,15 @@ def test_failed_object_does_not_inherit_another_objects_success(store, native):
     assert first.owner.raw == b"good" and second.owner.raw == b"YYYY"
 
 
-def test_bounded_native_batches_preserve_result_order_and_missing_objects(native):
+def test_bounded_native_batches_preserve_result_order_and_missing_objects(
+    native, monkeypatch
+):
     """A long restore must fit the native arena without dropping later objects."""
     calls = []
+    warnings = []
+    monkeypatch.setattr(
+        store_module.logger, "warning", lambda fmt, *args: warnings.append(fmt % args)
+    )
     put = native.batch_put_ranges_from_ptr
     get = native.batch_get_ranges_into_ptr
 
@@ -267,8 +274,204 @@ def test_bounded_native_batches_preserve_result_order_and_missing_objects(native
             for operation in ("store", "load")
             for keys in (("0", "1"), ("2", "3"), ("4",))
         ]
+        assert len(warnings) == 1
+        assert "load failed for 1/2 objects in chunk starting at 2" in warnings[0]
+        assert "failed indices (first 16): [2]" in warnings[0]
     finally:
         store.close()
+
+
+def test_store_failure_diagnostics_are_bounded_and_omit_cache_keys(native, monkeypatch):
+    """A failed native PUT keeps its per-object results without leaking keys."""
+    warnings = []
+    monkeypatch.setattr(
+        store_module.logger, "warning", lambda fmt, *args: warnings.append(fmt % args)
+    )
+    native.batch_put_ranges_from_ptr = lambda keys, *args: [False] * len(keys)
+    store = UMBPStore(
+        native, SimpleNamespace(CPU="cpu", GPU="gpu"), max_batch_objects=32
+    )
+    memory = region(b"private-value")
+    store.register_region(memory)
+    objects = tuple(object_for(f"private-key-{i}", memory) for i in range(32))
+    try:
+        assert store.store(objects).result(timeout=5) == (False,) * 32
+        assert len(warnings) == 1
+        assert "store failed for 32/32 objects" in warnings[0]
+        assert str(list(range(16))) in warnings[0]
+        assert "private" not in warnings[0]
+    finally:
+        store.close()
+
+
+@pytest.fixture
+def retry_clock(monkeypatch):
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        store_module, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
+
+    def attach(store):
+        def wait(delay):
+            clock.now += delay
+            return store._stop_retries.is_set()
+
+        monkeypatch.setattr(store._stop_retries, "wait", wait)
+
+    return attach
+
+
+def test_put_retries_only_failed_objects_and_preserves_chunk_order(native, retry_clock):
+    """A transient failure cannot discard successes or resubmit their buffers."""
+    calls = []
+    put = native.batch_put_ranges_from_ptr
+
+    def transient(keys, *args):
+        calls.append(tuple(keys))
+        outcome = put(keys, *args)
+        if len(calls) == 1:
+            outcome[1] = False
+        return outcome
+
+    native.batch_put_ranges_from_ptr = transient
+    store = UMBPStore(
+        native,
+        SimpleNamespace(CPU="cpu", GPU="gpu"),
+        max_batch_objects=2,
+        store_retry_timeout_s=1,
+    )
+    retry_clock(store)
+    memory = region(b"data")
+    store.register_region(memory)
+    try:
+        objects = tuple(object_for(str(i), memory) for i in range(3))
+        assert store.store(objects).result(timeout=5) == (True,) * 3
+        assert calls == [("0", "1"), ("1",), ("2",)]
+        assert native.data == {str(i): b"data" for i in range(3)}
+    finally:
+        store.close()
+
+
+def test_put_retry_budget_is_shared_by_all_chunks(native, retry_clock):
+    calls = []
+
+    def failed(keys, *args):
+        calls.append(tuple(keys))
+        return [False] * len(keys)
+
+    native.batch_put_ranges_from_ptr = failed
+    store = UMBPStore(
+        native,
+        SimpleNamespace(CPU="cpu", GPU="gpu"),
+        max_batch_objects=1,
+        store_retry_timeout_s=0.025,
+    )
+    retry_clock(store)
+    memory = region(b"data")
+    store.register_region(memory)
+    try:
+        objects = tuple(object_for(str(i), memory) for i in range(3))
+        assert store.store(objects).result(timeout=5) == (False,) * 3
+        assert calls == [("0",), ("0",), ("1",), ("2",)]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("response", [[], RuntimeError("private backend error")])
+def test_put_retry_never_hides_native_exceptions_or_malformed_results(
+    native, response, retry_clock
+):
+    calls = []
+
+    def failed(keys, *args):
+        calls.append(tuple(keys))
+        if len(calls) == 1:
+            return [False]
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    native.batch_put_ranges_from_ptr = failed
+    store = UMBPStore(
+        native,
+        SimpleNamespace(CPU="cpu", GPU="gpu"),
+        store_retry_timeout_s=1,
+    )
+    retry_clock(store)
+    memory = region(b"data")
+    store.register_region(memory)
+    try:
+        with pytest.raises(RuntimeError):
+            store.store((object_for("key", memory),)).result(timeout=5)
+        assert calls == [("key",), ("key",)]
+    finally:
+        store.close()
+
+
+def test_put_retry_budget_does_not_retry_failed_gets(native, retry_clock):
+    calls = []
+
+    def missing(keys, *args):
+        calls.append(tuple(keys))
+        return [False]
+
+    native.batch_get_ranges_into_ptr = missing
+    store = UMBPStore(
+        native,
+        SimpleNamespace(CPU="cpu", GPU="gpu"),
+        store_retry_timeout_s=1,
+    )
+    retry_clock(store)
+    memory = region(b"data")
+    store.register_region(memory)
+    try:
+        assert store.load((object_for("absent", memory),)).result(timeout=5) == (False,)
+        assert calls == [("absent",)]
+    finally:
+        store.close()
+
+
+def test_close_stops_retry_wait_before_deregistering_source(native, monkeypatch):
+    calls = []
+    waiting = threading.Event()
+    store = UMBPStore(
+        native,
+        SimpleNamespace(CPU="cpu", GPU="gpu"),
+        store_retry_timeout_s=60,
+    )
+    wait = store._stop_retries.wait
+
+    def blocked(delay):
+        waiting.set()
+        return wait(5)
+
+    def failed(keys, *args):
+        calls.append(tuple(keys))
+        return [False]
+
+    native.batch_put_ranges_from_ptr = failed
+    monkeypatch.setattr(store._stop_retries, "wait", blocked)
+    memory = region(b"data")
+    store.register_region(memory)
+    try:
+        future = store.store((object_for("key", memory),))
+        assert waiting.wait(5)
+        assert not future.done() and not native.deregistered
+        assert not future.cancel(), "Running retries still own their source buffers"
+        with ThreadPoolExecutor() as executor:
+            executor.submit(store.close).result(timeout=2)
+        assert future.result() == (False,)
+        assert calls == [("key",)] and native.deregistered == [memory.ptr]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "timeout", [True, -1, 61, float("nan"), float("inf"), 1 << 1024]
+)
+def test_invalid_store_retry_budget_is_rejected(native, timeout):
+    with pytest.raises(ValueError, match="store_retry_timeout_s"):
+        UMBPStore(native, SimpleNamespace(), store_retry_timeout_s=timeout)
 
 
 def test_chunked_load_keeps_allocation_owners_until_last_native_call(native):

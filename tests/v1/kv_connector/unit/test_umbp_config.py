@@ -113,6 +113,9 @@ def config(**overrides):
         ({"ranged_scratch_bytes": 0}, "integer"),
         ({"max_pending": -1}, "integer"),
         ({"ssd_staging_slots": 0}, "integer"),
+        ({"store_retry_timeout_s": -1}, "store_retry_timeout_s"),
+        ({"store_retry_timeout_s": True}, "store_retry_timeout_s"),
+        ({"store_retry_timeout_s": float("inf")}, "store_retry_timeout_s"),
         ({"master_address": "host"}, "host:port"),
         ({"master_address": "user:secret@host:1234"}, "credentials"),
         ({"master_address": "host:1234/path"}, "host:port"),
@@ -165,6 +168,30 @@ def test_dram_only_disables_implicit_ssd_and_uses_explicit_page_policy(native_ap
     assert record.native() is None
     assert record.destroyed_with_paths
     assert all(not path.exists() for path in record.paths)
+
+
+@pytest.mark.parametrize("budget", [0, 5])
+def test_factory_applies_store_retry_budget(native_api, monkeypatch, budget):
+    """Even a DRAM-only peer may route PUTs to another peer's SSD."""
+    cfg = config(store_retry_timeout_s=budget)
+    store = cfg.open_store(UMBPNodeConfig("worker-0"), max_object_bytes=4096)
+    native = native_api[1][0].native()
+    calls = []
+
+    def put(keys, *args):
+        calls.append(tuple(keys))
+        return [len(calls) > 1]
+
+    monkeypatch.setattr(native, "batch_put_ranges_from_ptr", put)
+    memory = region(b"data")
+    store.register_region(memory)
+    try:
+        assert store.store((object_for("key", memory),)).result(timeout=5) == (
+            bool(budget),
+        )
+        assert len(calls) == (2 if budget else 1)
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize("dram_bytes", [0, 32768])

@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.umbp import pd as pd_module
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.config import UMBPStoreConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.connector import UMBPConnector
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.key import UMBPKeySpace
@@ -544,6 +545,7 @@ def engine(monkeypatch):
         kv_role="kv_both",
         enable_pd=False,
         handoff_timeout=30.0,
+        store_retry_timeout=0,
         load_failure_policy="recompute",
     ):
         groups = groups or [KVCacheGroupSpec(["a"], attention_spec())]
@@ -569,6 +571,7 @@ def engine(monkeypatch):
                     "page_size_bytes": 4096,
                     "dram_capacity_bytes": 8192,
                     "max_pending": limit,
+                    "store_retry_timeout_s": store_retry_timeout,
                 },
             },
         )
@@ -587,7 +590,10 @@ def engine(monkeypatch):
         config.scheduler_config.async_scheduling = False
         native = NativeStore()
         store = UMBPStore(
-            native, SimpleNamespace(CPU="cpu", GPU="gpu"), max_pending=limit
+            native,
+            SimpleNamespace(CPU="cpu", GPU="gpu"),
+            max_pending=limit,
+            store_retry_timeout_s=store_retry_timeout,
         )
         monkeypatch.setattr(
             UMBPStoreConfig, "open_store", lambda *args, **kwargs: store
@@ -1191,10 +1197,53 @@ def test_pd_marker_cannot_authorize_get_before_missing_objects_are_visible(
     assert decode.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 31
 
 
+def test_pd_export_waits_for_retried_put_before_publishing_ready(engine, monkeypatch):
+    prefill = engine(kv_role="kv_producer", store_retry_timeout=5)
+    retry_entered, release = threading.Event(), threading.Event()
+    put = prefill.native.batch_put_ranges_from_ptr
+    calls = []
+
+    def transient(keys, *args):
+        calls.append(tuple(keys))
+        if len(calls) == 1:
+            return [False] * len(keys)
+        if len(calls) == 2:
+            retry_entered.set()
+            assert release.wait(5)
+        return put(keys, *args)
+
+    monkeypatch.setattr(prefill.native, "batch_put_ranges_from_ptr", transient)
+    request = prefill.request(230, tokens=16)
+    request.kv_transfer_params = {"do_remote_decode": True}
+    prefill.scheduler.add_request(request)
+    try:
+        prefill.until(retry_entered.is_set)
+        params = next(
+            output.kv_transfer_params
+            for output in prefill.engine_outputs
+            if output.kv_transfer_params
+        )
+        handle = HandoffHandle.from_dict(params["umbp_handoff"])
+        assert handle.ready_key(0) not in prefill.native.data
+        assert not any(isinstance(job, ControlJob) for job in prefill.jobs)
+        assert prefill.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() < 31
+    finally:
+        release.set()
+    prefill.drain()
+    assert handle.ready_key(0) in prefill.native.data
+    assert calls[0] == calls[1]
+    assert prefill.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 31
+
+
+@pytest.mark.parametrize("store_retry_timeout", [0, 0.025])
 def test_pd_failed_export_never_publishes_readiness_and_decode_recomputes(
-    engine, monkeypatch
+    engine, monkeypatch, store_retry_timeout
 ):
-    prefill = engine(kv_role="kv_producer")
+    warnings = []
+    monkeypatch.setattr(
+        pd_module.logger, "warning", lambda fmt, *args: warnings.append(fmt % args)
+    )
+    prefill = engine(kv_role="kv_producer", store_retry_timeout=store_retry_timeout)
     decode = engine(kv_role="kv_consumer", handoff_timeout=0.02)
     decode.native.data = prefill.native.data
     first = prefill.request(210, tokens=16)
@@ -1206,6 +1255,9 @@ def test_pd_failed_export_never_publishes_readiness_and_decode_recomputes(
     )
     prefill.scheduler.add_request(first)
     prefill.drain()
+    assert len(warnings) == 1
+    assert "UMBP P/D export store failed:" in warnings[0]
+    assert "readiness will not be published" in warnings[0]
     params = next(
         output.kv_transfer_params
         for output in prefill.engine_outputs

@@ -18,9 +18,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.protocol import HandoffHa
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.scheduler import (
     UMBPTransferScheduler,
 )
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import resolve_block_hashes
 from vllm.v1.request import Request, RequestStatus
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -225,6 +228,14 @@ class UMBPHandoffPlanner:
         if export is not None and outcome.job.id == export.store_job:
             # This outcome exists only after every rank's native work ends.
             export.stored = all(outcome.successes)
+            if not export.stored:
+                logger.warning(
+                    "UMBP P/D export store failed: sequence=%d, failed_objects=%d/%d; "
+                    "readiness will not be published",
+                    outcome.job.id.sequence,
+                    outcome.successes.count(False),
+                    len(outcome.successes),
+                )
 
     def owns_receive(self, job: TransferJob) -> bool:
         receive = self.receives.get(job.request_id)
