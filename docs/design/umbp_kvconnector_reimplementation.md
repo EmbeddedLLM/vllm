@@ -804,3 +804,91 @@ failures, multi-node transfers, and real scheduler/model execution. This result
 does not establish RDMA, GDS, TP/P-D serving, model accuracy or speedup. The full
 Qwen/GSM8K/Kimi, hybrid/non-prefix, parallel/speculative and routing/prefetch
 requirements remain unchanged.
+
+### Full-engine Qwen smoke and SSD batch admission (2026-09-14)
+
+The first full-engine attempt at `ea55a38003e11c26d9d7b4e6c9b646135ba8f231`
+used the current Python source with the pinned image's precompiled vLLM
+extensions. Their source commit is `1dc464d42681d22f38caf1fdc1eb632dc4421c45`,
+not the current vLLM commit. Native sources/dependency requirements differ, so
+this is limited runtime-compatibility evidence, not an exact-source native
+build validation. MoRI is the newly built, unchanged 1.2.3.post1 release.
+
+Qwen/Qwen3-0.6B uses the pre-existing snapshot
+`c1899de289a04d12100db370d81485cdf75e47ca`, mounted read-only from its Hub tree.
+TP1, BF16, eager execution, block size 16, 160 GPU blocks, max model length
+2048, max sequences 4, max batched tokens 512 and GPU utilization 0.1 are
+development settings, not a substitute for the Kimi TP8 acceptance recipe.
+One 584-token chat prompt produces 15 greedy tokens; clear only the local
+prefix cache with `reset_prefix_cache(reset_connector=False)` and repeat.
+Require matching output token IDs, zero baseline cached tokens, and positive
+external-cache hits and restored tokens in both offload arms. The configured
+receive-failure policy is `fail`, so a failed GET cannot pass by recomputing.
+
+The first attempt (`serve-r1-smoke-1.log`) passed the baseline, then failed
+before connector serving when AITER copied 4,591,816,539 bytes of installed
+JIT modules into a 4 GiB tmpfs. Its `get_user_jit_dir()` supports
+`AITER_JIT_DIR`; revision 2 points that at task-owned SSD storage, seeds links
+to immutable image modules, and sets `TMPDIR` to task-owned SSD storage too.
+No host/image package, HOME, kernel or filesystem configuration is changed.
+Revision 2 explicitly selects `ROCM_AITER_UNIFIED_ATTN` and LBHNC in every arm.
+The global `VLLM_ROCM_USE_AITER=0` remains unchanged; it does not disable this
+explicit attention-backend selection. Source/native import paths and image
+module hashes are captured before GPU execution.
+
+At `ea55a3800`, revision 2 produced valid negative SSD evidence:
+
+| Arm | Cold cached tokens | Restored tokens | Output matches baseline |
+| --- | ---: | ---: | --- |
+| No connector | 0 | 0 | Yes |
+| DRAM only | 0 | 576 | Yes |
+| SSD only, before batching fix | 0 | 0 (receive failed) | No output |
+
+SSD lookup found 576 tokens, but the 36-object GET exceeded the 16-page
+staging arena. Native `SsdBackend::BatchResolve` correctly rejects a working
+set larger than the whole arena as non-retryable. Thus external lookup hits
+alone are not successful-transfer evidence. The complete run failed and was
+recovered in `serve-r2-smoke-1-recovery.tar`, SHA256
+`6642b4ee0023ccb350ca23ee912a776881db77009d0f89052166446eec045dd1`, before
+marker-owned cleanup. The earlier passing DRAM arm is not an SSD pass.
+
+The correction splits native GET/PUT calls at whole-object boundaries using
+`ssd_staging_slots` as the maximum objects per call. `open_store` already
+requires each KV object to fit one page. Even DRAM-only clients that may read
+remote SSDs must use a common bound no larger than the smallest peer arena;
+automatic remote-capacity negotiation is not implemented. Lookup batching is
+unchanged. One future/admission slot covers every chunk, keeps all registrations
+and scheduler-owned blocks alive, preserves ordered per-object outcomes and
+fails on a malformed chunk before submitting later chunks. There is no early
+publication or increased SSD staging allocation.
+
+Regression tests extend the existing store/config suites: multi-chunk byte
+correctness with a middle missing object, later-chunk failure, cancellation/
+shutdown while a chunk is running, configuration-to-native batch bounds and
+invalid batch limits. Use the eight-suite CPU command above with `--confcutdir`;
+the corrected invocation passed **204 tests, eight native cases skipped** in
+18.27 seconds (`cpu-tests-r18.log`).
+Omitting that option on this CPU-only VPS triggers the unrelated global GPU
+cleanup fixture, as retained in the first local batching-test logs.
+
+The pinned SSD backend retains read staging under a default 3-second lease
+and retries transient arena pressure. Chunking can therefore wait between
+reads. This fixes per-call geometry, not transfer QoS, fairness, lease-release
+efficiency or latency; those need separate native pressure/performance work.
+Matched Qwen and native SSD revalidation of the batching correction is still
+required. GSM8K, eviction pressure, TP/P-D, hybrid models and two-node acceptance
+remain outstanding.
+
+The VPS evidence bundle contains `serve-r2-manifest.md`,
+`serve-r2-controller.sh`, `serve-r2-input/`, source/module hashes, the injected
+cleanup-failure receipt and full logs. The exact original comparison command is:
+
+```bash
+set -o pipefail
+bash local-logs/umbp-kvconnector-reimplementation-20260914/serve-r2-controller.sh smoke smoke-1 \
+  2>&1 | tee local-logs/umbp-kvconnector-reimplementation-20260914/serve-r2-smoke-1.log
+```
+
+That attempt is finished; do not overwrite it. The controller requires a fresh
+attempt name and an absent, marker-owned root. No P/D, GDS or speedup claim is
+made from this local-prefix-reset smoke.

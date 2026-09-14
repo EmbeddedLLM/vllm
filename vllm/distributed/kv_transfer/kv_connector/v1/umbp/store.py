@@ -96,6 +96,8 @@ class UMBPStore:
     ``native_client`` is exclusively owned by this store. Worker shutdown must
     call close(), which drains native calls before deregistering allocations.
     No cache clear is issued: the store can contain another engine's KV.
+    Data batches are split at object boundaries; the future remains pending
+    through every chunk. The limit must fit all participating SSD arenas.
     """
 
     def __init__(
@@ -105,11 +107,13 @@ class UMBPStore:
         *,
         workers: int = 2,
         max_pending: int = 8,
+        max_batch_objects: int = 16,
         cleanup: Callable[[], None] | None = None,
     ) -> None:
         try:
             _positive_int(workers, "workers")
             _positive_int(max_pending, "max_pending")
+            _positive_int(max_batch_objects, "max_batch_objects")
             required = (
                 "batch_exists",
                 "batch_get_ranges_into_ptr",
@@ -141,6 +145,7 @@ class UMBPStore:
         self._closing = False
         self._pending = 0
         self._max_pending = max_pending
+        self._max_batch_objects = max_batch_objects
 
     @classmethod
     def from_native_config(
@@ -149,10 +154,12 @@ class UMBPStore:
         *,
         workers: int = 2,
         max_pending: int = 8,
+        max_batch_objects: int = 16,
         cleanup: Callable[[], None] | None = None,
     ) -> "UMBPStore":
         _positive_int(workers, "workers")
         _positive_int(max_pending, "max_pending")
+        _positive_int(max_batch_objects, "max_batch_objects")
         from mori.cpp import MemoryLocationType, UMBPClient
 
         return cls(
@@ -160,6 +167,7 @@ class UMBPStore:
             MemoryLocationType,
             workers=workers,
             max_pending=max_pending,
+            max_batch_objects=max_batch_objects,
             cleanup=cleanup,
         )
 
@@ -259,6 +267,20 @@ class UMBPStore:
     def _execute(self, operation: str, items: tuple[Any, ...]) -> tuple[bool, ...]:
         if not items:
             return ()
+        if operation == "lookup":
+            return self._execute_batch(operation, items)
+        results: list[bool] = []
+        for start in range(0, len(items), self._max_batch_objects):
+            results.extend(
+                self._execute_batch(
+                    operation, items[start : start + self._max_batch_objects]
+                )
+            )
+        return tuple(results)
+
+    def _execute_batch(
+        self, operation: str, items: tuple[Any, ...]
+    ) -> tuple[bool, ...]:
         if operation == "lookup":
             result = self._client.batch_exists(list(items))
         else:

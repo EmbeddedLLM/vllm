@@ -230,6 +230,114 @@ def test_failed_object_does_not_inherit_another_objects_success(store, native):
     assert first.owner.raw == b"good" and second.owner.raw == b"YYYY"
 
 
+def test_bounded_native_batches_preserve_result_order_and_missing_objects(native):
+    """A long restore must fit the native arena without dropping later objects."""
+    calls = []
+    put = native.batch_put_ranges_from_ptr
+    get = native.batch_get_ranges_into_ptr
+
+    def bounded(operation, method):
+        def invoke(keys, *args):
+            assert len(keys) <= 2, "Native staging arena exceeded"
+            calls.append((operation, tuple(keys)))
+            return method(keys, *args)
+
+        return invoke
+
+    native.batch_put_ranges_from_ptr = bounded("store", put)
+    native.batch_get_ranges_into_ptr = bounded("load", get)
+    store = UMBPStore(
+        native, SimpleNamespace(CPU="cpu", GPU="gpu"), max_batch_objects=2
+    )
+    buffers = tuple(region(bytes([i]) * 4) for i in range(5))
+    objects = tuple(object_for(str(i), memory) for i, memory in enumerate(buffers))
+    try:
+        for memory in buffers:
+            store.register_region(memory)
+        assert store.store(objects).result(timeout=5) == (True,) * 5
+        del native.data["2"]
+        for memory in buffers:
+            ctypes.memset(memory.ptr, 255, memory.size)
+        assert store.load(objects).result(timeout=5) == (True, True, False, True, True)
+        assert [memory.owner.raw for memory in buffers] == [
+            bytes([255 if i == 2 else i]) * 4 for i in range(5)
+        ]
+        assert calls == [
+            (operation, keys)
+            for operation in ("store", "load")
+            for keys in (("0", "1"), ("2", "3"), ("4",))
+        ]
+    finally:
+        store.close()
+
+
+def test_chunked_load_keeps_allocation_owners_until_last_native_call(native):
+    store = UMBPStore(
+        native, SimpleNamespace(CPU="cpu", GPU="gpu"), max_batch_objects=1
+    )
+    memories = tuple(region(b"XXXX") for _ in range(3))
+    objects = tuple(object_for(str(i), memory) for i, memory in enumerate(memories))
+    entered, release, closing_started = (threading.Event() for _ in range(3))
+    get = native.batch_get_ranges_into_ptr
+
+    def delayed(keys, *args):
+        if keys == ["1"]:
+            entered.set()
+            assert release.wait(5)
+        return get(keys, *args)
+
+    native.batch_get_ranges_into_ptr = delayed
+    native.data.update({str(i): b"good" for i in range(3)})
+    for memory in memories:
+        store.register_region(memory)
+    future = store.load(objects)
+
+    def close():
+        closing_started.set()
+        store.close()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        try:
+            assert entered.wait(5)
+            assert not future.done() and not future.cancel()
+            assert memories[0].owner.raw == b"good"
+            closing = executor.submit(close)
+            assert closing_started.wait(5)
+            assert not closing.done() and not native.deregistered
+        finally:
+            release.set()
+            store.close()
+        closing.result(timeout=5)
+    assert future.result(timeout=5) == (True,) * 3
+    assert all(memory.owner.raw == b"good" for memory in memories)
+
+
+def test_malformed_later_chunk_fails_future_without_submitting_remaining(native):
+    store = UMBPStore(
+        native, SimpleNamespace(CPU="cpu", GPU="gpu"), max_batch_objects=1
+    )
+    memories = tuple(region(b"XXXX") for _ in range(3))
+    calls = []
+    get = native.batch_get_ranges_into_ptr
+
+    def malformed(keys, *args):
+        calls.extend(keys)
+        return [] if keys == ["1"] else get(keys, *args)
+
+    native.batch_get_ranges_into_ptr = malformed
+    native.data["0"] = b"good"
+    try:
+        for memory in memories:
+            store.register_region(memory)
+        objects = tuple(object_for(str(i), memory) for i, memory in enumerate(memories))
+        with pytest.raises(RuntimeError, match="malformed"):
+            store.load(objects).result(timeout=5)
+        assert calls == ["0", "1"]
+        assert [memory.owner.raw for memory in memories] == [b"good", b"XXXX", b"XXXX"]
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize("device,loc,ordinal", [(None, "cpu", -1), (3, "gpu", 3)])
 def test_registration_preserves_memory_location(store, native, device, loc, ordinal):
     memory = region(b"bytes", device=device)
@@ -403,7 +511,14 @@ def test_failed_deregistration_retains_ownership_for_retry(store, native):
 
 
 @pytest.mark.parametrize(
-    "field,value", [("workers", 0), ("workers", True), ("max_pending", -1)]
+    "field,value",
+    [
+        ("workers", 0),
+        ("workers", True),
+        ("max_pending", -1),
+        ("max_batch_objects", 0),
+        ("max_batch_objects", True),
+    ],
 )
 def test_invalid_admission_limits_are_rejected(native, field, value):
     with pytest.raises(ValueError, match="positive"):

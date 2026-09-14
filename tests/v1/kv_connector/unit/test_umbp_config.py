@@ -188,6 +188,25 @@ def test_ssd_roots_are_private_and_only_tiered_when_both_media_enabled(
         assert ssd["capacity"] == "1073741824B" and ssd["staging_slots"] == 3
         assert [path.parent for path in record.paths[1:]] == roots
         assert all(path.is_dir() for path in record.paths)
+        # Native SSD Resolve rejects a batch larger than its staging arena.
+        native = record.native()
+        original_get = native.batch_get_ranges_into_ptr
+        batches = []
+
+        def bounded_get(keys, *args, _get=original_get):
+            batches.append(len(keys))
+            assert len(keys) <= ssd["staging_slots"]
+            return _get(keys, *args)
+
+        native.batch_get_ranges_into_ptr = bounded_get
+        buffers = tuple(region(b"XXXX") for _ in range(7))
+        for memory in buffers:
+            store.register_region(memory)
+        objects = tuple(object_for(str(i), mem) for i, mem in enumerate(buffers))
+        assert store.load(objects).result(timeout=5) == (False,) * 7
+        assert batches == [3, 3, 1]
+        del native.batch_get_ranges_into_ptr
+        del native, original_get, bounded_get
         if dram_bytes:
             assert record.policy["tiers"][0]["offload_to"] == ["disk"]
             assert record.policy["tiers"][0]["offload_trigger"] == "on_evict"

@@ -104,6 +104,9 @@ class UMBPStoreConfig:
     changing existing mount names. Every worker creates its own subdirectories.
     page_size_bytes must agree across peers and fit their largest KV object.
     ranged_scratch_bytes sizes EACH of two independent remote I/O arenas.
+    ssd_staging_slots also bounds native data batches, including DRAM-only
+    clients of remote SSD peers. Use a common limit no larger than the smallest
+    peer arena. Every KV object fits one page by the open_store geometry check.
     """
 
     page_size_bytes: int
@@ -266,6 +269,7 @@ class UMBPStoreConfig:
                 native,
                 workers=self.workers,
                 max_pending=self.max_pending,
+                max_batch_objects=self.ssd_staging_slots,
                 cleanup=owned.close,
             )
         except BaseException:
