@@ -3,6 +3,7 @@
 Draft for the [vLLM RFC issue form](https://github.com/vllm-project/vllm/blob/main/.github/ISSUE_TEMPLATE/750-RFC.yml).
 Not submitted to GitHub.
 Implementation status and evidence are dated 2026-09-14.
+For a shorter issue body, use the [concise submission draft](umbp_kvconnector_rfc_issue.md).
 
 ## Motivation
 
@@ -78,6 +79,11 @@ benchmark or implementation claims are not evidence for this implementation.
 - **Optional extensions:** placement-aware llm-d/mori-sched routing, bounded
   prefetch, and eligible direct SSD-to-HBM reads. None is required for the basic
   offload/P-D contract, and none is claimed validated by the current prototype.
+- **Required compatibility scope:** hybrid memory allocation, ROCm-supported
+  attention backends, XpYd and heterogeneous P/D configurations, including
+  DPEP8 prefill to TP8EP8 decode. Same-topology TP1 is an interim milestone,
+  not the final target. Backend/layout conversion and KV resharding need
+  explicit contracts and native validation; these are not existing support.
 - **Evidence boundary:** checkpoint `408c3b752` has 225 passing CPU tests. Its
   independently verified two-host Qwen TP1 smoke matched baseline tokens for
   DRAM and SSD cold/partial P/D. Cold decode
@@ -85,9 +91,14 @@ benchmark or implementation claims are not evidence for this implementation.
   restores 320. Earlier native buffer and single-engine offload smokes passed.
   The previous SSD partial failure remains archived, and a separate native
   byte-accounting gate remains failed: fewer GET objects is not proof of fewer
-  network bytes. Exact-current-source native vLLM binaries, full multi-node/TP
-  acceptance, eviction pressure, hybrid models and matched model
-  accuracy/performance remain gates.
+  network bytes. The first completed overwrite/eviction test failed its
+  remote-SSD placement threshold (22 remote objects versus at least 28).
+  A new capacity-corrected run passed the unchanged gates in all eight cases:
+  after pressure, remote DRAM fetched 34 objects remotely and SSD fetched 32.
+  The earlier failure remains archived. An uncommitted hybrid-offload extension
+  has 235 passing CPU tests, but no native hybrid validation; hybrid P/D is
+  still rejected. Exact-current-source native vLLM binaries, sustained
+  multi-node/TP operation and matched model accuracy/performance remain gates.
 
 ### 1. Add an optional UMBPConnector
 
@@ -177,8 +188,10 @@ The initial payload is one logical cache-group block per worker shard, assembled
 from its layer buffers using MoRI's ranged API. Its canonical byte order is
 sorted layer name followed by logical H/N/C order. Cache capacity, GPU addresses,
 physical layer packing and kernel-block splitting are not semantic identity.
-The initial format requires matching TP/PP/CP topology; heterogeneous-TP
-resharding needs a separately versioned and tested mapping.
+The current prototype format requires matching TP/PP/CP topology. The required
+target includes heterogeneous P/D, using a separately versioned and tested
+mapping between logical KV state, source shards and destination layouts.
+Do not remove topology from existing keys to bypass compatibility checks.
 
 Exchange worker-derived layout identities before lookup. A representative
 scheduler cache spec is insufficient when workers retain different per-layer
@@ -191,6 +204,79 @@ prefix hash merely because it occupies that request's current block-table slot.
 Non-prefix-cacheable state needs a request-scoped handoff identity, not a reusable
 prefix key. Unsupported required groups must fail configuration or trigger an
 explicit supported recomputation path, never disappear from the hit calculation.
+
+#### Required HMA, ROCm-backend and topology support
+
+Support vLLM's [hybrid memory allocation](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/)
+with mixed attention/state groups, rather than requiring hybrid allocation to
+be disabled. Preserve actual group-specific logical block geometry, retained
+windows, recurrent checkpoints, shared allocations, padding and allocator
+physical-page constraints. HMA is not the same feature as DRAM/SSD tiering.
+Measure cache efficiency and source retention as well as restore correctness.
+
+Cover attention backends eligible for the pinned ROCm runtime/model, starting
+with `TRITON_ATTN`, `ROCM_ATTN`, `ROCM_AITER_FA`,
+`ROCM_AITER_UNIFIED_ATTN`, `TRITON_MLA`, `ROCM_AITER_MLA`,
+`ROCM_AITER_TRITON_MLA` and `ROCM_AITER_MLA_SPARSE` where applicable. Discover
+additional entries through the runtime selector and
+[backend capability matrix](https://docs.vllm.ai/en/latest/design/attention_backends/).
+Record actual selected backends, not just requested flags. The prototype's
+`ROCM_ATTN` connector-selection guard remains until its asymmetric K/V views
+are validated. Unsupported model/backend combinations are explicit exclusions,
+not silently substituted passing tests.
+
+Support compatible differing prefill/decode backends with versioned layout
+conversion where necessary. Semantic model/cache identity must match even when
+packing differs. Test strides, encoding/scales, auxiliary sparse state and
+recurrent state; equal shapes do not prove compatible bytes. Attention, MoE
+kernel and EP communication backends are independently validated choices.
+
+Support **XpYd**: X request-owning prefill engines and Y request-owning decode
+engines, not X/Y GPU ranks. Report deployment groups and expanded DP engines
+separately. Initial coverage includes 1p1d, 1p2d, 2p1d and 2p2d, followed by
+the required heterogeneous example:
+
+| Side | Requested configuration | Explicit interpretation, PP/PCP/DCP=1 |
+| --- | --- | --- |
+| Prefill | DPEP8 | DP=8, TP=1, EP=8; eight request-owning engines on eight GPUs |
+| Decode | TP8EP8 | DP=1, TP=8, EP=8; one request-owning engine on eight GPUs |
+
+EP is not an additional GPU-count multiplier in this example; see the
+[DP/TP/EP deployment semantics](https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment/).
+One deployment group on each side therefore exposes 8p1d under the stated
+engine-count convention. This is a required target, not a validated recipe.
+
+Also require **TP8 to 2x TP4 (1p2d)** and **2x TP4 to TP8 (2p1d)**,
+with eight GPUs per side. `2x TP4` denotes two request-owning TP4 engines,
+each with DP=1 and PP/PCP/DCP=1; EP is configured separately. A request selects
+one producer and one decoder, not both replicas as halves of a single engine.
+TP8-to-TP4 requires model-specific shard assembly into the selected decoder;
+TP4-to-TP8 requires splitting/replicating the selected producer's state.
+Equal aggregate GPU counts do not remove that mapping requirement.
+
+Exercise both TP4 replicas independently and concurrently, with per-replica
+local-prefix reuse, rerouting, cancellation and failed-rank/replica isolation.
+Never mix the two producers' unrelated KV or broadcast every request to both
+decoders. Validate both directions through direct and pool paths, including
+offload/reuse and combined hybrid/backend cases, using models that fit TP4.
+Measure mapping cost, capacity, fairness and latency at a fixed total GPU budget.
+
+For each request, identify the producing DP engine and redistribute its KV into
+the decoder's required model-specific shards. Do not gather unrelated KV from
+every producer DP rank or mistake expert participation for attention-cache
+ownership. Implement split/gather/replication for global KV-head/state ranges,
+including replicated GQA/MQA heads, MLA and hybrid checkpoints. Derive readiness
+from actual contributing sources and required destinations, not equal world
+sizes. Preserve local prefixes and retain sources through all admitted
+consumers, cancellations and drained failures.
+
+The same mapping must work with pool-mediated P/D, planned direct RDMA and
+offload/reuse. X/Y routing must handle concurrent handoffs, rank/engine restart,
+request-generation isolation and bounded fair admission. Reject unvalidated
+mappings until their tests pass. The
+[expanded implementation matrix](umbp_kvconnector_reimplementation.md#hybrid-allocation-rocm-backends-and-heterogeneous-xpyd)
+defines individual and combined HMA/backend/topology gates; separate passes
+are not proof that the combination works.
 
 ### 4. Compose offload with the scheduler lifecycle
 
@@ -643,6 +729,10 @@ prefetch cannot consume every resource needed for demand reads and P/D.
 | Coordinated direct/pool/offload | Disjoint missing-range ownership, independent background persistence, partial-write/cancel/rank-failure tests and drain-before-fallback |
 | Three-case P/D effectiveness and direct-path preservation | Direct-only versus direct-plus-offload versus offload-only, plus unchanged MoRIIO reference; measured copies/overlap/backlog and a predefined numerical non-regression budget |
 | TP/hybrid state | Full attention, MLA and recurrent groups; boundary validity, group failures and exact supported shard mappings |
+| Hybrid memory allocation | HMA enabled, mixed groups/windows/checkpoints, CoW/alias/padding safety and measured allocation efficiency |
+| ROCm backend interoperability | Every eligible backend exercised; compatible differing P/D backends, versioned layout conversion and explicit unsupported/fallback outcomes |
+| XpYd and heterogeneous P/D | Concurrent 1p1d/1p2d/2p1d/2p2d; DPEP8 to TP8EP8, TP8 to 2x TP4 and 2x TP4 to TP8; request-owner mapping, resharding and exact completion sets |
+| Combined HMA/backend/topology | Native model validation with all three enabled together, offload/reuse and direct/pool modes; matched accuracy and performance baselines |
 | Model correctness | Qwen3-0.6B development tests, matched GSM8K baseline/offload/P-D; Kimi K3 TP8 hybrid and long-context acceptance |
 | Routing/prefetch | llm-d adapter, placement staleness/replay recovery, cancellation/expiry, no-model HBM preload and routing opt-out |
 | Performance | Matched repeated trials with TTFT, ITL, throughput, tail latency, recomputed tokens and actual transfer bytes |
@@ -703,6 +793,8 @@ Proposed implementation sequence:
    offload and P/D handoff tests. Both paths gate the functional milestone.
 3. Native GPU/DRAM/SSD and two-node model correctness, including hybrid state;
    validate direct SSD-to-HBM loads separately against host-staged fallback.
+   Implement HMA, ROCm-backend compatibility and heterogeneous XpYd mapping,
+   including DPEP8 to TP8EP8; require the combined acceptance matrix.
 4. Direct MoRI-IO RDMA P/D, coordinated direct/pool selection and background
    offload, with independent correctness and matched MoRIIO performance gates.
 5. Placement-aware routing, connector-controlled prefetch and fault recovery.
@@ -733,8 +825,9 @@ Proposed implementation sequence:
    for all-group save sources and generation-scoped completion?
 3. What is the preferred connector-neutral readiness/control/hint surface for
    router-driven prefetch and a P/D handle whose data is not ready yet?
-4. Should the initial wire format require identical topology, or is portable
-   heterogeneous-TP sharding required for the first upstream feature milestone?
+4. What shared wire/layout abstractions and staging order should implement the
+   required heterogeneous topology and cross-backend support, including
+   DPEP8 to TP8EP8, while safely retaining current guards until validated?
 5. What retention guarantee should pool-mediated P/D promise, and what should
    happen when a ready object's storage lease cannot be maintained?
 6. What native CI coverage and ongoing ROCm ownership are required before in-tree
@@ -789,10 +882,23 @@ issues, PRs and their implementations before submission or opening a PR.
 
 ### Current prototype and evidence limits
 
+The results below have different scopes and source checkpoints. A passing
+storage or P/D smoke does not close the ordinary offload eviction gate.
 All recorded P/D serving results below are pool-mediated. Direct HBM-to-HBM
 delivery, coordinated direct/pool selection and background offload, and matched
 MoRIIO performance preservation are unimplemented/unvalidated milestones. This
 proposal update does not change tested commits or upgrade any evidence gate.
+
+| Validation | Source checkpoint | Recorded outcome |
+| --- | --- | --- |
+| CPU connector suite | `408c3b752` | 225 passed; eight opt-in native cases skipped |
+| Expanded CPU suite with aligned Mamba offload | Uncommitted working tree, based on `3edbafbff` | 235 passed; eight native cases skipped; no hybrid GPU/model validation |
+| Native registered CPU/GPU buffer I/O | `ea55a3800` | Eight DRAM/SSD cases passed; not model serving |
+| Single-engine DRAM/SSD offload | `2dc83e970` | Token agreement after local metadata reset; GPU overwrite and natural eviction not established |
+| Two-host DRAM/SSD P/D | `408c3b752` | Four cold/partial-prefix cases passed; Qwen TP1 smoke only |
+| Ordinary offload overwrite/pressure, r2 | `408c3b752` | Eight model restores verified; full gate failed: remote SSD fetched 22 remote objects after pressure, below the required 28; cleanup passed |
+| Ordinary offload overwrite/pressure, r3 | `408c3b752` | All eight cases passed unchanged frozen gates with an 8 MiB serving-side store; remote DRAM/SSD fetched 34/32 remote objects after pressure; both cleanup audits passed |
+| Physical network-byte accounting | `efac63da2` | Additional native accounting gate failed; later token passes do not resolve it |
 
 The local prototype starts from `EmbeddedLLM/vllm:umbpkvconnector` at
 `1678b396270406c27fcab8f5b86b21fd305ac605`, with these unpublished checkpoints:
@@ -838,7 +944,7 @@ chunked prefill, unequal group sizes, lookup gaps, timeout, abort, failed receiv
 recomputation and inter-engine model-identity isolation. In this CPU suite,
 native I/O, GPU events and model execution are still fakes.
 
-The current CPU suite at `408c3b752` has **225 passed, eight native cases
+The checkpointed CPU suite at `408c3b752` has **225 passed, eight native cases
 skipped**, in 21.05 seconds. Additional tests cover retrying only failed PUT
 objects, a shared operation-wide retry budget, unchanged GET failures,
 exceptions/malformed results during retries, shutdown/ownership and withholding
@@ -861,12 +967,29 @@ The batching regression tests additionally check ordered multi-chunk reads and
 writes with a middle missing object, malformed later-chunk results, cancellation
 and close during a later chunk, and the configuration-to-native batch bound.
 
-The current connector enables dense P/D roles with explicit shared-master
+The GPU-tested connector enables dense P/D roles with explicit shared-master
 configuration and exports complete, jointly aligned prefix blocks. Any partial
 prompt tail is recomputed on the decoder. It is accessible via the development
 module-path mechanism, not the built-in registry. Unsupported hybrid/non-prefix,
 parallel/speculative and quantized configurations remain explicitly rejected;
 implementing their required semantics remains part of the full proposal.
+
+A later, **uncommitted working-tree extension** based on documentation HEAD
+`3edbafbff` adds ordinary offload for aligned Mamba checkpoints. Its expanded
+seven-file CPU suite passed **235 tests, with eight native cases skipped**, in
+18.77 seconds (`cpu-tests-r27.log`). Source/type-check hooks passed. This is
+not the source used for the native offload or P/D results below.
+
+Recurrent saves use exact scheduler-offered checkpoint boundaries, including
+copy-on-write and finish-time partial checkpoints, rather than mutable block
+table positions. Restore selects a boundary supported by every required group
+and loads one recurrent checkpoint per group. CPU tests check missing earlier
+checkpoints, attention gaps, exact partial-state bytes, abort ownership and
+failed-receive recomputation through the real Scheduler and BlockPool. Native
+I/O, GPU fences and model execution remain fakes. The extension requires
+non-speculative Mamba `align` mode and supported floating-point state dtypes;
+hybrid P/D remains explicitly rejected pending mandatory export/retention
+semantics. This does not establish Kimi K3 or native hybrid correctness.
 
 Separate native validation at `ea55a3800`: **eight tests passed** on one MI355X
 GPU, covering CPU/GPU source and destination combinations with DRAM-only and
@@ -878,7 +1001,7 @@ library SHA256 is
 GDS and SPDK were disabled. These are buffer-storage tests, not model-serving,
 network-transfer, tier-promotion or in-flight cancellation acceptance.
 
-The latest **Qwen3-0.6B single-engine offload smoke passed** at `2dc83e970`,
+An earlier **Qwen3-0.6B single-engine offload smoke passed** at `2dc83e970`,
 using model revision `c1899de289a04d12100db370d81485cdf75e47ca`, TP1, BF16,
 eager execution, block size 16, `ROCM_AITER_UNIFIED_ATTN` and LBHNC in all arms.
 Each arm used a fresh engine, generated a cold response, reset only the local
@@ -1023,8 +1146,62 @@ models/Docker inventories preserved after hash-verified VPS recovery. No
 weights were downloaded. The earlier failed case is not reclassified by this
 new result, and the physical-byte-accounting gate remains unresolved.
 
-Native pressure-tested offload, complete multi-node/TP P/D, hybrid boundaries,
-corruption recovery, model accuracy and performance remain unproven. Routing/prefetch and
+A subsequent ordinary-offload experiment at `408c3b752` attempted to test
+embedded and remote DRAM/SSD after a byte-verified overwrite of GPU KV and
+natural eviction pressure. It stopped in the first no-connector baseline:
+vLLM rejected a callable sent through `collective_rpc` under its normal
+serialization policy. Independent verification of the recovered evidence
+confirmed the baseline's 584 prompt tokens and 15 expected output tokens,
+but **no GPU overwrite and no connector model case executed**. This is a
+test-harness failure, not evidence that offload passed or that UMBP corrupted KV.
+
+The corrected harness revision uses `worker_extension_cls` and a string-named
+RPC with `VLLM_ALLOW_INSECURE_SERIALIZATION=0`. Eight CPU harness tests pass,
+including reset-before-RPC ordering and safe argument serialization. These
+are separate from the 225 connector tests. All four modes completed both
+overwrite and natural-pressure restores. A failure-preserving independent
+report checked the recovered source, receipts and baseline output equality
+for all eight cases, including all 293,601,280 overwritten GPU KV bytes and
+576 completed external tokens with zero GPU-local prefix hits per restore.
+Six distinct pressure prompts occupied 216 prompt blocks against a 160-block
+GPU allocation; the final restore had no intervening cache reset.
+
+**The frozen full r2 offload gate nevertheless failed.** Remote SSD after
+pressure fetched 22 objects remotely and 14 from the local UMBP pool; the
+predeclared threshold required at least 28 remote objects. Local UMBP storage
+is external to the GPU prefix cache, so those 14 objects do not contradict
+the zero GPU-local-hit counter. The frozen verifier remains unchanged and its
+failure is retained; a successful controller exit is not full acceptance.
+Both hosts passed cleanup audits after hash-verified evidence recovery.
+
+The test assumed a 32 MiB SSD store held eight 4 MiB objects. In the pinned
+[segment index](https://github.com/ROCm/mori/blob/67632e80e2e492184b589904b63225f82d45537c/src/umbp/local/tiers/segment/segment_index.cpp),
+capacity is instead charged by padded on-disk record bytes, not staging-page
+size. These smaller KV records can therefore leave more objects local than
+the test intended. The new r3 harness uses an 8 MiB serving-side store with
+the same workload and acceptance thresholds; no production source changed.
+
+**R3 passed all eight cases and the independent frozen verifier.** Every
+restore matched the 15-token baseline, with 576 completed external tokens and
+zero GPU-local prefix hits. The byte-verified overwrite and natural-pressure
+controls also passed. Both remote modes fetched all 36 objects remotely on the
+first restore; after pressure, DRAM fetched 34 remotely and SSD fetched 32,
+exceeding the unchanged minimum of 28. Source and native-library identities
+were independently checked against recovered artifacts. Both hosts passed
+cleanup audits after hash-verified recovery to the VPS; pre-existing models
+and Docker inventories were preserved, and no weights were downloaded.
+
+This is a new passing bounded test, not a reclassification of r2. It uses
+Qwen TP1 and the same older precompiled vLLM extensions described above.
+The verifier explicitly reports that this is not a benchmark and that physical
+transfer bytes were not verified. See the
+[r3 reproduction record](umbp_kvconnector_reimplementation.md#ordinary-offload-r3-passing-bounded-retest)
+for exact commands, pins, recovery hashes and per-mode outcomes.
+
+Full native offload acceptance under sustained concurrency, complete
+multi-node/TP P/D, native hybrid boundaries, corruption recovery, model accuracy
+and performance remain
+unproven. Routing/prefetch and
 llm-d integration are not yet ported. Earlier integration results from other
 branches or releases are not carried over as validation of this prototype.
 The earlier 181-test offload and 184-test uncommitted snapshots remain historical

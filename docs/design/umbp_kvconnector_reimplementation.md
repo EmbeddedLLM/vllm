@@ -20,6 +20,13 @@ implements pool-mediated P/D only. Direct delivery and matched MoRIIO performanc
 validation are separate, unimplemented milestones; pool smoke passes do not
 establish either of them.
 
+The required target also includes hybrid memory allocation, the attention
+backends supported by the pinned vLLM ROCm runtime, XpYd deployments and
+heterogeneous P/D parallelism, explicitly including DPEP8 prefill to TP8EP8
+decode. These are implementation and acceptance requirements, not capabilities
+established by existing TP1 smokes. Matching-topology-only support is an interim
+restriction, not the final scope.
+
 | Component | Pinned starting commit |
 | --- | --- |
 | EmbeddedLLM/vllm `umbpkvconnector` | `1678b396270406c27fcab8f5b86b21fd305ac605` |
@@ -255,6 +262,166 @@ validation results or authorization to run remote experiments.
   offload implementation. Any required engine hook must be a generic connector
   lifecycle/control contract, not a separate UMBP execution path.
 
+## Hybrid allocation, ROCm backends and heterogeneous XpYd
+
+### Hybrid memory allocation
+
+Integrate with vLLM's [hybrid KV cache manager](hybrid_kv_cache_manager.md)
+without requiring operators to disable hybrid allocation or force every layer
+into a full-attention cache representation. Hybrid allocation is distinct from
+UMBP's HBM/DRAM/SSD storage tiering; both must compose.
+
+- Use the cache manager's actual groups and allocation descriptors, including
+  mixed full/sliding-window attention and supported recurrent/linear-attention
+  state. Respect group-specific logical block sizes, valid windows, checkpoint
+  boundaries, padding, shared allocations and physical page constraints.
+  Do not assume arbitrary per-group physical page sizes are allocator-supported.
+- Map logical layer/group state to exact registered ranges; do not transfer
+  null/history placeholders or overwrite shared valid prefixes. Keep checkpoint
+  copy-on-write sources, destinations and overlapping views owned through all
+  compute/transfer users, including abort, preemption and delayed ranks.
+- Determine reusable state using every required group's semantics: dense
+  prefixes, retained sliding windows and exact recurrent endpoints are not the
+  same kind of hit. Mandatory hybrid P/D exports must retain all required state
+  until delivery completes; ordinary checkpoint offload alone is insufficient.
+- Test native offload and both planned P/D paths with hybrid allocation enabled.
+  Measure allocated/used/padded/pinned bytes per group, peak HBM and admitted
+  concurrency against a no-connector hybrid baseline. Existing aligned-Mamba
+  CPU results do not establish general hybrid-allocation or hybrid P/D support.
+
+### ROCm attention-backend coverage and interoperability
+
+Build a versioned capability matrix from the pinned runtime's ROCm selector
+and each backend's configuration validation, not from one successful backend
+or a static global enum. Record vLLM/ROCm/AITER/Triton versions, GPU architecture,
+model, attention type, KV dtype/scales, block layout, HMA, graph mode and
+parallelism. The [upstream feature matrix](https://docs.vllm.ai/en/latest/design/attention_backends/)
+is discovery guidance; installed-source/runtime checks decide eligibility.
+
+| Family to cover where the pinned ROCm runtime supports the configuration | Required connector work |
+| --- | --- |
+| `TRITON_ATTN`, `ROCM_ATTN`, `ROCM_AITER_FA`, `ROCM_AITER_UNIFIED_ATTN` | Dense/GQA/MQA and supported windowed/hybrid layouts; native K/V strides, separate views and padding |
+| `TRITON_MLA`, `ROCM_AITER_MLA`, `ROCM_AITER_TRITON_MLA` | Latent/positional components and actual replicated or sharded MLA cache representation |
+| `ROCM_AITER_MLA_SPARSE` | Required sparse/indexer state as well as KV; never omit auxiliary state needed for decode |
+| Additional ROCm-eligible backends in the pinned selector | Add explicit matrix entries and layout/encoding tests; do not silently exclude newly supported backends |
+
+Support same-backend offload and P/D first, then compatible cross-backend P/D
+and pool reuse. Negotiate semantic cache identity separately from physical
+packing. If bytes differ, use a versioned, tested packing/conversion adapter;
+never infer compatibility from equal tensor sizes or delete identity guards.
+Unsupported encoding conversions must reject transfer or use an explicit
+recompute policy, with the reason recorded. A fallback is not a pass for the
+requested backend or direct path. Record actual selected backends on both ends.
+
+The current `vllm/platforms/rocm.py` excludes `ROCM_ATTN` from automatic
+KVConnector selection pending validation of asymmetric native K/V views.
+Resolving that layout/transfer gap is required work; do not simply remove the
+guard. Encoder-only backends or unsupported model/backend combinations are
+marked not applicable with a source-grounded reason, not counted as passes.
+Attention backend, MoE kernel backend and EP all-to-all backend are separate
+configuration axes; verify ROCm eligibility independently for each.
+
+### XpYd and heterogeneous P/D parallelism
+
+Support X request-owning prefill engines and Y request-owning decode engines,
+with independent placement and routing: at least 1p1d, 1p2d, 2p1d and 2p2d,
+then the required eight-way case below. Counts refer to logical request owners,
+not GPUs, TP workers or HTTP frontends. A manifest must also report deployment
+groups and expanded DP engines; EP-coupled DP engines can share collectives
+without sharing ownership of every request's attention KV.
+
+For the requested example, interpret the shorthand as follows, with PP, PCP
+and DCP all one. This follows the usual
+[vLLM DP/TP/EP relationship](https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment/);
+it is a target configuration, not a validated launch recipe.
+
+| Side | Shorthand | Attention configuration | MoE configuration | GPUs per deployment group |
+| --- | --- | --- | --- | ---: |
+| Prefill | DPEP8 | DP=8, TP=1; eight request-owning attention engines | EP=8 across those ranks | 8 |
+| Decode | TP8EP8 | DP=1, TP=8; one request-owning attention engine | EP=8 across those ranks | 8 |
+
+EP is not another factor of eight in GPU count. With this counting convention,
+one prefill deployment group and one decode deployment group expose 8p1d.
+Also record the deployment-group ratio so this is not confused with eight
+independent eight-GPU prefill deployments. The two existing eight-GPU hosts
+could supply this 16-GPU topology only after fresh availability and runtime
+checks; this plan does not reserve or launch them.
+
+Also require the following bidirectional TP/replica configurations. Here,
+`2x TP4` means two distinct request-owning TP4 engines, not one TP8 engine;
+each engine has DP=1 and PP/PCP/DCP=1. EP settings are specified separately.
+
+| Prefill | Decode | XpYd | GPUs, prefill / decode | Per-request KV mapping |
+| --- | --- | --- | --- | --- |
+| One TP8 engine | Two TP4 engines | 1p2d | 8 / 8 | Route to either decoder; assemble the producer's TP8 state into that selected decoder's TP4 layout |
+| Two TP4 engines | One TP8 engine | 2p1d | 8 / 8 | Route prefill to either producer; split/replicate that producer's TP4 state into the decoder's TP8 layout |
+
+Each request uses one selected producer and one selected decoder. Two replicas
+do not jointly hold two halves of a request, and 1p2d does not imply broadcasting
+every handoff to both decoders. Do not merge unrelated requests from the two
+TP4 producers. Equal total GPU counts do not imply compatible per-engine KV
+shards. Use the model-specific global-coordinate mapping, including replicated
+heads, MLA and recurrent state, rather than assuming a universal two-to-one
+byte concatenation. Select models/configurations that fit each TP4 engine.
+
+Exercise both replicas independently and concurrently, including different
+local-prefix hits, rerouting/retry, cancellation and a failed replica/rank.
+Completion sets cover only that request's participating source/destination
+shards. Validate TP8-to-TP4 and TP4-to-TP8 separately in direct and pool modes,
+with background offload and subsequent reuse. Compare fixed total GPU budgets,
+per-engine cache capacity, mapping overhead, fairness and tail latency; retain
+matched no-transfer baselines and hybrid/backend combination gates.
+
+Required implementation:
+
+1. Advertise versioned engine generation, request-owning DP rank, TP/EP/PP/CP
+   topology, logical layer/group IDs, global KV-head or state coordinates and
+   worker-owned memory descriptors. Keep expert placement separate from KV
+   ownership; EP ranks executing a request's experts do not necessarily hold
+   that request's attention cache.
+2. Map each request's actual producer sources to the selected decoder's required
+   shards. For DP8/TP1 to DP1/TP8, distribute that request's TP1 cache into the
+   decoder's model-specific TP8 representation; do not gather unrelated requests
+   from all eight prefill DP engines. Handle GQA/MQA replicated heads, MLA
+   latent-state replication and recurrent-state partitioning explicitly.
+3. Version the wire/object format to separate logical compatibility from source
+   shard encoding and destination packing. Implement validated split/gather,
+   replication, range assembly and block-boundary conversion where needed.
+   Removing TP from the existing key is not a resharding implementation.
+4. Derive readiness and completion from the exact contributing sources and
+   required destinations, not equal world sizes or every prefill DP rank.
+   Preserve decoder-local state, publish only complete group/shard receives,
+   and retain sources until every admitted consumer has completed or drained.
+5. Route across X/Y engines with bounded transfer admission, fairness and
+   request/generation isolation. Test simultaneous handoffs, repeated prefixes,
+   retries, rerouting, cancelled consumers, delayed/failed ranks and endpoint
+   restart. Adding/removing replicas must not make stale handles readable.
+6. Apply the mapping to pool-mediated and direct P/D, background offload and
+   subsequent reuse. Keep strict rejection until each supported combination
+   has its mapping and tests; expand beyond the named example using explicit
+   DP/TP/EP/PP/PCP/DCP descriptors rather than hard-coded eight-rank rules.
+
+### Acceptance matrix for the expanded scope
+
+| Gate | Required evidence |
+| --- | --- |
+| Hybrid allocation | Real cache-manager lifecycle plus native mixed-group restores; window/checkpoint validity, CoW, padding and alias guards; no forced HMA disablement |
+| ROCm backend coverage | Explicit requested/selected backend receipts and offload/P-D correctness for every eligible matrix entry; unsupported configurations reported separately |
+| Cross-backend compatibility | Same logical state converted into each destination layout; byte/padding checks and matched no-transfer model baselines; negative incompatibility cases |
+| XpYd | Concurrent 1p1d, 1p2d, 2p1d, 2p2d and expanded 8p1d; per-request shard isolation, fairness, retries and failed/restarted endpoints |
+| DPEP8 to TP8EP8 | Native 8-GPU prefill plus 8-GPU decode, all eight prefill request owners exercised, cold/partial/pressure cases and missing-rank failure; both direct and pool paths |
+| TP8 to 2x TP4 | Native 1p2d, both TP4 decoders exercised concurrently; TP8-to-TP4 assembly, per-decoder prefix reuse, failure isolation and no unintended broadcast |
+| 2x TP4 to TP8 | Native 2p1d, both TP4 producers exercised concurrently; TP4-to-TP8 split/replication, request isolation and no cross-producer KV mixing |
+| Combined acceptance | Hybrid model, eligible differing P/D backends and heterogeneous topology together, with offload/reuse enabled; isolated dimension passes do not establish their composition |
+
+Start mapping tests with deterministic CPU tensors and exact global-coordinate
+oracles, then native byte-checked buffers, then model inference. Compare each
+backend/topology to its matched no-transfer baseline with declared numerical
+tolerances and semantic/accuracy gates; different kernels need not be bitwise
+identical. Count reconstructed/recomputed tokens and actual bytes/copies per
+source/destination, resharding scratch, pinned HBM, TTFT/ITL, throughput and
+tail latency. Freeze tolerances and performance budgets before running tests.
+
 ## Feature migration and acceptance matrix
 
 | Requirement | Destination / evidence needed | Current state |
@@ -271,6 +438,9 @@ validation results or authorization to run remote experiments.
 | Single-node DRAM and ext4 SSD offload | MoRI embedded deployment, forced eviction, byte/source reconciliation | Qwen local-cache-reset smoke passed at `2dc83e970`; forced HBM overwrite/pressure and performance pending |
 | Multi-node DRAM/SSD restore | Master-led deployment, peer failures, safe recompute and recovery | Forced cross-host native buffer reads and P/D smokes passed; ordinary multi-node offload, pressure and peer/master faults pending |
 | TP and hybrid cache geometry | Exact layouts, complete group/shard restoration, cancellation and preemption | Layout/rank barriers and unequal dense-group scheduler tests pass; native TP and hybrid boundary semantics pending |
+| Hybrid memory allocation | HMA-enabled mixed attention/state groups, exact ownership and allocation-efficiency evidence | Required; broader native HMA/P-D acceptance pending |
+| ROCm attention backends | Versioned eligibility matrix, native layout adapters and compatible cross-backend reuse | Required; existing unified-attention smokes are not multi-backend acceptance |
+| XpYd and heterogeneous P/D | Request-owner routing, topology-aware resharding, exact contributor/destination barriers; DPEP8 to TP8EP8, TP8 to 2x TP4 and the reverse | Required, not established by matching-TP1 tests; guard unsupported mappings until validated |
 | Placement and MoRI scheduling | Current authoritative placement API, lifecycle events, tier/locality/cost routing | Pending |
 | CPU/HBM prefetch and admission | Token-identity control, connector-owned load, TTL/cancel/drain/no-model invariants | Pending |
 | llm-d integration and fault recovery | Routing, prefetch, replay/gaps, staleness, reconnect/fail-open tests | Pending |
@@ -298,6 +468,9 @@ are not part of this filesystem-backed implementation.
    prefix reuse, pressure, preemption, same-ID reuse and failure fallback.
 4. Validate native MoRI GPU/CPU/file-SSD transfers and two-node serving.
    Pin exact release artifacts and prove the chosen transport at runtime.
+   Implement HMA and ROCm-backend adapters, then topology-aware mapping and
+   XpYd routing; gate DPEP8 to TP8EP8 and combined hybrid/backend cases using
+   the expanded acceptance matrix above.
 5. Implement and independently validate the direct RDMA P/D milestone above:
    shared MoRIIO transport, forced direct/pool modes, safe mixed-path ownership,
    background offload and failure fallback. Compare against unchanged MoRIIO
@@ -1693,3 +1866,321 @@ All three independent checks exited 0:
 No task-created files or resources remain on either GPU host. The retained
 VPS archives allow reproduction review; these checks do not verify model
 accuracy, physical transfer bytes or sustained staging-pressure behavior.
+
+## Ordinary offload: GPU overwrite and natural eviction (2026-09-14)
+
+The `offload-r2` experiment addresses two gaps in the earlier cache-reset smoke:
+proving that old GPU KV bytes were overwritten, and restoring after actual
+GPU cache pressure without a reset immediately before the restore. Four fresh
+configurations are tested: embedded DRAM, embedded ext4 SSD, remote DRAM and
+remote ext4 SSD. This is ordinary `kv_both` offloading with `enable_pd=False`,
+not P/D or router-driven prefetch. All eight model restores were independently
+verified, but the frozen full gate failed its remote-SSD post-pressure placement
+threshold: 22 remote objects versus at least 28 required. Evidence recovery and
+both independent cleanup audits passed. This is not a full offload pass.
+
+### Failed first harness and corrected RPC
+
+`offload-r1` stopped after its first no-connector baseline generated the expected
+584 prompt tokens and 15 output tokens. The normal vLLM Msgpack policy rejected
+a Python function sent through `collective_rpc`. No KV overwrite and no UMBP
+model case executed. Independent verification compared all three RPC envelopes
+with recovered runtime JSON and checked both archive hashes. This is a harness
+failure, not an offload pass or evidence of UMBP corruption.
+
+The corrected harness uses the supported worker extension
+`offload.KVOverwriteWorker` and a string method name, `overwrite_task_kv`.
+`VLLM_ALLOW_INSECURE_SERIALIZATION=0` remains explicit. Eight CPU harness tests
+pass in 1.70 seconds on recheck: allocation aliasing/noncontiguous coverage,
+empty-cache rejection, safe named RPC after successful reset, and negative
+controls that reject empty/wrong output, local hits or incomplete receives.
+These are separate from the 225 production connector CPU tests.
+
+The first attempt exited 1 and passed its independent cleanup audit. Both
+hosts' original Docker inventories, local ext4 SSD0 and pre-existing model
+checks were preserved. All GPUs returned to baseline memory with no KFD PIDs.
+Recovery artifacts remain on the VPS:
+
+| Host | Recovery bytes | SHA256 |
+| --- | ---: | --- |
+| 003 | 671,235,722 | `1422de31bab396f89d371a3eab499f357b9e0745dc7d103261e47d988be69209` |
+| 004 | 769,402,846 | `43f2a872032a2bdd5e56618f371784a60145a13e78caf5a8dc41ddccc47114c5` |
+
+Logs: `offload-r1-smoke1.log`, `verify-offload-r1-failure.log` and
+`offload-r1-final-audit.log`, with artifacts under `offload-r1-smoke1/` in
+`local-logs/umbp-kvconnector-reimplementation-20260914` on the VPS.
+
+### Frozen overwrite/eviction protocol
+
+Every baseline and candidate engine runs serially on physical GPU0 of host 004.
+Host 003 runs the native storage peer and master only for remote modes. Both
+hosts use the identical pinned nightly image and native MoRI library listed
+in the preceding P/D retest. vLLM Python source remains
+`408c3b752eaf18dd9c055d9ab5bac3208c5071df`; MoRI remains
+`67632e80e2e492184b589904b63225f82d45537c` (`v1.2.3.post1`). The documentation
+HEAD at launch is `6dd2b779e1cfb5176164bff77e06ba81db377be1`; no production
+source changed. The image's native vLLM extensions are not a current-source
+rebuild. llm-d and llm-d-router pins in the baseline table are still provenance
+only and neither repository runs in this experiment.
+
+Use the pre-existing read-only Qwen3-0.6B snapshot
+`c1899de289a04d12100db370d81485cdf75e47ca` at
+`/shared_vllm/huggingfacehub/models--Qwen--Qwen3-0.6B`, mounted at `/model`.
+Task runtime, JIT caches and KV SSD files use the existing local SSD0 under
+`/mnt/umbp-ssd0/umbp-kvc-offload-20260914-r2`. No weights are downloaded.
+Container UID/GID is 1000/1000 with device group 992, root/source/model mounts
+read-only, capabilities dropped and no host credential/home mounts. Native
+peer endpoints use the authorized host network, not an isolated network.
+
+The model is TP1/BF16/eager with block size 16, 160 GPU blocks, max length 2048,
+max sequences 4, max batch 512, GPU utilization 0.1, seed 0 and the verified
+`ROCM_AITER_UNIFIED_ATTN` / LBHNC path. Receive failure policy is `fail`.
+
+For each configuration:
+
+1. Generate the original color-question prompt with no connector. Reset local
+   cache metadata, overwrite all unique underlying GPU KV allocations with
+   byte `0xA5`, verify every byte, then recompute and match the original output.
+2. Generate six different-color control prompts and retain their output IDs.
+3. Start a fresh connector engine and seed the original prompt with a unique
+   cache salt. After successful local reset and native/worker drain, synchronize
+   the GPU and overwrite/check all 293,601,280 KV bytes. Refuse model-parameter
+   storage overlap; require more than 60 MiB actually changed.
+4. Restore the original prompt. Require exact baseline output, 576 completed
+   externally cached tokens, zero local hits and native GET batches 16/16/4.
+5. Generate all six pressure prompts with distinct salts. Their full prompt
+   blocks exceed the 160-block GPU allocation. Without another reset/overwrite,
+   restore the original prompt and require the same full external restore and
+   baseline token agreement. Verify each pressure output against its control.
+
+Embedded storage uses 2 GiB of the selected medium. Remote storage uses a
+2 GiB peer on 003 and only 32 MiB on 004. Capacity is not remote-read proof: the
+independent verifier requires all 36 first-restore objects to be remote and
+at least 28 pressure-restore objects to be remote, allowing at most eight local
+objects from native whole-object installation. The assumption that 32 MiB
+limits SSD storage to eight objects was incorrect; see the result below.
+Remote modes wait 12 seconds
+after seeding/overwrite for metadata quiescence; immediate publication latency
+is explicitly outside this test. All peers use 4 MiB pages, 16 staging slots
+and 64 MiB GET/PUT scratch arenas. SSD uses POSIX fallback, not GDS/SPDK.
+
+### Offload gate commands and evidence
+
+From `/home/ubuntu/vllmumbp`, with both streams logged using pipefail/tee:
+
+```bash
+sha256sum -c local-logs/umbp-kvconnector-reimplementation-20260914/offload-r2-launch-hashes.txt
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/offload-r2-controller.py failure gate1
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/offload-r2-controller.py smoke smoke1
+```
+
+The injected failure gate exited 42 with verified recovery and cleanup on both
+hosts. Never restart an active controller, overwrite existing attempt outputs
+or change frozen inputs mid-run. Fresh attempts require preflight and manifest
+review; changed scripts require a new frozen revision and failure gate.
+
+After controller termination and recovery, run the independent checks:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/verify-offload-r2.py \
+  local-logs/umbp-kvconnector-reimplementation-20260914/offload-r2-smoke1
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/offload-r2-audit.py \
+  local-logs/umbp-kvconnector-reimplementation-20260914/offload-r2-smoke1
+```
+
+Frozen SHA256: controller `a77dfea1bad9399e3e15ec9787f97cf2bf7b499e8a6cd51cc72466fbc3095bc7`;
+host script `fe1577c50fdb86400bece9a83ea33fb8ded6f86a39749d256394743eedde2770`;
+manifest `fc463fcad0f3aa580099a2ad459e0274feea9185313bf948c322c89b7d447bed`;
+independent verifier `d9029e400f5de106f86df8231c6d8cd22e30c763ee44356d14e001a19408389b`;
+auditor `c9087a09527abcf9e33940ac9f1628490bbfa763bcbc92b3d32f9cf0ce45dbfd`.
+Full per-input/source/native hashes are in `offload-r2-launch-hashes.txt`.
+The log is `offload-r2-smoke1.log`; RPC receipts, actor logs and recovered
+archives are in `offload-r2-smoke1/`. These local artifacts are not public
+download links; publication requires review and explicit authorization.
+
+### Verified outcome: model restores pass, remote-placement gate fails
+
+The controller exited 0; the unchanged independent verifier exited 1 at its
+remote-object threshold. A separate failure-preserving report,
+`report-offload-r2.py`, exited 0 after verifying the recovered archives, all
+13 installed source modules, native library, RPC receipts, overwrite bytes,
+pressure controls and model outputs. Its result explicitly reports
+`predeclared_offload_gate_passed=false`; it is not a replacement passing gate.
+
+Every restore reproduced the baseline's 15 output token IDs, with 576 completed
+externally cached tokens and zero GPU-local prefix hits. All unique GPU KV
+allocations were overwritten and byte-checked (293,601,280 bytes). Six distinct
+pressure prompts occupied 216 full prompt blocks against 160 allocated GPU
+blocks. The pressure restore ran without another reset.
+
+| Mode | Remote objects after overwrite | Remote objects after pressure | Result |
+| --- | ---: | ---: | --- |
+| Embedded DRAM | 0 | 0 | Both model restores pass |
+| Embedded ext4 SSD | 0 | 0 | Both model restores pass |
+| Remote DRAM | 36 | 28 | Both model and remote-placement checks pass |
+| Remote ext4 SSD | 36 | 22 | Both model restores pass; post-pressure remote-placement check fails |
+
+The remote-SSD pressure GET batches were `(16 total, 10 local, 6 remote)`,
+`(16, 0, 16)` and `(4, 4, 0)`: 22 remote and 14 local UMBP objects. Local UMBP
+objects remain external to the GPU cache; this is not a GPU-local prefix hit.
+
+MoRI's pinned segment-index `PrepareWrite` charges padded `RecordBytes`, not
+4 MiB staging pages. The 1,835,008-byte KV payload has a 1,839,104-byte record
+with its short key; a 32 MiB SSD store can hold more than eight such objects.
+The lower observed remote count therefore exposes an incorrect test-capacity
+assumption, not a model-output mismatch. The subsequent `offload-r3` reduces the
+serving-side capacity to 8 MiB while retaining the same workload and at least
+28-remote-object threshold. Its preparation tests passed in 1.68 seconds;
+the later frozen launch and passing outcome are recorded below. This does not
+change the failed r2 result.
+
+The report can be rerun without a model or remote mutation:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/report-offload-r2.py \
+  local-logs/umbp-kvconnector-reimplementation-20260914/offload-r2-smoke1
+```
+
+Report SHA256:
+`12c4a70a78a97b3ea8cbd597feaf71becb2516c2ffa4fd7f94ad0e321cfb9bdb`.
+Logs: `verify-offload-r2.log` (failed gate), `report-offload-r2.log` (verified
+failure report), `offload-r2-final-audit.log` (passed cleanup) and
+`offload-r2-post-run-hash-check.log` (all frozen inputs unchanged).
+
+| Host | Recovery bytes | SHA256 |
+| --- | ---: | --- |
+| 003 | 671,204,702 | `3d2cd25e68d3c1ddd3e5258c730f6f622727daa055212a43a6f441db6735e86c` |
+| 004 | 771,802,201 | `e4682907109d1009e23225a11406bb9aac87a45f8e7602fd22469baf0bf4167f` |
+
+Recovery matched second stable remote streams before exact task roots and
+containers were removed. The task-added image on 004 was removed; 003's
+pre-existing image was preserved. The independent audit confirmed original
+Docker inventories, model checks and SSD0 mount identity were preserved, all
+GPUs returned to baseline memory, and task processes/listeners were absent.
+No weights were downloaded and no task-created remote files remain.
+
+The r3 pass below establishes only this bounded eviction workload. Sustained
+concurrency, TP/hybrid state, peer/master failure, corruption recovery, GDS,
+tier migration, matched GSM8K/Kimi K3 acceptance, physical traffic accounting,
+llm-d/prefetch integration and performance remain separate gates.
+
+## Ordinary offload r3: passing bounded retest
+
+The new run retained source `408c3b752eaf18dd9c055d9ab5bac3208c5071df`,
+MoRI `67632e80e2e492184b589904b63225f82d45537c`, the pinned nightly image and
+existing Qwen model revision above. Only the serving-side remote-mode capacity
+changed from 32 MiB to 8 MiB; the remote peer and embedded modes retained their
+2 GiB budgets. Workload, byte-overwrite checks, pressure controls and acceptance
+thresholds were unchanged. No production code changed for this retest.
+
+Ten harness tests passed in 1.63 seconds. Fresh preflight checks passed on both
+hosts. The frozen no-GPU lifecycle failure gate exited the expected 42, with
+both launchers stopped and evidence recovered before exact cleanup. The model
+controller, independent verifier and final cleanup audit subsequently exited 0.
+All frozen-input hash checks passed.
+
+Every restore matched the same 15 baseline token IDs, with 576 completed
+external cached tokens and zero GPU-local prefix hits. All 293,601,280 GPU KV
+bytes were overwritten and verified. Six distinct pressure prompts covered
+216 blocks against a 160-block allocation, with no reset before the final
+restore. These are TP1 Qwen correctness smokes, not benchmark trials.
+
+| Mode | Overwrite restore seconds | Pressure restore seconds | Remote objects, first / after pressure |
+| --- | ---: | ---: | --- |
+| Embedded DRAM | 0.152 | 0.152 | 0 / 0 |
+| Embedded ext4 SSD | 6.517 | 6.581 | 0 / 0 |
+| Remote DRAM | 0.252 | 0.158 | 36 / 34 |
+| Remote ext4 SSD | 6.599 | 6.438 | 36 / 32 |
+
+The frozen independent verifier checked recovered RPC receipts, source modules,
+native library, token equality, overwrite bytes, pressure controls and native
+GET batches. Both remote modes exceed the unchanged post-pressure threshold
+of 28 remotely fetched objects. It reports
+`offload_overwrite_eviction_verified=true`, `is_benchmark=false` and
+`physical_bytes_verified=false`. Fewer objects is still not a physical-byte
+measurement. Exact-current-source vLLM native extensions were not rebuilt.
+
+These are the recorded commands, from `/home/ubuntu/vllmumbp`. Existing attempt
+outputs must not be overwritten; a new remote run needs fresh preflights,
+reviewed paths/manifest, a frozen revision and its failure gate. Capture both
+streams to new VPS logs with `set -o pipefail` and `tee`, as in earlier runs.
+
+```bash
+sha256sum -c local-logs/umbp-kvconnector-reimplementation-20260914/offload-r3-launch-hashes.txt
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/offload-r3-controller.py failure gate1
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/offload-r3-controller.py smoke smoke1
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/verify-offload-r3.py \
+  local-logs/umbp-kvconnector-reimplementation-20260914/offload-r3-smoke1
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/offload-r3-audit.py \
+  local-logs/umbp-kvconnector-reimplementation-20260914/offload-r3-smoke1
+```
+
+Frozen controller SHA256:
+`db7d50fcf108a0432a6f8eed0e59e3fc88a75278b925cb4bc7510647fee47cf9`;
+verifier:
+`bf45873459bcedd43a823c70ce2ead1d5456eb30c558ea840c03aac95138103b`.
+The complete 21-input hash list is `offload-r3-launch-hashes.txt`.
+Authoritative logs are `offload-r3-smoke1.log`, `verify-offload-r3.log` and
+`offload-r3-final-audit.log` in the same VPS evidence directory.
+
+| Host | Recovery bytes | SHA256 |
+| --- | ---: | --- |
+| 003 | 671,204,888 | `ee562d8e5c42df1984db39bbf1eeaafe986154bdd5f0eaff25e320427cbea071` |
+| 004 | 771,800,880 | `1dc25a255569ad6fefe25eb8559284538a487cf7e7699515607382fc16b6cdd6` |
+
+Both archives matched second stable remote streams before task-state deletion.
+Independent audits confirmed task roots, labelled resources, processes and
+listeners absent, all GPUs back at baseline memory, and original Docker
+inventories, model checks and SSD0 mounts preserved. No weights were downloaded
+and no task-created remote files remain. This passing retest does not erase
+the failed r2 placement gate or resolve the outstanding acceptance gates above.
+
+## Aligned Mamba offload: CPU-only working-tree extension
+
+An uncommitted extension based on documentation HEAD `3edbafbff` implements
+ordinary recurrent checkpoint offload, not hybrid P/D. It was not staged to the
+GPU hosts for r3. The expanded CPU suite passed 235 tests, with eight opt-in
+native cases skipped, in 18.77 seconds; source/type-check hooks passed in
+`hybrid-pre-commit-r3.log`. The unrelated actionlint installer was skipped;
+no workflow files changed.
+
+The extension consumes exact scheduler boundary offers, including detached
+copy-on-write and finish-time partial checkpoints. Store admission pins a
+still-valid cached source even when its prior owner released it to the free
+queue; loads still require exclusively writable owned destinations. Lookup
+selects a jointly valid endpoint and restores one recurrent checkpoint per
+group, preserving valid local state. Native I/O, GPU events and model execution
+are fakes in these CPU tests. Hybrid P/D remains a startup error until mandatory
+checkpoint export and retention are implemented. No Kimi/native hybrid pass
+is implied.
+
+The final CPU command, from `repos/vllm-kvconnector`, was:
+
+```bash
+set -o pipefail
+HF_HUB_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 \
+  ../vllm/.venv/bin/python -m pytest \
+  --confcutdir=tests/v1/kv_connector/unit \
+  tests/v1/kv_connector/unit/test_umbp_key.py \
+  tests/v1/kv_connector/unit/test_umbp_store.py \
+  tests/v1/kv_connector/unit/test_umbp_config.py \
+  tests/v1/kv_connector/unit/test_umbp_layout.py \
+  tests/v1/kv_connector/unit/test_umbp_worker.py \
+  tests/v1/kv_connector/unit/test_umbp_lifecycle.py \
+  tests/v1/kv_connector/unit/test_output_aggregator.py -q \
+  2>&1 | tee ../../local-logs/umbp-kvconnector-reimplementation-20260914/cpu-tests-r27.log
+```
+
+Use a new log filename for another execution. Intermediate failing fixtures
+and the corrected source-admission regression remain in the VPS logs; they
+are not reported as passes. Record a source checkpoint before native validation
+or publishing these working-tree results as reproducible commit evidence.
