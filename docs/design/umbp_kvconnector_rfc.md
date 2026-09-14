@@ -26,7 +26,7 @@ Long-context and agentic workloads repeatedly revisit prefixes after their KV
 has left GPU memory. Disaggregated serving introduces a related problem: a
 prefill engine produces KV that a separate decode engine needs, potentially
 with part of that prefix already resident on the decoder. We want one
-connector-owned data path that can handle both situations while preserving
+connector-owned lifecycle that can select direct or stored KV while preserving
 vLLM's cache ownership and failure-recovery rules.
 
 vLLM already has P/D and offloading connectors. This proposal adds a MoRI UMBP
@@ -35,13 +35,17 @@ replacing the KVConnector framework or treating existing connectors as incapable
 of these workloads. In particular, the existing
 [MoRIIOConnector](https://github.com/vllm-project/vllm/blob/1678b396270406c27fcab8f5b86b21fd305ac605/docs/features/moriio_connector_usage.md)
 provides a direct P/D transfer path. A reusable, tiered UMBP object pool is a
-different storage and lifetime model.
+different storage and lifetime model. The target is to support both: preserve
+direct MoRI-IO RDMA delivery for fresh KV still in producer HBM, and use UMBP
+for reusable or offloaded KV. The current prototype implements only
+pool-mediated P/D; the direct path and coordinated selection are planned work.
 
 The intended benefits are:
 
 - Restore evicted KV from local or remote DRAM/SSD when cheaper than recompute.
-- Deliver prefill KV through the same pool, loading only the decoder's missing
-  compatible state rather than retransferring its valid local prefix.
+- Deliver fresh producer-resident KV directly over RDMA without a mandatory
+  pool write, and restore compatible stored KV through UMBP. Both paths load
+  only missing state and preserve the decoder's valid local prefix.
 - Expose reliable placement and transfer-cost signals to a router without
   making a router's cache prediction authoritative for engine correctness.
 - Support proactive prefetch using connector-managed transfers and ordinary
@@ -61,10 +65,16 @@ benchmark or implementation claims are not evidence for this implementation.
   vLLM's existing KVConnector framework for both offloading and P/D. Whether
   this is a dedicated connector or a shared offload backend with a thin P/D
   adapter remains open for maintainer feedback.
-- **Data path:** store compatible KV in local/remote DRAM or SSD, preserve a
-  decoder's valid local prefix, and receive only its missing state. P/D handles
-  identify an export; readiness is published only after successful all-rank
-  stores. Blocks remain owned until transfers and error handling finish.
+- **Data paths:** retain pool-mediated restore from local/remote DRAM or SSD
+  and add direct MoRI-IO RDMA P/D for fresh producer-resident KV. Both preserve
+  the decoder's valid local prefix and receive only missing state. Pool export
+  readiness follows successful all-rank stores; direct delivery uses its own
+  fenced transfer/completion contract without a mandatory pool PUT. Blocks
+  remain owned until all transfers and error handling finish.
+- **Direct-path milestone:** reuse MoRIIO transport, coordinate direct/pool
+  ownership and background offload, and benchmark against unchanged
+  `MoRIIOConnector`. This is planned, not an implemented mode or a performance
+  claim. RDMA inside UMBP does not establish a direct HBM-to-HBM route.
 - **Optional extensions:** placement-aware llm-d/mori-sched routing, bounded
   prefetch, and eligible direct SSD-to-HBM reads. None is required for the basic
   offload/P-D contract, and none is claimed validated by the current prototype.
@@ -86,11 +96,16 @@ Implement a `KVConnectorBase_V1` connector supporting both:
 1. **KV offloading:** a serving engine stores reusable KV and restores it after
    local eviction, using embedded storage or a master-led distributed pool.
 2. **P/D disaggregation:** a prefill engine hands off computed KV to a separate
-   decode engine through that pool, with explicit readiness and failure handling.
+   decode engine with explicit readiness and failure handling. Pool delivery is
+   implemented in the prototype; direct RDMA delivery and coordinated path
+   selection are explicit additional milestones.
 
-The first functional milestone must demonstrate both paths. Passing storage
+The first functional milestone must demonstrate offload and pool-mediated P/D.
+Passing storage
 unit tests or showing prefix reuse between ordinary serving replicas is not
 sufficient to claim P/D support.
+That initial pool-based milestone does not establish direct-P/D support or
+MoRIIO performance parity; those require the separate gates below.
 
 MoRI is imported only when this connector is selected. Ordinary vLLM serving
 must not need MoRI, a UMBP master, llm-d or mori-sched. The initial dependency
@@ -133,7 +148,8 @@ supported-configuration checks, and reproducible serving validation.
  Engine HBM placement hints are separate from readable pool objects.
 ```
 
-This diagram describes the proposal, not a completed deployment.
+This diagram shows the pool-mediated branch, not a completed deployment or
+the direct RDMA branch proposed in section 5.
 
 | Component | Owns |
 | --- | --- |
@@ -141,6 +157,7 @@ This diagram describes the proposal, not a completed deployment.
 | Connector scheduler | Lookup, pinned transfer jobs, per-request handoff, all-rank completion and publication decisions |
 | Connector worker | Allocation registration, byte layout, compute/transfer fences, native I/O and final outcomes |
 | MoRI UMBP | Object storage, pool placement, transport and configured storage/eviction policy |
+| Shared MoRI-IO direct transport adapter (planned) | Registered peer sessions and RDMA submissions/completions; not independent cache ownership or pool publication |
 | llm-d or another router | Replica selection and bounded prefetch coordination; not GPU cache ownership |
 
 MoRI storage policy, vLLM token scheduling, and router request scheduling are
@@ -213,10 +230,71 @@ The proposed handoff carries a versioned handle identifying the model/cache
 namespace, producer generation, required token boundary, cache groups and shards.
 Sending that handle to the decoder is **not** a claim that the KV is ready.
 
+#### Direct RDMA and pool-mediated P/D
+
+The target has two coordinated delivery paths, not a mandatory storage detour
+for every fresh prefill. The pinned
+[MoRI-IO engine adapter](https://github.com/ROCm/mori/blob/67632e80e2e492184b589904b63225f82d45537c/src/umbp/distributed/transfer/mori_io_engine.cpp)
+already supplies RDMA batch reads/writes inside UMBP. But the current connector's
+pool PUT/GET path admits objects to storage and restores them through native
+pool slots or scratch buffers before filling decoder KV. GPU registration alone
+does not make that a direct producer-HBM-to-decoder-HBM transfer.
+
+```text
+Planned direct delivery of fresh producer-resident KV:
+  Prefill HBM ---------------- MoRI-IO RDMA ----------------> Decode HBM
+
+Current pool delivery, example with producer-local DRAM placement:
+  Prefill HBM -> Prefill DRAM -- MoRI-IO RDMA --> Decode DRAM/scratch
+                                                       |
+                                                       +--> Decode HBM
+```
+
+Placement changes the copies and network hops. SSD is optional; selected SSD
+storage adds I/O. The GDS diagrams below concern SSD restore, not direct P/D.
+For fresh KV, the pool route is expected to add admission, staging/copy and
+coordination latency versus direct MoRIIO. This is an architectural expectation,
+not a measured slowdown. Reusing stored KV can instead avoid prefill computation
+and extend cache capacity. There is no matched direct-versus-pool benchmark yet.
+
+The proposed direct-path contract is:
+
+- Reuse or factor the existing MoRIIO transport and handshake machinery rather
+  than duplicate the RDMA stack. Negotiate versioned path capability, engine
+  generation, compatible layout/shards and worker-owned registered destinations.
+  A router's HBM hint is not proof that a source is pinned or readable, and
+  request metadata cannot supply arbitrary trusted RDMA descriptors.
+- Preserve valid decoder-local KV. Direct delivery serves eligible fresh HBM
+  ranges; pool GET serves compatible stored ranges. Validate forced modes
+  first, then add automatic availability/cost selection. Mixed requests require
+  disjoint missing-range ownership and one aggregate completion decision.
+- Retain source/destination blocks and fence GPU computation before RDMA.
+  Preserve the opportunity for MoRIIO layer-wise WRITE overlap, and evaluate
+  READ mode separately. Direct decode admission depends on successful required
+  rank/group receives, not a pool PUT, SSD write or pool ready marker. A handle
+  alone never permits decode. Pool-mediated delivery retains its existing
+  store/readiness/GET sequence.
+- Keep optional background offload outside the direct handoff's admission
+  barrier, with bounded resources and retained sources until all users finish.
+  Failed optional persistence must not fail an already successful direct
+  receive. Direct completion must not advertise an uncommitted pool object.
+- Before fallback after a partial direct failure, suppress publication and
+  drain/fence every native writer to affected destinations. Only then restore
+  from the pool, recompute or reuse those blocks. Expiry/cancel is not RDMA
+  cancellation. Reject stale/duplicate completions and prevent two paths from
+  writing the same destination concurrently.
+
+This is not implemented by selecting a current flag or merely composing two
+independent connectors. Shared ownership, completion and fallback must be
+implemented and reviewed explicitly. The
+[implementation milestone](umbp_kvconnector_reimplementation.md#direct-rdma-pd-milestone-planned-not-implemented)
+defines the staged correctness and matched-performance validation.
+
 #### Combined P/D architecture: GDS and non-GDS
 
-This view combines producer export, object placement and decoder receive in
-one architecture. Solid arrows carry KV payloads; dashed arrows carry requests,
+This view combines **pool-mediated** producer export, object placement and
+decoder receive. It does not depict the planned direct RDMA branch above.
+Solid arrows carry KV payloads; dashed arrows carry requests,
 control or completion. The SSD placements and receive routes are alternatives,
 not mandatory duplicate writes or reads. Native GDS remains to be validated.
 
@@ -283,6 +361,9 @@ lease the data against eviction. The existing P/D lifetime rules apply equally
 to both data paths.
 
 #### Handoff and receive ordering
+
+This sequence applies to pool-mediated delivery only. The planned direct path
+uses the transfer/completion contract above rather than waiting for pool stores.
 
 ```mermaid
 sequenceDiagram
@@ -557,7 +638,10 @@ prefetch cannot consume every resource needed for demand reads and P/D.
 | Native single-node offload | Forced GPU eviction with verified DRAM and ext4 SSD restore sources |
 | Direct SSD-to-HBM loads | Verified hipFile fastpath versus host-staged fallback; aligned/ranged KV correctness, lifetime and corruption tests; actual transfer bytes and matched latency/throughput |
 | Native multi-node offload | Remote DRAM/SSD reads, peer/master faults and safe recovery |
-| True P/D | Separate prefill/decode engines, all-rank readiness, nonzero local-prefix reuse and missing-state-only reads |
+| Pool-mediated P/D | Separate prefill/decode engines, all-rank readiness, nonzero local-prefix reuse and missing-state-only reads |
+| Direct RDMA P/D | Verified producer-HBM to decoder-HBM transfer, no mandatory pool PUT/SSD I/O, compute fences, all-rank/group completion and observed staging/fallback |
+| Coordinated direct/pool/offload | Disjoint missing-range ownership, independent background persistence, partial-write/cancel/rank-failure tests and drain-before-fallback |
+| Direct-path performance preservation | Matched unchanged MoRIIO, direct UMBP, DRAM/SSD pool and combined modes; measured copies/overlap and a predefined numerical non-regression budget |
 | TP/hybrid state | Full attention, MLA and recurrent groups; boundary validity, group failures and exact supported shard mappings |
 | Model correctness | Qwen3-0.6B development tests, matched GSM8K baseline/offload/P-D; Kimi K3 TP8 hybrid and long-context acceptance |
 | Routing/prefetch | llm-d adapter, placement staleness/replay recovery, cancellation/expiry, no-model HBM preload and routing opt-out |
@@ -571,6 +655,17 @@ storage/transport and GPU materialization costs. Count actual I/O: a successful
 deduplicated PUT is not evidence that its logical bytes crossed a NIC or SSD.
 Do not claim a universal speedup or merge readiness from smoke tests.
 
+Direct-path evaluation must pin model/runtime/source, layout, parallelism,
+hardware/NIC allocation, transport tuning and workload against unchanged
+`MoRIIOConnector`. Compare layer-wise WRITE and READ behavior explicitly; report
+handoff latency and compute/transfer overlap in addition to serving metrics.
+Include forced direct, forced DRAM/SSD pool and direct-plus-background-offload
+arms. Poison receive buffers and verify bytes/tokens plus transport endpoints.
+A fastpath-required test must fail on hidden pool or host-staged fallback.
+Mixed-prefix, pressure, cancellation and failed-rank cases gate safe composition.
+Agree the numerical non-regression budget before performance acceptance;
+existing pool smokes and incomplete byte counters cannot satisfy this gate.
+
 Proposed implementation sequence:
 
 1. Storage, identities, layout mapping and transfer-lifetime contracts.
@@ -578,14 +673,18 @@ Proposed implementation sequence:
    offload and P/D handoff tests. Both paths gate the functional milestone.
 3. Native GPU/DRAM/SSD and two-node model correctness, including hybrid state;
    validate direct SSD-to-HBM loads separately against host-staged fallback.
-4. Placement-aware routing, connector-controlled prefetch and fault recovery.
-5. Matched accuracy/performance evaluation and publication of reproduction data.
+4. Direct MoRI-IO RDMA P/D, coordinated direct/pool selection and background
+   offload, with independent correctness and matched MoRIIO performance gates.
+5. Placement-aware routing, connector-controlled prefetch and fault recovery.
+6. Matched accuracy/performance evaluation and publication of reproduction data.
 
 ### 9. Alternatives and trade-offs
 
-- **MoRIIO P/D plus a separate offloader:** retains a direct transfer path and
-  may win for cold handoffs, but requires coordination of two data paths and
-  ownership models. Benchmark it; the shared pool is not assumed faster.
+- **Coordinated MoRIIO P/D plus UMBP offload:** the intended dual-path target.
+  Reuse shared transport/ownership components or compose adapters with explicit
+  completion and fallback coordination; the upstream packaging is open for
+  review. Independent connectors cannot simply race writes or release sources
+  separately. Benchmark against unchanged MoRIIO and pool-only delivery.
 - **UMBP only as an offloading backend:** useful, but does not by itself define
   P/D readiness, incremental decoder loading or request-specific boundary state.
 - **Reuse general offloading components:** preferred where contracts match;
@@ -610,6 +709,10 @@ Proposed implementation sequence:
    happen when a ready object's storage lease cannot be maintained?
 6. What native CI coverage and ongoing ROCm ownership are required before in-tree
    registration? Which shared changes should be reviewed separately?
+7. Should direct MoRIIO and UMBP pool delivery share a transport adapter within
+   one connector or use coordinated composition? Which capability, ownership
+   and completion interfaces should be common, and what matched direct-P/D
+   non-regression budget is required?
 
 ## Feedback Period
 
@@ -655,6 +758,11 @@ duplicate-work determination: overlapping work may use other names. Refresh
 issues, PRs and their implementations before submission or opening a PR.
 
 ### Current prototype and evidence limits
+
+All recorded P/D serving results below are pool-mediated. Direct HBM-to-HBM
+delivery, coordinated direct/pool selection and background offload, and matched
+MoRIIO performance preservation are unimplemented/unvalidated milestones. This
+proposal update does not change tested commits or upgrade any evidence gate.
 
 The local prototype starts from `EmbeddedLLM/vllm:umbpkvconnector` at
 `1678b396270406c27fcab8f5b86b21fd305ac605`, with these unpublished checkpoints:
