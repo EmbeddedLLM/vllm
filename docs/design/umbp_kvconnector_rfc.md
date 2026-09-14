@@ -5,6 +5,13 @@ Implementation status and evidence are dated 2026-09-14.
 
 ## Motivation
 
+Propose an optional **UMBPConnector** backed by MoRI's Unified Memory &
+Bandwidth Pool (UMBP), using vLLM's existing KVConnector scheduler/worker
+interfaces for both KV offloading and prefill/decode (P/D) disaggregation.
+The data path must work independently of llm-d or mori-sched; placement-aware
+routing and bounded prefetch are optional integration layers. This is a design
+proposal with a CPU-tested prototype, not a claim of production readiness.
+
 Long-context and agentic workloads repeatedly revisit prefixes after their KV
 has left GPU memory. Disaggregated serving introduces a related problem: a
 prefill engine produces KV that a separate decode engine needs, potentially
@@ -173,11 +180,12 @@ namespace, producer generation, required token boundary, cache groups and shards
 Sending that handle to the decoder is **not** a claim that the KV is ready.
 
 ```text
-Prefill compute -> pin exportable state -> fenced stores on all ranks
-       -> all required objects successful -> publish handoff-ready record
+Prefill compute -> retain source blocks + return handoff handle
+       -> fenced stores on all ranks -> all required objects successful
+       -> publish per-rank readiness -> finalize export -> release source blocks
 
-Decode local-prefix lookup -> validate handle and readiness
-       -> allocate/load only missing required state
+Decode local-prefix lookup -> validate handle -> allocate missing-state receive
+       -> wait for readiness -> GET only missing required state
        -> all required receives successful -> admit decode computation
 ```
 
@@ -192,6 +200,17 @@ eviction or peer loss. Reads still validate outcomes. On stale handles,
 incompatibility, timeout or missing data, discard the unusable state and follow
 the configured recompute/error policy. Exact retention/lease behavior is an open
 design question; do not assume an unverified native lease API.
+
+In the current draft implementation, readiness is an immutable, per-rank pool
+object keyed by the complete versioned handle. Publication is admitted only
+after the producer's all-rank data-store outcome succeeds. The pinned
+[Python client bindings](https://github.com/ROCm/mori/blob/67632e80e2e492184b589904b63225f82d45537c/src/pybind/pybind_umbp.cpp)
+expose neither per-key deletion nor an object TTL. Handle expiry therefore
+limits acceptance, not physical record retention. Normal pool eviction may
+reclaim records; bounded metadata growth, retention under pressure and native
+teardown still require validation. Never use shared-pool `clear()` for
+per-request cleanup. Wall-clock expiry also requires a documented clock-skew
+assumption; a local receive deadline does not cancel a running KV memory access.
 
 Validation must measure the decoder's actual missing-state transfers and
 recomputed tokens, including the final-logit token, rather than equating a pool
@@ -334,9 +353,11 @@ Coordinate with existing work rather than creating a second general framework:
   that this proposal assumes exists.
 
 The distinct proposal here is a release-pinned UMBP data plane with a concrete
-joint offload/P-D lifecycle, plus placement/prefetch adapters. The initial related
-issue search is not an exhaustive duplicate-work determination; refresh issues,
-PRs and their current implementations before submission or opening a PR.
+joint offload/P-D lifecycle, plus placement/prefetch adapters. On 2026-09-14,
+the public GitHub issue-search API returned zero open PRs for the narrow query
+`repo:vllm-project/vllm is:pr is:open UMBP`. That is not an exhaustive
+duplicate-work determination: overlapping work may use other names. Refresh
+issues, PRs and their current implementations before submission or opening a PR.
 
 ### Current prototype and evidence limits
 
@@ -377,6 +398,26 @@ and unsupported hybrid/parallel/quantized configurations are explicitly rejected
 at this checkpoint; implementing them remains required by this proposal.
 Earlier integration results from other
 branches/releases are not carried over as validation of this prototype.
+
+There is also **uncommitted P/D work** on top of documentation HEAD
+`9365daa2f63a87b97ac81e9295b48e7d0d481a6c`. A fresh run of the same eight
+CPU suites passed **184 tests** in 17.33 seconds, including three new P/D cases.
+These use separate producer/consumer Scheduler instances, one CPU worker each,
+and a shared native-store fake. They cover a handle returned through the actual
+engine output before readiness, byte-checked restoration with zero or nonzero
+decoder-local prefix, and failed export causing receive timeout/recomputation.
+The aligned 16-token prompt cases read only the missing prefix and compute the
+producer's first sampled token on the decoder; no GET starts before readiness.
+This is not a native two-engine deployment or a multi-rank P/D proof.
+
+This working draft enables dense P/D roles with an explicit shared-master
+configuration. It exports complete, jointly aligned prefix blocks; any partial
+prompt tail is recomputed on the decoder. It does not yet implement hybrid
+boundary-state handoff, heterogeneous topology, routing/prefetch integration,
+or end-to-end model validation. Its code pre-commit run also still reports a
+missing type annotation in the P/D test fixture. The uncommitted source must be
+reviewed, corrected and checkpointed before it can be pinned for reproduction;
+the 184-test result must not be attributed to the 181-test code commit above.
 
 One native integrity gap needs explicit resolution: the pinned
 [SSD ranged-read interface](https://github.com/ROCm/mori/blob/67632e80e2e492184b589904b63225f82d45537c/src/umbp/include/umbp/local/tiers/ssd_tier.h)
