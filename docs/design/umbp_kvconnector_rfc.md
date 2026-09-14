@@ -350,6 +350,9 @@ The local prototype starts from `EmbeddedLLM/vllm:umbpkvconnector` at
 - `4ab562728fff64cd2c12de8068f263e938c94c90`: cache-manager-owned transfer jobs,
   rank-local asynchronous lookup, all-rank finalization and receive/error
   snapshot retirement.
+- `b4d667df1d2df175ca9892a1971da30423fd9746`: real KVConnector startup and dense
+  offload request hooks, model-configuration identity, fresh-worker epoch
+  binding, and composed Scheduler tests.
 
 MoRI remains unchanged at release commit
 `67632e80e2e492184b589904b63225f82d45537c`. The preserved llm-d-router reference
@@ -357,16 +360,22 @@ is `7541552c71642f2756517a7aeb3c0c35720c06d0`; llm-d is
 `d557f83e1e5f1e5a6ed54ef154c554cf6c775e33`. Neither has yet been ported or
 validated against this new connector implementation.
 
-Current evidence at `4ab562728`: **164 CPU tests passed** (161 UMBP tests and
+Current evidence at `b4d667df1`: **181 CPU tests passed** (178 UMBP tests and
 three existing connector/output-aggregation regressions). These cover physical
 layouts, generation/rank receipts, policy translation, private-path isolation
 and lifetime/failure cases using CPU buffers and a native-API fake. Composed
 tests use the real KVCacheManager/BlockPool and both vLLM model-runner output
-collectors. They verify source pins, exclusive load destinations, all-rank
-finalization and delayed release until receive/error snapshots retire.
-They do not establish full Scheduler request-state integration, HIP/RDMA/SSD
-correctness, complete P/D serving, model accuracy or performance.
-No UMBPConnector is registered yet. Earlier integration results from other
+collectors. Additional single-worker tests now use the actual connector factory
+and Scheduler for dense offload: cold save, eviction, missing-prefix-only restore,
+chunked prefill, unequal group sizes, lookup gaps, timeout, abort, failed receive
+recomputation and inter-engine model-identity isolation. Native I/O, GPU events
+and model execution are still fakes.
+They do not establish HIP/RDMA/SSD correctness, native TP, hybrid boundaries,
+complete P/D serving, model accuracy or performance. The connector is accessible
+via the development module-path mechanism, not the built-in registry. P/D roles
+and unsupported hybrid/parallel/quantized configurations are explicitly rejected
+at this checkpoint; implementing them remains required by this proposal.
+Earlier integration results from other
 branches/releases are not carried over as validation of this prototype.
 
 One native integrity gap needs explicit resolution: the pinned
