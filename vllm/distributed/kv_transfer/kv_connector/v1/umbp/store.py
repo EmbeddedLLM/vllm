@@ -7,6 +7,7 @@ not publish a loaded block before its successful result. A failed read may
 have modified its destination. Cancelling a running future cannot cancel DMA.
 """
 
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from threading import Lock
@@ -104,22 +105,35 @@ class UMBPStore:
         *,
         workers: int = 2,
         max_pending: int = 8,
+        cleanup: Callable[[], None] | None = None,
     ) -> None:
-        _positive_int(workers, "workers")
-        _positive_int(max_pending, "max_pending")
-        required = (
-            "batch_exists",
-            "batch_get_ranges_into_ptr",
-            "batch_put_ranges_from_ptr",
-            "register_memory",
-            "deregister_memory",
-            "supports_ranged_io",
-        )
-        if any(not callable(getattr(native_client, name, None)) for name in required):
-            raise RuntimeError("UMBP requires the MoRI 1.2.3.post1 ranged I/O API")
-        if not native_client.supports_ranged_io():
-            raise RuntimeError("This UMBP deployment does not support ranged I/O")
+        try:
+            _positive_int(workers, "workers")
+            _positive_int(max_pending, "max_pending")
+            required = (
+                "batch_exists",
+                "batch_get_ranges_into_ptr",
+                "batch_put_ranges_from_ptr",
+                "register_memory",
+                "deregister_memory",
+                "supports_ranged_io",
+            )
+            if any(
+                not callable(getattr(native_client, name, None)) for name in required
+            ):
+                raise RuntimeError("UMBP requires the MoRI 1.2.3.post1 ranged I/O API")
+            if not native_client.supports_ranged_io():
+                raise RuntimeError("This UMBP deployment does not support ranged I/O")
+            self._executor = ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="umbp-kv"
+            )
+        except BaseException:
+            # Do not retain the native client in this frame's traceback while
+            # a failed factory call removes its private storage directories.
+            native_client = None
+            raise
         self._client = native_client
+        self._cleanup = cleanup
         self._locations = memory_location_type
         self._regions: dict[int, MemoryRegion] = {}
         self._lock = Lock()
@@ -127,13 +141,15 @@ class UMBPStore:
         self._closing = False
         self._pending = 0
         self._max_pending = max_pending
-        self._executor = ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="umbp-kv"
-        )
 
     @classmethod
     def from_native_config(
-        cls, config: Any, *, workers: int = 2, max_pending: int = 8
+        cls,
+        config: Any,
+        *,
+        workers: int = 2,
+        max_pending: int = 8,
+        cleanup: Callable[[], None] | None = None,
     ) -> "UMBPStore":
         _positive_int(workers, "workers")
         _positive_int(max_pending, "max_pending")
@@ -144,6 +160,7 @@ class UMBPStore:
             MemoryLocationType,
             workers=workers,
             max_pending=max_pending,
+            cleanup=cleanup,
         )
 
     def _check_open(self) -> None:
@@ -280,3 +297,6 @@ class UMBPStore:
             # v1.2.3.post1 has a C++ Close/destructor but no Python close binding.
             # Dropping our exclusive client reference invokes native teardown.
             self._client = None
+            if self._cleanup is not None:
+                self._cleanup()
+                self._cleanup = None

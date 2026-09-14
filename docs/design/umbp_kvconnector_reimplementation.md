@@ -46,7 +46,7 @@ External HBM/DRAM placement reports are advisory, not proof that a corresponding
 UMBP object can be read. The new implementation must not equate a routing hint
 with completed, servable KV.
 
-Two additional release details affect the upcoming configuration layer:
+Two additional release details affect the configuration layer:
 
 - `distributed.ranged_scratch_size` defaults to zero, disabling the remote
   ranged-I/O arenas. Configure it explicitly to fit at least the largest
@@ -59,6 +59,17 @@ Two additional release details affect the upcoming configuration layer:
 These are source observations from the pinned
 [configuration contract](https://github.com/ROCm/mori/blob/67632e80e2e492184b589904b63225f82d45537c/src/umbp/include/umbp/common/config.h),
 not native behavior established by the CPU tests below.
+
+### Configuration test design
+
+The configuration adapter translates explicit per-worker capacity, SSD roots,
+network endpoints and actual layout object sizes into the pinned native API.
+Its contract is to reject invalid input before starting a client, generate an
+explicit DRAM/SSD backend policy, and own only the directories it creates.
+Unit tests will exercise unknown fields, insufficient page/scratch sizing,
+partial network configuration, native startup failure and cleanup ordering.
+The existing store tests provide real CPU buffers and deterministic I/O
+barriers; native-config fakes test translation, not SSD or RDMA operation.
 
 ## Intended architecture and ownership
 
@@ -122,6 +133,7 @@ completion behavior; it is not being relabeled as UMBP offloading.
 | Requirement | Destination / evidence needed | Current state |
 | --- | --- | --- |
 | Native API and owned ranged storage | `umbp/store.py`; CPU contracts, then real native pointer tests | CPU contracts implemented; native pending |
+| Explicit storage configuration | `umbp/config.py`; page/scratch checks, DRAM/SSD policy and private-path lifetime | CPU translation/lifetime tests pass; native policy lowering pending |
 | Compatible P/D/offload keys | `umbp/key.py`, `umbp/layout.py`; descriptor integration and identity isolation | Logical rank-local descriptors implemented; scheduler handshake pending |
 | Scheduler lookup and allocation | KVConnector lookup, metadata, block ownership, asynchronous feedback | Pending |
 | Worker load/store and errors | Registered cache views, compute fences, completion snapshots and error block IDs | Transfer component CPU-tested; connector hooks/error-block delivery pending |
@@ -244,7 +256,7 @@ PYTHONDONTWRITEBYTECODE=1 "$TEST_VENV/bin/python" -m pytest \
 
 Limitations and next integration work remain mandatory:
 
-1. Build the native configuration/policy adapter and actual connector hooks.
+1. Integrate the configuration/policy adapter with actual connector hooks.
    The scheduler must pin blocks, handle rejected admission with explicit failed
    rank receipts, and deliver invalid load block IDs and request completions.
    Worker job admission must follow increasing sequence order; a retired job
@@ -272,3 +284,86 @@ unrelated Actionlint hook is skipped for these Python/Markdown-only changes:
 its Go toolchain installer fails with a download/version-resolution error,
 and no `.github/workflows/` files are changed. Repository lint policy is
 unchanged. Full transcripts and failed intermediate runs remain on the VPS.
+
+## Third implementation checkpoint: explicit storage policy
+
+`UMBPStoreConfig` now builds the pinned native configuration with an explicit
+schema-v1 policy for DRAM-only, SSD-only or DRAM→SSD storage. With both media,
+the policy spills on eviction and requests copy-promotion on read. These are
+configured native policies, not promotion/demotion measurements. No public
+`--kv-transfer-config` recipe is ready until connector registration and hooks
+are implemented.
+
+The adapter requires an explicit pool page size, positive selected capacities,
+and pre-existing absolute SSD roots. It rejects unknown options, missing network
+endpoints for a shared master, and page/scratch sizes smaller than the worker
+layout's `max_object_bytes`. Every peer must agree on page size; heterogeneous
+worker sizes need a deployment-wide maximum, not independent auto-sizing.
+The otherwise unused top-level DRAM capacity prevents the release's embedded
+factory from silently shrinking that page size; real allocation is specified
+only by the generated backend policy.
+
+Budgets are **per worker**, not per eight-GPU host. Account for the selected
+DRAM capacity, **two** ranged scratch arenas, SSD staging slots times page size,
+and native transport/metadata overhead. SSD capacity is total across the
+listed roots and is split by the native sharded tier. For this deployment,
+use the existing `/mnt/umbp-ssd0` bind mount after a fresh runner preflight;
+adding `/mnt/umbp-ssd1` through `/mnt/umbp-ssd7` later does not rename SSD0.
+Directory existence alone does not establish that it is mounted, local NVMe,
+ext4, large enough or free of other users' workloads. Those remain preflight
+checks, not facts inferred by this adapter.
+
+Each client creates fresh `vllm-umbp-*` subdirectories beneath those roots,
+plus a private temporary policy directory. The paths are logged before native
+startup. They survive running I/O and failed deregistration. Shutdown drains
+the store, deregisters allocations and releases the native client before
+deleting only these owned directories; cleanup failures can be retried.
+Existing root contents, mounts, model caches and shared pool data are never
+cleared. Abrupt process termination can still leave directories behind: retain
+the startup manifest on the VPS and audit cleanup after recovering evidence.
+Native destructor failure/peer-read draining still needs native validation.
+The adapter rejects an ambient `UMBP_WORKLOAD_TRACE_PATH` to prevent unowned
+trace files; collect service stdout/stderr to the VPS instead.
+
+The pinned policy parser selects file-backed SSDs, with native direct-I/O and
+CRC defaults. **This does not prove physical SSD I/O or checksum verification
+on ranged reads.** The pinned
+[SSD range interface](https://github.com/ROCm/mori/blob/67632e80e2e492184b589904b63225f82d45537c/src/umbp/include/umbp/local/tiers/ssd_tier.h)
+explicitly omits whole-record CRC verification on ranged reads. Corruption
+injection and an integrity strategy must be resolved before claiming that
+all corrupted cache objects reliably fall back to recomputation. Likewise,
+native O_DIRECT may fall back on unsupported filesystems; measure actual device
+I/O in the SSD acceptance run. GPU-destination re-cache and implicit locality
+prefetch are disabled in this adapter to avoid invalid host-copy assumptions
+and hidden duplicate traffic.
+
+The combined suite now passes **148 CPU tests** (146 UMBP tests plus the two
+existing output-aggregator regressions). New coverage includes schema/sizing,
+DRAM-only and SSD-only policies, tiering edges, two-client directory isolation,
+symlink/comma-path ambiguity, startup failure, cleanup after native draining,
+deregistration/cleanup retries and ambient trace rejection. Native config and
+client construction are fakes; no HIP, RDMA, actual SSD or model result follows.
+
+Reproduction on the VPS, from this worktree:
+
+```bash
+set -o pipefail
+TEST_VENV=/home/ubuntu/vllmumbp/repos/vllm/.venv
+PYTHONDONTWRITEBYTECODE=1 "$TEST_VENV/bin/python" -m pytest \
+  --confcutdir=tests/v1/kv_connector/unit \
+  tests/v1/kv_connector/unit/test_umbp_config.py \
+  tests/v1/kv_connector/unit/test_umbp_store.py \
+  tests/v1/kv_connector/unit/test_umbp_key.py \
+  tests/v1/kv_connector/unit/test_umbp_layout.py \
+  tests/v1/kv_connector/unit/test_umbp_worker.py \
+  tests/v1/kv_connector/unit/test_output_aggregator.py -q
+```
+
+Evidence: `local-logs/umbp-kvconnector-reimplementation-20260914/` on the VPS.
+The earlier `cpu-tests-r7.log` contains 144 passes; `cpu-tests-r8.log` contains
+148 passes after additional cleanup and path tests; the final formatted-source
+run is `cpu-tests-r9.log` (148 passed). Retain intermediate lint
+failures alongside `config-pre-commit-r4.log`, the passing final lint run.
+Scheduler ownership, worker-layout
+exchange, connector hooks, P/D, native integrity, model validation, routing and
+prefetch remain required work, not waived by these component results.

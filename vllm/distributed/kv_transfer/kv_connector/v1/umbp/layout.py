@@ -235,6 +235,10 @@ class UMBPLayout:
         if not self._groups:
             raise ValueError("No transferable KV cache groups")
         self.regions = tuple(regions.values())
+        self.max_object_bytes = max(
+            sum(size for page in pages for _, size in page.runs)
+            for pages in self._groups.values()
+        )
         self.num_shards = topology.tp_size * topology.pp_size * topology.pcp_size
         self.prefix_cacheable_group_ids = frozenset(config.prefix_cacheable_group_ids)
         self.identity = json.dumps(

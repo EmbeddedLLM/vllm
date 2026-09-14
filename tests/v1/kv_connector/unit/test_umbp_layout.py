@@ -117,6 +117,7 @@ def test_roundtrip_preserves_logical_kv_and_neighbor_blocks(
         assert len(producer.regions) == len(consumer.regions) == 1
         src = producer.block_object("block", group_id=0, block_id=1)
         dst = consumer.block_object("block", group_id=0, block_id=3)
+        assert producer.max_object_bytes == consumer.max_object_bytes == src.size
         assert store.store((src,)).result(5) == (True,)
         assert native.data["block"] == b"".join(
             byte_tensor(source[name][1]) for name in sorted(source)
@@ -205,6 +206,7 @@ def test_packed_layers_and_aliased_hybrid_groups_preserve_padding():
     mamba = mapped.block_object("state", group_id=1, block_id=2)
     assert attn.size == 2 * spec.unpadded_page_size_bytes
     assert mamba.size == groups[1].kv_cache_spec.state_content_size_bytes
+    assert mapped.max_object_bytes == max(attn.size, mamba.size)
     assert [(s.offset, s.size) for s in attn.slices] == [(256, 64), (384, 64)]
     assert [(s.offset, s.size) for s in mamba.slices] == [(512, 36)]
 
@@ -224,6 +226,7 @@ def test_uniform_group_uses_each_layers_actual_spec_and_semantic_identity():
     mapped = UMBPLayout(config, caches, CacheTopology())
     obj = mapped.block_object("hybrid", group_id=0, block_id=1)
     assert obj.size == sum(s.real_page_size_bytes for s in specs.values())
+    assert mapped.max_object_bytes == obj.size
     altered = replace(
         config,
         kv_cache_groups=[
