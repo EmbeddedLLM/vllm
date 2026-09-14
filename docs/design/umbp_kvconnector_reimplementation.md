@@ -1,6 +1,9 @@
 # UMBP reimplementation through KVConnectors
 
-Status: **in progress; dense offload and P/D hooks CPU-tested, native serving pending**.
+Status: **in progress; limited native Qwen offload and same-host P/D smokes
+passed; multi-node, pressure, accuracy and performance acceptance pending**. Current Python-source
+checkpoint: `efac63da24ddba5374d4a55ad30923c400c239a4`; the serving smoke reused
+older nightly vLLM native binaries, as detailed in the revision 3 evidence below.
 
 ## Target and preserved baseline
 
@@ -132,22 +135,22 @@ completion behavior; it is not being relabeled as UMBP offloading.
 
 | Requirement | Destination / evidence needed | Current state |
 | --- | --- | --- |
-| Native API and owned ranged storage | `umbp/store.py`; CPU contracts, then real native pointer tests | CPU contracts implemented; native pending |
-| Explicit storage configuration | `umbp/config.py`; page/scratch checks, DRAM/SSD policy and private-path lifetime | CPU translation/lifetime tests pass; native policy lowering pending |
-| Compatible P/D/offload keys | `umbp/key.py`, `umbp/layout.py`; descriptor integration and identity isolation | Worker-derived namespace handshake and fresh generation exchange implemented for matching TP; native verification pending |
+| Native API and owned ranged storage | `umbp/store.py`; CPU contracts, then real native pointer tests | CPU contracts and eight native CPU/GPU DRAM/SSD buffer cases passed; broader pressure/fault validation pending |
+| Explicit storage configuration | `umbp/config.py`; page/scratch checks, DRAM/SSD policy and private-path lifetime | CPU tests and native DRAM-only/SSD-only startup/cleanup passed; pressure and tier migration pending |
+| Compatible P/D/offload keys | `umbp/key.py`, `umbp/layout.py`; descriptor integration and identity isolation | Worker-derived namespace handshake and generation exchange implemented; same-host matching-TP1 P/D smoke passed, broader native topology pending |
 | Scheduler lookup and allocation | KVConnector lookup, metadata, block ownership, asynchronous feedback | Dense offload and P/D planners exercised through real Scheduler; hybrid boundaries pending |
 | Worker load/store and errors | Registered cache views, compute fences, completion snapshots and error block IDs | Real connector hooks and post-forward event recording wired; CPU runner tests pass, native GPU ordering pending |
-| P/D handoff and incremental transfer | Producer/consumer protocol, all-rank commit, local-prefix reuse, two-engine transfer accounting | Dense finish-time export and readiness-gated receive CPU-tested; native two-engine and hybrid handoff pending |
-| Single-node DRAM and ext4 SSD offload | MoRI embedded deployment, forced eviction, byte/source reconciliation | Pending |
+| P/D handoff and incremental transfer | Producer/consumer protocol, all-rank commit, local-prefix reuse, two-engine transfer accounting | Same-host separate-GPU Qwen cold/partial P/D passed at `efac63da2`; native multi-rank/multi-node and hybrid handoff pending |
+| Single-node DRAM and ext4 SSD offload | MoRI embedded deployment, forced eviction, byte/source reconciliation | Qwen local-cache-reset smoke passed at `2dc83e970`; forced HBM overwrite/pressure and performance pending |
 | Multi-node DRAM/SSD restore | Master-led deployment, peer failures, safe recompute and recovery | Pending |
 | TP and hybrid cache geometry | Exact layouts, complete group/shard restoration, cancellation and preemption | Layout/rank barriers and unequal dense-group scheduler tests pass; native TP and hybrid boundary semantics pending |
 | Placement and MoRI scheduling | Current authoritative placement API, lifecycle events, tier/locality/cost routing | Pending |
 | CPU/HBM prefetch and admission | Token-identity control, connector-owned load, TTL/cancel/drain/no-model invariants | Pending |
 | llm-d integration and fault recovery | Routing, prefetch, replay/gaps, staleness, reconnect/fail-open tests | Pending |
-| Qwen correctness and accuracy | Matched no-connector/offload/P-D outputs and GSM8K evidence | Pending |
+| Qwen correctness and accuracy | Matched no-connector/offload/P-D outputs and GSM8K evidence | One-prompt offload and same-host P/D token matches passed; matched GSM8K acceptance pending |
 | Kimi K3 acceptance | Requested TP8/AITER settings, hybrid layouts, long-context restore and semantic tests | Pending |
 | Transfer effectiveness | Source counters, physical transfer proof, matched warmup/latency/throughput protocol | Pending |
-| Reproduction and zero remote residue | Exact source/runtime/model manifests, VPS logs, audited cleanup | No remote work yet |
+| Reproduction and zero remote residue | Exact source/runtime/model manifests, VPS logs, audited cleanup | Native/offload and P/D attempts recovered to VPS with per-attempt cleanup audits; repeat for every run |
 
 The existing eight-GPU host descriptions are hints until revalidated. Use only
 authorized hosts, pre-existing ext4 SSD0 mounts, and disposable per-run/rank
@@ -612,8 +615,10 @@ UMBP-only engine-core RPCs or synthetic prefetch requests in this checkpoint.
    which the normal Scheduler frees the held producer allocation.
 4. The decoder validates namespace, schema, boundary hash, alignment and expiry,
    then allocates only the missing prefix beyond its valid local cache. Workers
-   wait for their rank's marker before issuing native GETs. The Scheduler does
-   not execute a request while its receive is pending.
+   wait for their rank's marker and visibility of every requested missing
+   object before issuing native GETs. A local marker can precede heartbeat
+   publication of peer-held KV routes. The Scheduler does not execute a
+   request while its receive is pending.
 5. Receives use the existing all-rank finalization and error-snapshot retirement
    barriers. Missing/evicted objects and allocated-receive timeouts honor vLLM's
    `kv_load_failure_policy` (`recompute` or `fail`). Invalid hints detected before
@@ -875,8 +880,8 @@ The pinned SSD backend retains read staging under a default 3-second lease
 and retries transient arena pressure. Chunking can therefore wait between
 reads. This fixes per-call geometry, not transfer QoS, fairness, lease-release
 efficiency or latency; those need separate native pressure/performance work.
-Matched Qwen and native SSD revalidation of the batching correction is still
-required. GSM8K, eviction pressure, TP/P-D, hybrid models and two-node acceptance
+The matched Qwen revalidation below exercises the correction with native SSD
+storage. GSM8K, eviction pressure, TP/P-D, hybrid models and two-node acceptance
 remain outstanding.
 
 The VPS evidence bundle contains `serve-r2-manifest.md`,
@@ -892,3 +897,247 @@ bash local-logs/umbp-kvconnector-reimplementation-20260914/serve-r2-controller.s
 That attempt is finished; do not overwrite it. The controller requires a fresh
 attempt name and an absent, marker-owned root. No P/D, GDS or speedup claim is
 made from this local-prefix-reset smoke.
+
+#### Verified batching correction: Qwen revision 3
+
+At exact Python-source commit `2dc83e970aa6c2ae0f7df3e3d2456694c7d0cb0f`,
+all three arms passed with the same model, GPU 0 on 003, image, MoRI library,
+attention backend/layout and resource budgets as revision 2. The source archive
+SHA256 is `22d2bca1422789f3f57d5f8370a759cbc2836bbc707c5e6f6fbf87334f9b5c70`;
+it excludes the uncommitted RFC. The older-image vLLM native-binary limitation
+described above still applies.
+
+| Arm | Cold cached tokens | Restored tokens | Output matches baseline | Repeat request wall time |
+| --- | ---: | ---: | --- | ---: |
+| No connector | 0 | 0 | Yes, 15 greedy tokens | 0.144324 s |
+| DRAM only | 0 | 576 | Yes, 15 greedy tokens | 0.155199 s |
+| SSD only, bounded batches | 0 | 576 | Yes, 15 greedy tokens | 6.463459 s |
+
+The prompt contains 584 tokens. Local prefix-cache hits are zero throughout;
+external hits are zero for cold requests and 576 for both offload repeats.
+Every repeat returns the same token IDs as its cold request and the baseline.
+This is a limited native full-engine offload correctness pass. Local cache reset
+does not establish that old HBM bytes were overwritten; actual pressure/eviction
+and separate-engine P/D remain required. No GSM8K or throughput result is implied.
+
+SSD's 36-object GET becomes 16/16/4 calls at unchanged staging capacity. Its
+6.46-second repeat is consistent with two turnovers of the 3-second native read
+leases, but no profiler attribution was collected. Do not treat these single
+request times as a performance benchmark or shorten leases without proving
+transfer lifetime safety.
+
+Final CPU evidence is `cpu-tests-r19.log`: **204 passed, eight native tests
+skipped**, 15 warnings, 18.21 seconds. This supersedes r18 as the final local
+rerun; the eight earlier passing native buffer tests remain separate evidence.
+
+The exact completed comparison command, run from `/home/ubuntu/vllmumbp`, was:
+
+```bash
+set -o pipefail
+bash local-logs/umbp-kvconnector-reimplementation-20260914/serve-r3-controller.sh smoke smoke-1 \
+  2>&1 | tee local-logs/umbp-kvconnector-reimplementation-20260914/serve-r3-smoke-1.log
+```
+
+Do not rerun that evidence name. The controller refuses an existing recovery
+archive. A future replay needs a fresh attempt name plus fresh GPU, filesystem,
+model and cleanup checks. Frozen inputs and provenance are in
+`serve-r3-input/`, `serve-r3-manifest.md` and `serve-r3-launch-hashes.txt` within
+`local-logs/umbp-kvconnector-reimplementation-20260914/`.
+
+The controller finished with exit 0, `qwen_smoke_private_paths_removed=true`
+and `cleanup_complete=true`. The entire runtime was recovered as
+`serve-r3-smoke-1-recovery.tar.gz` (769,471,616 bytes), SHA256
+`1d957f08a351e61b27ff17037f493df2d405929e1ff1ffeb7bf988d0e6e164e8`, and
+compared with the deterministic remote stream before marker-owned cleanup.
+The archive omits non-file IPC sockets, as reported by tar. The injected
+setup-failure gate had already proved recovery/cleanup with expected exit 42.
+
+Independent verification, also run from the VPS workspace:
+
+```bash
+set -o pipefail
+/home/ubuntu/vllmumbp/repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/verify-qwen-smoke.py \
+  local-logs/umbp-kvconnector-reimplementation-20260914/serve-r3-smoke-1.log \
+  local-logs/umbp-kvconnector-reimplementation-20260914/serve-r3-smoke-1-recovery.tar.gz \
+  2>&1 | tee local-logs/umbp-kvconnector-reimplementation-20260914/verify-qwen-r3.log
+```
+
+The verifier passed, comparing all six log receipts with recovered JSON,
+expected tokens/cache counters, actual attention/layout markers and cleanup.
+Its negative control rejects the r2 lookup-hit-but-failed-GET case. See
+`verify-qwen-r3.log` and `verify-qwen-negative-control.log`.
+
+The independent 14:33 UTC audit (`serve-r3-final-audit.sh` and its `.log`)
+confirmed the exact r3 root and all run-labelled Docker resources absent, no
+KFD processes, all eight GPUs at baseline VRAM, and the directory lock available.
+The original image is preserved. The pre-existing Qwen weight/tokenizer sizes
+and config/tokenizer-config hashes match; no incomplete files exist. No weight
+download, host configuration change or work on 004 occurred. All recovered
+runtime, logs and scripts remain on the VPS, not on the GPU host.
+
+## P/D native validation and visibility correction (2026-09-14)
+
+The test uses a release-built MoRI master, separate native clients and separate
+Qwen producer/consumer engines on GPU0/GPU1 of runner003. The exact model
+revision, image/native-library pins, runtime toolchain and older-native-vLLM
+binary caveat are the same as the offload smoke above. The new engine source
+is `efac63da24ddba5374d4a55ad30923c400c239a4`; MoRI remains at
+`67632e80e2e492184b589904b63225f82d45537c`.
+
+### Failed attempts and transport-only diagnostic
+
+All paths in this section are relative to the VPS bundle
+`local-logs/umbp-kvconnector-reimplementation-20260914/`.
+
+| Attempt | Actual result | Recovery SHA256 |
+| --- | --- | --- |
+| `pd-r1-smoke-1` | Master loader failed to locate `libmori_io.so`; no model or native-client test | `47139291acd4fa80951253d60680e5e6fce6a511a3bd5912574ed2f8a0e5426a` |
+| `pd-r2-smoke-1` | Loader fixed; first native PUT failed with ionic_0 RTR transition errno19 under network-none; no model P/D | `97314eadca602a83df0fe483ceba5237d079cbc23c538da11ad63466a077f7e3` |
+| `pd-r3-transport-1` | Host-network native cross-process PUT/consumer-local GET passed; all 4096 bytes verified; no model mounted | `c51dd2d4ca28c133895ec31166cd20a4234f65d24c83bd333195358cb0860bf3` |
+| `pd-r4-smoke-1` | Native transport and baseline passed; producer emitted handle576/first token, consumer KV load failed, partial case not reached | `ca79b391d69002d876ac10b9739edf6f4840a917b39870b69eeaf0eaaac8db8a` |
+
+Each attempt recovered its entire runtime as `<attempt>-recovery.tar.gz`,
+hash-checked before exact marker-owned deletion. The independent
+`pd-r1-final-audit.log` through `pd-r4-final-audit.log` passed. The r4 archive
+is 769,479,024 bytes; its four receipts correctly fail the seven-receipt model
+verifier (`verify-pd-r4.log`). Failed GETs are not accepted based on an external
+hit counter. r4 used distinct producer/consumer GPU UUIDs and `failure_policy=fail`.
+
+The standalone master needs `/work/package/mori` on `LD_LIBRARY_PATH` in
+addition to the relocated protobuf/gRPC libraries. A no-GPU `ldd` check now
+precedes execution. The successful transport shape uses host networking within
+the user's existing recipe scope, not host interface/kernel/firewall changes.
+Master port 48700 and native I/O ports 49201/49202 bind loopback; peer ports 49101/49102 bind
+all interfaces. Metrics are disabled. This is not network isolation or a
+single-variable proof that network namespace alone caused the r2 failure.
+
+### Readiness visibility regression
+
+In the pinned native release, a successful PUT commits bytes but can precede
+heartbeat delivery of the object's route to the master. `BatchExists` is
+local-first. A ready marker placed on the decoder can therefore be visible
+before producer-held KV is routable from that decoder. The former marker-only
+gate allowed an early GET; r4 failed before the next heartbeat.
+
+Checkpoint `efac63da2` gates P/D GETs on the rank marker **and every missing
+object in that receive job**. It uses the same bounded asynchronous lookup,
+backoff and deadline; no fixed sleep, heartbeat tuning or GET retry. Objects
+can still be evicted after the probe, so normal native GET outcomes and receive
+failure policy remain authoritative. No ordinary offload path changes.
+
+Test design: extend the existing composed Scheduler fixture to expose the
+marker while withholding data visibility. Require no GET/computation until
+the data becomes visible, then one successful receive and no leaked blocks.
+Keep separate eviction-after-probe coverage for both fail and recompute.
+`pd-visibility-negative.log` shows the new test failing on the old code because
+GET ran early. `cpu-tests-r20.log`: **205 passed, eight native tests skipped**,
+18.34 seconds, using the eight-suite offline command above. Applicable code
+and commit hooks passed (`pd-visibility-hooks.log`, `pd-visibility-commit.log`);
+unrelated actionlint was skipped. The local code commit contains only the
+worker gate and its tests; the existing design drafts were preserved.
+
+Native retry 5 is separately frozen in `pd-r5-manifest.md`,
+`pd-r5-launch-hashes.txt`, `pd-r5-controller.sh` and `pd-r5-input/`.
+Source archive SHA256:
+`b14bf8f7c753c40f216bf3e689c1b191c576d5717d6a1588f6654b735b58c3be`.
+The setup-failure gate passed with expected exit 42 and cleanup true, recovery
+SHA256 `a8bd2af195055a77ebfd0fd82f36d851c815bdd593edbb46c56fe7fa269affa2`.
+The native retry result was independently verified as described below.
+
+### Verified separate-engine Qwen P/D: retry 5
+
+`pd-r5-smoke-1.log` completed with exit 0, all case markers, private-path removal
+and controller cleanup. `verify-pd-r5.log` independently matched all seven
+receipts against the recovered JSON, checked three actual backend/layout
+selections and distinct producer/consumer GPU UUIDs, and confirmed the exact
+token/count checks. Both producer and decoder use `LLM` engine APIs, not an
+HTTP server or llm-d router. Both are on host 003; this is not a multi-node pass.
+
+Common model/engine settings: pre-existing Qwen3-0.6B revision
+`c1899de289a04d12100db370d81485cdf75e47ca`, TP1/BF16/eager, block size 16,
+160 GPU blocks, max length 2048, max sequences 4, max batch tokens 512, GPU utilization 0.1,
+`ROCM_AITER_UNIFIED_ATTN` and LBHNC. Native storage is 512 MiB DRAM per client,
+4 MiB pages, 64 MiB GET and PUT arenas, 16-object batches; receive policy is fail.
+The task/runtime caches use the bound ext4 SSD0; this run does not test SSD KV.
+
+| Case | Decoder local tokens | Decoder external tokens | Native decoder GET chunks | Total GET objects | Output |
+| --- | ---: | ---: | --- | ---: | --- |
+| Cold P/D | 0 | 576 | 16 / 16 / 4 | 36 | First producer token + 14 decoder tokens match baseline's 15 IDs |
+| Partial-prefix P/D | 256 | 320 | 16 / 4 | 20 | Same 15 IDs; valid local prefix retained |
+
+The original prompt has 584 tokens. Producer emits its actual boundary-576
+handle and first token; decoder receives the unchanged handle plus 585 prompt
+tokens and reports 576 cached tokens. Separate salts isolate the cases. For
+partial P/D the decoder first warms 257 tokens, retaining 256 full local tokens;
+the producer also reuses those 256 from the pool before exporting its complete
+aligned prefix. This is not a second cold-prefill comparison.
+
+The baseline request took 0.758 s; cold and partial decoder requests took 3.064 s
+and 4.612 s respectively. These are un-warmed single-request wall times, not a
+benchmark or speedup. The readiness delay aligns with the default 5-second
+heartbeat publication cycle; no latency attribution/profile or heartbeat
+tuning was performed. Native startup also reported repeated empty-heartbeat
+sequence-gap/full-sync warnings, retained in the log for follow-up.
+
+#### Native count evidence and failed byte-accounting gate
+
+`pd-r5-get-evidence.log` reconciles the decoder's five native ranged GET calls
+with the cold/partial request windows: 36 versus 20 objects. Each object is
+1,835,008 bytes by the registered layout/PUT log, so expected logical payloads
+are 66,060,288 and 36,700,160 bytes. These are derived payload sizes, **not measured
+physical traffic or validated native byte-counter totals**. Cold reads used 18
+local and 18 remote objects; partial reads used 20 remote objects. Different pool
+placement means fewer total GET objects does not imply fewer network bytes.
+
+The strict `verify-pd-ranged.py` byte gate **failed**, retained in
+`verify-pd-r5-ranged.log`; it was not relaxed into a pass. Native debug totals
+were 33,030,144 bytes for cold GETs and 0 for partial GETs. Source inspection of
+the unchanged release's `ServeWholeObjectUnitsFromMedium` shows its
+`remote_bytes` output parameter is never updated, unlike the arena path.
+That path can land full remote objects in a local medium slot and copy to GPU
+even with `cache_remote_fetches=false`; that flag is not a blanket prohibition
+on this ranged-read placement. Native byte metrics/admission/copy accounting
+need separate fixes or instrumentation before effectiveness claims.
+`summarize-pd-get-evidence.py` verifies only object counts and explicitly emits
+`strict_byte_gate_passed=false`. Token-level smoke acceptance is separate.
+
+#### Exact commands and teardown
+
+From `/home/ubuntu/vllmumbp` on the VPS, after the recorded failure gate:
+
+```bash
+set -o pipefail
+bash local-logs/umbp-kvconnector-reimplementation-20260914/pd-r5-controller.sh smoke smoke-1 \
+  2>&1 | tee local-logs/umbp-kvconnector-reimplementation-20260914/pd-r5-smoke-1.log
+/home/ubuntu/vllmumbp/repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/verify-pd-smoke.py \
+  local-logs/umbp-kvconnector-reimplementation-20260914/pd-r5-smoke-1.log \
+  local-logs/umbp-kvconnector-reimplementation-20260914/pd-r5-smoke-1-recovery.tar.gz \
+  2>&1 | tee local-logs/umbp-kvconnector-reimplementation-20260914/verify-pd-r5.log
+bash local-logs/umbp-kvconnector-reimplementation-20260914/pd-final-audit.sh r5 \
+  2>&1 | tee local-logs/umbp-kvconnector-reimplementation-20260914/pd-r5-final-audit.log
+```
+
+Do not rerun the completed evidence name: select a fresh attempt name and repeat
+the preflight/frozen-manifest/failure-cleanup gates. The controller records
+exact mounts, source paths and runtime commands; the manifest defines all
+expected outcomes without a recompute fallback.
+
+Recovery archive `pd-r5-smoke-1-recovery.tar.gz`: 769,513,919 bytes, SHA256
+`858a2209f741341071aceb6b2dff4a919e3bc9eed461f818bf3db487f5fbfe83`.
+The controller compared the local archive with a second deterministic remote
+stream before deleting `/mnt/umbp-ssd0/umbp-kvc-pd-20260914-r5`. Dead IPC sockets
+were omitted by tar with warnings; all file evidence remains on the VPS.
+Independent audit at 15:28 UTC confirmed the root, labelled Docker resources,
+task listeners and KFD processes absent, all GPU memory back to baseline,
+directory lock available, original image preserved and pre-existing model
+size/config/tokenizer checks unchanged. No weights were downloaded; the protected
+`/shared_vllm/huggingfacehub/models--Qwen--Qwen3-0.6B` tree remains intact. Host 004
+was not used. GEAK evidence/cleanup guidance informed the run; no GEAK agent,
+authentication, host kernel or filesystem provisioning was involved.
+
+Remaining gates include native multi-node/TP and SSD P/D, forced HBM/storage
+pressure, lifetime/fault/corruption cases, hybrid/Kimi state, exact-current
+vLLM native binaries, matched GSM8K, routing/prefetch/llm-d and performance.
+Neither the same-host smoke nor 205 CPU tests complete the implementation goal.
