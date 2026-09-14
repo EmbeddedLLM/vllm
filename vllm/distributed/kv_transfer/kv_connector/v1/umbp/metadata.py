@@ -5,7 +5,10 @@
 from dataclasses import dataclass, field
 from typing import Literal
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorWorkerMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata,
+    KVConnectorWorkerMetadata,
+)
 
 
 @dataclass(frozen=True, order=True)
@@ -23,18 +26,50 @@ class TransferId:
 
 
 @dataclass(frozen=True)
-class BlockTransfer:
-    """A vLLM-owned block hash and the allocated group/block it maps to."""
+class BlockKey:
+    """A vLLM-owned block hash and cache group, without a destination address."""
 
     block_hash: bytes
     group_id: int
-    block_id: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.block_hash, bytes) or not self.block_hash:
             raise ValueError("A transfer needs a nonempty vLLM block hash")
-        if any(type(n) is not int or n < 0 for n in (self.group_id, self.block_id)):
-            raise ValueError("Group and block IDs must be nonnegative integers")
+        if type(self.group_id) is not int or self.group_id < 0:
+            raise ValueError("Group ID must be a nonnegative integer")
+
+
+@dataclass(frozen=True)
+class BlockTransfer(BlockKey):
+    """A vLLM-owned block hash and the allocated group/block it maps to."""
+
+    block_id: int
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if type(self.block_id) is not int or self.block_id < 0:
+            raise ValueError("Block ID must be a nonnegative integer")
+
+
+@dataclass(frozen=True)
+class LookupJob:
+    """Probe each worker's own native pool and compatible shard keys."""
+
+    id: TransferId
+    request_id: str
+    blocks: tuple[BlockKey, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, TransferId):
+            raise ValueError("A lookup needs a generation-scoped ID")
+        if not isinstance(self.request_id, str) or not self.request_id:
+            raise ValueError("A lookup needs a request ID")
+        if (
+            not isinstance(self.blocks, tuple)
+            or not self.blocks
+            or any(type(block) is not BlockKey for block in self.blocks)
+        ):
+            raise ValueError("A lookup needs a nonempty immutable key tuple")
 
 
 @dataclass(frozen=True)
@@ -89,6 +124,7 @@ class UMBPWorkerMetadata(KVConnectorWorkerMetadata):
     completions: dict[TransferId, dict[int, RankCompletion]] = field(
         default_factory=dict
     )
+    retired: dict[TransferId, frozenset[int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for job, ranks in self.completions.items():
@@ -101,6 +137,13 @@ class UMBPWorkerMetadata(KVConnectorWorkerMetadata):
                 for rank, result in ranks.items()
             ):
                 raise ValueError("UMBP feedback needs explicit rank outcomes")
+        for job, retired_ranks in self.retired.items():
+            if (
+                not isinstance(job, TransferId)
+                or not isinstance(retired_ranks, frozenset)
+                or any(type(rank) is not int or rank < 0 for rank in retired_ranks)
+            ):
+                raise ValueError("Retirement feedback needs immutable explicit ranks")
 
     def aggregate(self, other: KVConnectorWorkerMetadata) -> "UMBPWorkerMetadata":
         if not isinstance(other, UMBPWorkerMetadata):
@@ -114,7 +157,10 @@ class UMBPWorkerMetadata(KVConnectorWorkerMetadata):
                         "Conflicting UMBP completion for the same rank/job"
                     )
                 destination[rank] = completion
-        return UMBPWorkerMetadata(merged)
+        retired = dict(self.retired)
+        for job, retired_ranks in other.retired.items():
+            retired[job] = retired.get(job, frozenset()) | retired_ranks
+        return UMBPWorkerMetadata(merged, retired)
 
 
 class CompletionBarrier:
@@ -124,7 +170,7 @@ class CompletionBarrier:
     accessing the retained blocks. Receipts may arrive in different steps.
     """
 
-    def __init__(self, job: TransferJob, ranks: frozenset[int]) -> None:
+    def __init__(self, job: TransferJob | LookupJob, ranks: frozenset[int]) -> None:
         if (
             not isinstance(ranks, frozenset)
             or not ranks
@@ -153,6 +199,71 @@ class CompletionBarrier:
     def done(self) -> bool:
         return self._received.keys() == self.ranks
 
+    def snapshot(self) -> UMBPWorkerMetadata:
+        return UMBPWorkerMetadata({self.job.id: dict(self._received)})
+
     @property
     def succeeded(self) -> bool:
         return self.done and all(result.succeeded for result in self._received.values())
+
+    @property
+    def successes(self) -> tuple[bool, ...]:
+        if not self.done:
+            raise RuntimeError("Cannot publish results before every rank completes")
+        return tuple(
+            all(
+                not result.cancelled and result.successes[i]
+                for result in self._received.values()
+            )
+            for i in range(len(self.job.blocks))
+        )
+
+
+@dataclass(frozen=True)
+class JobOutcome:
+    """Scheduler-authorized finalization, after every rank's last native access."""
+
+    job: TransferJob | LookupJob
+    successes: tuple[bool, ...]
+
+    def __post_init__(self) -> None:
+        RankCompletion(self.successes)
+        if not isinstance(self.job, TransferJob | LookupJob) or (
+            len(self.successes) != len(self.job.blocks)
+        ):
+            raise ValueError("Outcome must describe every object in its job")
+
+
+@dataclass(frozen=True)
+class UMBPConnectorMetadata(KVConnectorMetadata):
+    """One ordered scheduler step; finalizations precede new job admission."""
+
+    epoch: str
+    jobs: tuple[TransferJob | LookupJob, ...] = ()
+    cancelled: tuple[TransferId, ...] = ()
+    finalized: tuple[JobOutcome, ...] = ()
+
+    def __post_init__(self) -> None:
+        TransferId(self.epoch, 0)
+        for values, types in (
+            (self.jobs, (TransferJob, LookupJob)),
+            (self.cancelled, (TransferId,)),
+            (self.finalized, (JobOutcome,)),
+        ):
+            if not isinstance(values, tuple) or any(
+                not isinstance(value, types) for value in values
+            ):
+                raise ValueError("Connector metadata must contain immutable job tuples")
+        ids = tuple(job.id for job in self.jobs)
+        if any(a.sequence >= b.sequence for a, b in zip(ids, ids[1:])):
+            raise ValueError("Jobs must have strictly increasing sequences")
+        all_ids = (
+            *ids,
+            *self.cancelled,
+            *(outcome.job.id for outcome in self.finalized),
+        )
+        if any(job_id.epoch != self.epoch for job_id in all_ids):
+            raise ValueError("Connector metadata mixes engine generations")
+        final_ids = tuple(outcome.job.id for outcome in self.finalized)
+        if len(set(final_ids)) != len(final_ids) or set(ids).intersection(final_ids):
+            raise ValueError("A job cannot be finalized twice or before dispatch")

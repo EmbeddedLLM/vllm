@@ -135,8 +135,8 @@ completion behavior; it is not being relabeled as UMBP offloading.
 | Native API and owned ranged storage | `umbp/store.py`; CPU contracts, then real native pointer tests | CPU contracts implemented; native pending |
 | Explicit storage configuration | `umbp/config.py`; page/scratch checks, DRAM/SSD policy and private-path lifetime | CPU translation/lifetime tests pass; native policy lowering pending |
 | Compatible P/D/offload keys | `umbp/key.py`, `umbp/layout.py`; descriptor integration and identity isolation | Logical rank-local descriptors implemented; scheduler handshake pending |
-| Scheduler lookup and allocation | KVConnector lookup, metadata, block ownership, asynchronous feedback | Pending |
-| Worker load/store and errors | Registered cache views, compute fences, completion snapshots and error block IDs | Transfer component CPU-tested; connector hooks/error-block delivery pending |
+| Scheduler lookup and allocation | KVConnector lookup, metadata, block ownership, asynchronous feedback | Job lifecycle uses real cache-manager pins; request planner/startup wiring pending |
+| Worker load/store and errors | Registered cache views, compute fences, completion snapshots and error block IDs | All-rank finalization/error snapshots CPU-tested through both runner collectors; public connector wiring pending |
 | P/D handoff and incremental transfer | Producer/consumer protocol, all-rank commit, local-prefix reuse, two-engine transfer accounting | Pending |
 | Single-node DRAM and ext4 SSD offload | MoRI embedded deployment, forced eviction, byte/source reconciliation | Pending |
 | Multi-node DRAM/SSD restore | Master-led deployment, peer failures, safe recompute and recovery | Pending |
@@ -367,3 +367,91 @@ failures alongside `config-pre-commit-r4.log`, the passing final lint run.
 Scheduler ownership, worker-layout
 exchange, connector hooks, P/D, native integrity, model validation, routing and
 prefetch remain required work, not waived by these component results.
+
+### Scheduler/worker lifecycle test design
+
+The next component owns scheduler block references and carries bounded lookup,
+transfer and finalization jobs through existing connector metadata. Inputs are
+vLLM cache records/allocated destinations and generation-scoped worker receipts;
+outputs are immutable job batches, all-rank outcomes and receive/error snapshots.
+Tests must catch premature reuse after request free/preemption, shared-prefix
+overwrite, wrong cache-record identities, rank failure/replay and publication
+before all native accesses end. Use the real KVCacheManager/BlockPool and existing
+CPU worker/native fixtures first, then the actual model-runner output collector.
+These composed tests are still not model serving or a complete P/D protocol.
+
+## Fourth implementation checkpoint: scheduler ownership and runner snapshots
+
+`umbp/scheduler.py` now owns bounded lookup/transfer jobs against a real
+`KVCacheManager`. Store sources must match actual group/hash cache records;
+load destinations must belong to the request, be exclusively owned and not
+already published to prefix caching. Every job pins its exact physical GPU
+blocks. Request free/cancellation does not release native ownership, and a
+same-string request ID cannot cancel a different Request incarnation. Only one
+receive job may be outstanding per request because the runner completion API
+identifies requests rather than individual jobs.
+
+`umbp/lifecycle.py` translates ordered job metadata into the existing transfer
+worker, bounded native lookups, per-rank receipts and runner completion/error
+snapshots. Each rank looks up its own compatible keys, so masterless private
+worker pools are not incorrectly treated as a rank-0 shared store. All-rank
+per-object conjunction determines lookup results. Queue pressure retries within
+the admitted set; cancellation drains running lookups and never invents hits.
+
+The receive lifecycle deliberately retains ownership through error delivery:
+
+```text
+scheduler pins exact blocks -> worker compute fence -> native operation
+            |                                             |
+            |                      every rank reports terminal object results
+            |                                             |
+            +-> scheduler sends all-rank finalization <----+
+                                  |
+                workers emit finished_recving + invalid block IDs
+                                  |
+                retirement acknowledgements in the same output snapshots
+                                  |
+                scheduler consumes snapshots, then releases load pins
+```
+
+Stores can release their pins after all native completions, but receives keep
+them until every finalization snapshot has been consumed. This closes the gap
+where an old failed-load block ID could otherwise be reused before the scheduler
+handles its error. Completed jobs continue counting against admission until
+retirement; empty engine steps remain necessary while any phase is pending.
+Duplicate rank feedback is idempotent, and a malformed feedback batch cannot
+partially release other jobs' references. Rejected worker transfers still wait
+for their compute fence before issuing failure receipts.
+
+Validation: **164 CPU tests passed**, 15 expected warnings, 16.12 seconds,
+in `cpu-tests-r11.log` on the VPS. This includes 161 UMBP component/composed
+tests, two existing output-aggregator regressions, and the unchanged connector
+metadata-cleanup regression. The final run used `HF_HUB_OFFLINE=1`: no model
+or configuration was downloaded. Both v1's `KVConnectorModelRunnerMixin` and
+v2's `ActiveKVConnector` collect real lifecycle completion/error/retirement
+snapshots through a thin mock connector wrapper. GPU execution and native MoRI
+remain fakes; these are not full Scheduler request-state or model-serving tests.
+
+```bash
+set -o pipefail
+TEST_VENV=/home/ubuntu/vllmumbp/repos/vllm/.venv
+HF_HUB_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 "$TEST_VENV/bin/python" -m pytest \
+  --confcutdir=tests/v1/kv_connector/unit \
+  tests/v1/kv_connector/unit/test_umbp_config.py \
+  tests/v1/kv_connector/unit/test_umbp_store.py \
+  tests/v1/kv_connector/unit/test_umbp_key.py \
+  tests/v1/kv_connector/unit/test_umbp_layout.py \
+  tests/v1/kv_connector/unit/test_umbp_worker.py \
+  tests/v1/kv_connector/unit/test_umbp_lifecycle.py \
+  tests/v1/kv_connector/unit/test_output_aggregator.py \
+  tests/v1/kv_connector/unit/test_kv_connector_lifecycle.py -q
+```
+
+There is still **no registered or usable UMBPConnector**. The next work must
+connect request planning, worker initialization/layout handshake and actual GPU
+event creation to these components, then implement the P/D handle/readiness
+protocol and missing-prefix-only loading. A transfer finalization is not a
+published P/D readiness record. Hybrid boundary selection, request-scoped
+non-prefix state, host-pool-qualified IDs, native integrity and model/accuracy/
+performance evidence remain required. Do not treat unsupported configurations
+as waived requirements or offer a serving command that does not yet work.

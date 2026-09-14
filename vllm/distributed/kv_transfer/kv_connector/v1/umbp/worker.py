@@ -14,6 +14,7 @@ from typing import Protocol
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.key import UMBPKeySpace
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.layout import UMBPLayout
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.metadata import (
+    BlockKey,
     RankCompletion,
     TransferId,
     TransferJob,
@@ -116,6 +117,34 @@ class UMBPTransferWorker:
         except Exception:
             store.close()
             raise
+
+    @property
+    def epoch(self) -> str:
+        return self._epoch
+
+    @property
+    def rank(self) -> int:
+        return self._rank
+
+    def lookup(self, blocks: tuple[BlockKey, ...]) -> Future[tuple[bool, ...]]:
+        """Probe this rank's own pool; scheduler combines results from all ranks."""
+        if self._closed:
+            raise RuntimeError("UMBP transfer worker is closed")
+        assert self._layout is not None
+        if not isinstance(blocks, tuple) or any(
+            type(block) is not BlockKey
+            or block.group_id not in self._layout.prefix_cacheable_group_ids
+            for block in blocks
+        ):
+            raise ValueError("Lookup requires immutable prefix-cacheable keys")
+        return self._store.lookup(
+            tuple(
+                self._keyspace.block_key(
+                    block.block_hash, group=block.group_id, shard=self._rank
+                )
+                for block in blocks
+            )
+        )
 
     def submit(self, job: TransferJob, fence: ComputeFence) -> bool:
         """Admit an immutable job; caller has already pinned its GPU blocks."""
