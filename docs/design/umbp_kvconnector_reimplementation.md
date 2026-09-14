@@ -1,6 +1,6 @@
 # UMBP reimplementation through KVConnectors
 
-Status: **in progress; offload request hooks CPU-tested, native serving and P/D pending**.
+Status: **in progress; dense offload and P/D hooks CPU-tested, native serving pending**.
 
 ## Target and preserved baseline
 
@@ -135,9 +135,9 @@ completion behavior; it is not being relabeled as UMBP offloading.
 | Native API and owned ranged storage | `umbp/store.py`; CPU contracts, then real native pointer tests | CPU contracts implemented; native pending |
 | Explicit storage configuration | `umbp/config.py`; page/scratch checks, DRAM/SSD policy and private-path lifetime | CPU translation/lifetime tests pass; native policy lowering pending |
 | Compatible P/D/offload keys | `umbp/key.py`, `umbp/layout.py`; descriptor integration and identity isolation | Worker-derived namespace handshake and fresh generation exchange implemented for matching TP; native verification pending |
-| Scheduler lookup and allocation | KVConnector lookup, metadata, block ownership, asynchronous feedback | Dense offload planner exercised through real Scheduler; hybrid/P-D planners pending |
+| Scheduler lookup and allocation | KVConnector lookup, metadata, block ownership, asynchronous feedback | Dense offload and P/D planners exercised through real Scheduler; hybrid boundaries pending |
 | Worker load/store and errors | Registered cache views, compute fences, completion snapshots and error block IDs | Real connector hooks and post-forward event recording wired; CPU runner tests pass, native GPU ordering pending |
-| P/D handoff and incremental transfer | Producer/consumer protocol, all-rank commit, local-prefix reuse, two-engine transfer accounting | Pending |
+| P/D handoff and incremental transfer | Producer/consumer protocol, all-rank commit, local-prefix reuse, two-engine transfer accounting | Dense finish-time export and readiness-gated receive CPU-tested; native two-engine and hybrid handoff pending |
 | Single-node DRAM and ext4 SSD offload | MoRI embedded deployment, forced eviction, byte/source reconciliation | Pending |
 | Multi-node DRAM/SSD restore | Master-led deployment, peer failures, safe recompute and recovery | Pending |
 | TP and hybrid cache geometry | Exact layouts, complete group/shard restoration, cancellation and preemption | Layout/rank barriers and unequal dense-group scheduler tests pass; native TP and hybrid boundary semantics pending |
@@ -567,3 +567,127 @@ that protocol; PP/CP/speculative support and integrity checks remain required.
 Native MoRI lifecycle, SSD/RDMA/TP, Qwen/GSM8K/Kimi, placement/routing/prefetch and
 llm-d gates are unchanged. No remote state or model weights were created by this
 checkpoint, and all evidence remains on the VPS.
+
+### P/D protocol test design
+
+Add producer finish-time export and consumer readiness-gated loads through the
+existing connector jobs. Inputs are a versioned namespace/boundary-hash handle,
+real cache records and all-rank receipts; outputs are ready markers, incremental
+loads and the existing finished-sending/receive-error snapshots. Tests must catch
+early readiness, missing ranks, failed stores, stale/mismatched handles, deadline
+fallback, cancellation and source reuse before native completion. Reuse the CPU
+worker fixtures and real Scheduler harness, with distinct prefill/decode engines
+and the producer's actual EngineCoreOutput transfer parameters. Those tests do
+not establish native/model correctness. MoRI's pinned Python binding has no
+per-key delete/TTL: markers are immutable pool objects with logical handle expiry,
+reclaimed by ordinary eviction/client teardown, not by clearing shared state.
+
+Extend the existing two-worker job fixture to verify that a delayed final rank
+prevents readiness and that any rank's export failure selects release rather
+than publication. Use the real single-worker Scheduler pair for stale identity,
+expiry, eviction after readiness, configured receive-error policy and aborts
+during a blocked existence probe. The observable contract is no early GET,
+no compute on unreceived KV, and no leaked/reused allocation ownership. These
+tests need CPU buffers and controlled native barriers, not a new model harness.
+
+## Sixth implementation checkpoint: dense P/D handoff
+
+`umbp/protocol.py` defines a strict versioned handle with a compatible namespace,
+producer generation, unique nonce, chained prefix boundary hash and expiry.
+`umbp/pd.py` plans producer export and decoder receive through the same bounded
+job ledger as ordinary offload. The connector uses existing request-finish
+holds, worker metadata and finished-sending/receive-error APIs; there are no new
+UMBP-only engine-core RPCs or synthetic prefetch requests in this checkpoint.
+
+### Handoff and ownership
+
+1. The producer finishes prefill and returns its handle in the actual
+   `EngineCoreOutput.kv_transfer_params`. Returning `True` from the finish hook
+   retains the source allocation. The handle is not a readiness claim.
+2. Workers export complete aligned prefix objects after their compute fences.
+   Only the scheduler's successful all-rank/all-object outcome admits a ready
+   marker publication job. Failed or expired exports instead admit release.
+3. Each producer worker publishes a one-byte immutable marker in its shard key
+   space. Control-job finalization emits finished-sending on every rank, after
+   which the normal Scheduler frees the held producer allocation.
+4. The decoder validates namespace, schema, boundary hash, alignment and expiry,
+   then allocates only the missing prefix beyond its valid local cache. Workers
+   wait for their rank's marker before issuing native GETs. The Scheduler does
+   not execute a request while its receive is pending.
+5. Receives use the existing all-rank finalization and error-snapshot retirement
+   barriers. Missing/evicted objects and allocated-receive timeouts honor vLLM's
+   `kv_load_failure_policy` (`recompute` or `fail`). Invalid hints detected before
+   allocation are advisory misses and use local compute, not receive failures.
+
+Existence probes carry no KV pointers. A cancelled/expired receive can retire
+before a blocked existence call returns; the store still owns/counts that call
+and drains it at shutdown. A running GET is different: cancellation or timeout
+must not release its destination while native code may still write it.
+
+### Development configuration and request contract
+
+Use the existing module-path connector configuration from checkpoint five.
+The additional options in `kv_connector_extra_config` are:
+
+| Option | Contract |
+| --- | --- |
+| `enable_pd` | Boolean; defaults to true for `kv_producer`/`kv_consumer`, false for `kv_both`. Explicitly disabling it with a P/D-only role is rejected. |
+| `handoff_timeout` | Seconds in `(0, 3600]`, default 30. Bounds producer handle acceptance and pre-GET readiness waiting, not running native memory access. |
+| `storage.master_address`, `nodes` | P/D requires a shared master and explicit unique peer identity/endpoints per TP rank. Embedded offload remains supported without P/D. |
+
+For the tested producer path, set `max_tokens=1` and request
+`kv_transfer_params={"do_remote_decode": true}`. Pass the returned transfer
+parameters unchanged to the consumer, along with the prompt **including the
+producer's first sampled token**. The returned parameters set
+`do_remote_prefill=true` and contain `umbp_handoff`; do not reconstruct or invent
+that handle in a router. The CPU tests exercise EngineCoreOutput, not an HTTP
+proxy. Native HTTP/proxy and llm-d integration remain separate validation work.
+
+`kv_both` with `enable_pd=true` accepts per-request P/D flags while ordinary
+requests still use offload. Enabling P/D on a producer-capable engine advertises
+mandatory KV delivery to the Scheduler; per-request export still requires the
+explicit flag. `kv_both` with P/D disabled keeps the prior offload behavior.
+
+Export boundaries are rounded down to the least common multiple of dense group
+block sizes. A 16-token prompt with 4-token blocks transfers at most 16 prefix
+tokens and the decoder computes the producer's sampled token. For a 13-token
+prompt, it transfers at most 12 and computes two tokens (partial tail plus the
+sampled token). A valid decoder-local prefix reduces actual GET object counts.
+This is not zero-recompute handoff for arbitrary hybrid or partial boundary state.
+Independent engines also need matching hash algorithms and hash seeds: a shared
+CPU test process does not validate cross-process hash initialization.
+
+### Evidence and remaining gates
+
+`cpu-tests-r16.log`: **199 passed**, 15 expected warnings, 18.27 seconds, using
+the eight-suite offline command from checkpoint four. This includes 16 P/D
+cases and ordinary offload with P/D enabled/disabled. To isolate the P/D cases:
+
+```bash
+HF_HUB_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 \
+  /home/ubuntu/vllmumbp/repos/vllm/.venv/bin/python -m pytest \
+  --confcutdir=tests/v1/kv_connector/unit \
+  tests/v1/kv_connector/unit/test_umbp_lifecycle.py -k test_pd_ -q
+```
+
+The two-worker component test proves that a delayed rank prevents publication
+and any export failure selects release. Separate single-worker Scheduler pairs
+prove handle-before-readiness ordering, byte-correct missing-prefix loads,
+partial tails, unequal dense groups, invalid handles, post-readiness eviction,
+recompute/fail behavior and aborts during blocked readiness probes. The tests
+use real CPU buffers/cache managers and fake native I/O, GPU events and model
+bytes/tokens. They establish neither real TP/P-D transport nor model accuracy.
+The failed r15 run was a test-fixture argument error, corrected in r16; it is
+retained as failed evidence. The earlier mypy fixture annotation is corrected.
+
+MoRI remains unchanged at the pinned release. Its Python client lacks per-key
+delete/TTL, so logical expiry does not reclaim ready objects. Native retention
+under pressure, bounded marker metadata, teardown and ranged-SSD CRC integrity
+still require proof or implementation changes. Never clear a shared pool to
+clean up one request. Clock skew may reduce handle availability; no clock or
+deadline grants permission to reuse incompatible KV or free in-flight buffers.
+
+Native GPU/DRAM/ext4 SSD and two-node serving, Qwen/GSM8K/Kimi, hybrid/non-prefix
+boundary semantics, parallel/speculative modes, routing and CPU/HBM prefetch
+remain required. No native MoRI, remote host or model workload was used for this
+checkpoint. All logs remain on the VPS; no remote residue was created.

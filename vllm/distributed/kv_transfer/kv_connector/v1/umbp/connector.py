@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Opt-in UMBP KVConnector wiring, pending native serving validation.
 
-Use the external module-path mechanism during development. The current request
-planner implements dense full-attention/MLA offload, not P/D handoff or hybrid
-state. Reject those modes explicitly rather than advertise incomplete delivery.
+Use the external module-path mechanism during development. Dense full-attention
+and MLA use the offload planner and optional pool-mediated P/D protocol. Hybrid
+boundary state and unvalidated parallel modes remain explicitly rejected.
 """
 
 import hashlib
@@ -40,6 +40,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.metadata import (
     UMBPConnectorMetadata,
     UMBPWorkerMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.umbp.pd import UMBPHandoffPlanner
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.planner import UMBPRequestPlanner
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.scheduler import (
     UMBPTransferScheduler,
@@ -98,6 +99,8 @@ class UMBPConnector(KVConnectorBase_V1, SupportsHMA):
             "storage",
             "nodes",
             "lookup_timeout",
+            "enable_pd",
+            "handoff_timeout",
         }
         if extra.keys() - allowed:
             raise ValueError(f"Unknown UMBP options: {sorted(extra.keys() - allowed)}")
@@ -120,8 +123,19 @@ class UMBPConnector(KVConnectorBase_V1, SupportsHMA):
         ):
             raise ValueError("lookup_timeout must be positive and finite")
         self._lookup_timeout = float(timeout)
-        if self._kv_transfer_config.kv_role != "kv_both":
-            raise ValueError("P/D roles require the pending UMBP handoff protocol")
+        self._enable_pd = extra.get(
+            "enable_pd", self._kv_transfer_config.kv_role != "kv_both"
+        )
+        if type(self._enable_pd) is not bool:
+            raise ValueError("enable_pd must be a boolean")
+        if not self._enable_pd and self._kv_transfer_config.kv_role != "kv_both":
+            raise ValueError("P/D roles require enable_pd")
+        timeout = extra.get("handoff_timeout", 30.0)
+        if type(timeout) not in (int, float) or not 0 < timeout <= 3600:
+            raise ValueError("handoff_timeout must be in (0, 3600] seconds")
+        self._handoff_timeout = float(timeout)
+        if self._enable_pd and not self._storage_config.master_address:
+            raise ValueError("P/D handoff requires a shared UMBP master")
         parallel = vllm_config.parallel_config
         if (
             parallel.pipeline_parallel_size != 1
@@ -197,11 +211,12 @@ class UMBPConnector(KVConnectorBase_V1, SupportsHMA):
         self._layout: UMBPLayout | None = None
         self._keyspace: UMBPKeySpace | None = None
         self._worker: UMBPWorkerLifecycle | None = None
+        self._handoff: UMBPHandoffPlanner | None = None
         self._closed = False
 
     @property
     def requires_kv_delivery(self) -> bool:
-        return False  # Best-effort offload, not mandatory P/D delivery.
+        return self._enable_pd and self._kv_transfer_config.is_kv_producer
 
     def set_xfer_handshake_metadata(
         self, metadata: dict[int, KVConnectorHandshakeMetadata]
@@ -238,10 +253,20 @@ class UMBPConnector(KVConnectorBase_V1, SupportsHMA):
             ranks=ranks,
             max_pending=self._storage_config.max_pending,
         )
+        if self._enable_pd:
+            self._handoff = UMBPHandoffPlanner(
+                self._kv_cache_manager,
+                self._transfers,
+                namespace=values[0].namespace,
+                producer=self._kv_transfer_config.is_kv_producer,
+                consumer=self._kv_transfer_config.is_kv_consumer,
+                timeout=self._handoff_timeout,
+            )
         self._planner = UMBPRequestPlanner(
             self._kv_cache_manager,
             self._transfers,
             lookup_timeout=self._lookup_timeout,
+            handoff=self._handoff,
         )
 
     def on_new_request(self, request: Request) -> None:
@@ -282,14 +307,17 @@ class UMBPConnector(KVConnectorBase_V1, SupportsHMA):
         self, request: Request, block_ids: tuple[list[int], ...]
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self._planner is not None
-        self._planner.request_finished(request)
-        return False, None
+        return self._planner.request_finished(request)
 
     def has_pending_push_work(self) -> bool:
-        return self._transfers is not None and self._transfers.has_pending_push_work()
+        return (
+            self._transfers is not None and self._transfers.has_pending_push_work()
+        ) or (self._handoff is not None and self._handoff.has_pending())
 
     def has_pending_block_frees(self) -> bool:
-        return self._transfers is not None and self._transfers.has_pending_block_frees()
+        return (
+            self._transfers is not None and self._transfers.has_pending_block_frees()
+        ) or (self._handoff is not None and self._handoff.has_pending())
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if (

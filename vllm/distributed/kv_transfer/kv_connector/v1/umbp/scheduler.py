@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.metadata import (
     BlockKey,
     BlockTransfer,
     CompletionBarrier,
+    ControlJob,
     JobOutcome,
     LookupJob,
     TransferId,
@@ -22,6 +23,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.metadata import (
     UMBPConnectorMetadata,
     UMBPWorkerMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.umbp.protocol import HandoffHandle
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -87,6 +89,30 @@ class UMBPTransferScheduler:
         """Check capacity on the scheduler thread before allocating a receive."""
         return self._has_capacity()
 
+    @property
+    def epoch(self) -> str:
+        return self._epoch
+
+    def control(
+        self,
+        request: Request,
+        handle: HandoffHandle,
+        operation: Literal["publish", "release"],
+    ) -> ControlJob | None:
+        job = ControlJob(
+            TransferId(self._epoch, self._sequence),
+            request.request_id,
+            handle,
+            operation,
+        )
+        if not self._has_capacity():
+            return None
+        self._pending[job.id] = _PendingJob(
+            request, CompletionBarrier(job, self._ranks)
+        )
+        self._sequence += 1
+        return job
+
     def lookup(self, request: Request, keys: tuple[BlockKey, ...]) -> LookupJob | None:
         job = LookupJob(
             TransferId(self._epoch, self._sequence), request.request_id, keys
@@ -106,12 +132,17 @@ class UMBPTransferScheduler:
         request: Request,
         operation: Literal["load", "store"],
         blocks: tuple[BlockTransfer, ...],
+        *,
+        handoff: HandoffHandle | None = None,
+        readiness_timeout: float = 30.0,
     ) -> TransferJob | None:
         job = TransferJob(
             TransferId(self._epoch, self._sequence),
             request.request_id,
             operation,
             blocks,
+            handoff,
+            readiness_timeout,
         )
         if not self._has_capacity():
             return None

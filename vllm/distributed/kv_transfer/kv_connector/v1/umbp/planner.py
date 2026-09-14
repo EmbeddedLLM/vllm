@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Request planning for immutable full-attention/MLA group blocks.
 
-This planner is the ordinary offload path, not the P/D ready-record protocol.
+Ordinary offload and optional P/D handoff share the transfer ownership ledger.
 Hybrid checkpoint and non-prefix state must not silently use this dense-prefix
 algorithm. The connector rejects those configurations until their planner lands.
 """
@@ -10,15 +10,18 @@ algorithm. The connector rejects those configurations until their planner lands.
 import time
 from dataclasses import dataclass
 from math import lcm
+from typing import Any
 
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.metadata import (
     BlockKey,
     BlockTransfer,
+    ControlJob,
     JobOutcome,
     LookupJob,
     TransferId,
     UMBPConnectorMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.umbp.pd import UMBPHandoffPlanner
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.scheduler import (
     UMBPTransferScheduler,
 )
@@ -54,9 +57,11 @@ class UMBPRequestPlanner:
         transfers: UMBPTransferScheduler,
         *,
         lookup_timeout: float = 5.0,
+        handoff: UMBPHandoffPlanner | None = None,
     ) -> None:
         self.manager = manager
         self.transfers = transfers
+        self.handoff = handoff
         self._sizes = tuple(
             group.kv_cache_spec.block_size
             for group in manager.kv_cache_config.kv_cache_groups
@@ -86,6 +91,8 @@ class UMBPRequestPlanner:
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         self.on_new_request(request)
+        if self.handoff is not None and self.handoff.is_receiver(request):
+            return self.handoff.get_num_new_matched_tokens(request, num_computed_tokens)
         if not self.manager.prefix_cache_lookup_enabled(request):
             return 0, False
         # Follow the ordinary prefix-cache contract: leave logits to a forward.
@@ -140,6 +147,9 @@ class UMBPRequestPlanner:
         self.on_new_request(request)
         if not num_external_tokens:
             return
+        if self.handoff is not None and self.handoff.is_receiver(request):
+            self.handoff.update_state_after_alloc(request, blocks, num_external_tokens)
+            return
         lookup = self._lookups[request.request_id]
         if (
             lookup.allocated
@@ -178,11 +188,17 @@ class UMBPRequestPlanner:
 
     def update_connector_output(self, output: KVConnectorOutput) -> None:
         for outcome in self.transfers.update_connector_output(output):
+            if self.handoff is not None:
+                self.handoff.update_outcome(outcome)
+            if isinstance(outcome.job, ControlJob):
+                continue
             if isinstance(outcome.job, LookupJob):
                 self._lookup_done(outcome)
             elif outcome.job.operation == "load":
                 lookup = self._lookups.get(outcome.job.request_id)
-                if lookup is not None and lookup.load_job == outcome.job.id:
+                if (lookup is not None and lookup.load_job == outcome.job.id) or (
+                    self.handoff is not None and self.handoff.owns_receive(outcome.job)
+                ):
                     # Do not immediately PUT objects just restored from this
                     # pool. Failed objects remain eligible after recompute.
                     loaded = self._saved.setdefault(outcome.job.request_id, set())
@@ -205,6 +221,10 @@ class UMBPRequestPlanner:
                         if not success:
                             saved.discard(BlockKey(block.block_hash, block.group_id))
                             self._save_cursor.pop(outcome.job.request_id, None)
+        for request_id in output.finished_sending or ():
+            if self.handoff is not None:
+                self.handoff.finished_sending(request_id)
+            self._forget(request_id)
 
     def build_connector_meta(self, output: SchedulerOutput) -> UMBPConnectorMetadata:
         for request_id in output.preempted_req_ids or ():
@@ -213,8 +233,14 @@ class UMBPRequestPlanner:
             self._lookups.pop(request_id, None)
             self._saved.pop(request_id, None)
             self._save_cursor.pop(request_id, None)
+            if self.handoff is not None:
+                self.handoff.preempted(request_id)
+        if self.handoff is not None:
+            self.handoff.build_jobs()
         for request_id, count in output.num_scheduled_tokens.items():
             request = self._requests[request_id]
+            if self.handoff is not None and self.handoff.is_sender(request):
+                continue  # Mandatory export is owned by request_finished.
             # Scheduler counters advance after this hook. Speculative decoding
             # is rejected at startup until committed-token save planning lands.
             end = min(request.num_computed_tokens + count, request.num_tokens)
@@ -247,14 +273,22 @@ class UMBPRequestPlanner:
                 saved.update(BlockKey(item.block_hash, item.group_id) for item in items)
         return self.transfers.build_connector_meta()
 
-    def request_finished(self, request: Request) -> None:
+    def request_finished(self, request: Request) -> tuple[bool, dict[str, Any] | None]:
         # Finished stores retain their own references; aborts suppress them.
         if request.status in (
             RequestStatus.FINISHED_ABORTED,
             RequestStatus.FINISHED_ERROR,
         ):
             self.transfers.cancel_request(request)
-        self._requests.pop(request.request_id, None)
-        self._lookups.pop(request.request_id, None)
-        self._saved.pop(request.request_id, None)
-        self._save_cursor.pop(request.request_id, None)
+        result = (
+            self.handoff.request_finished(request) if self.handoff else (False, None)
+        )
+        if not result[0]:
+            self._forget(request.request_id)
+        return result
+
+    def _forget(self, request_id: str) -> None:
+        self._requests.pop(request_id, None)
+        self._lookups.pop(request_id, None)
+        self._saved.pop(request_id, None)
+        self._save_cursor.pop(request_id, None)

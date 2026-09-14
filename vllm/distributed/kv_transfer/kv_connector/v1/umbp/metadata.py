@@ -9,6 +9,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorWorkerMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.umbp.protocol import HandoffHandle
 
 
 @dataclass(frozen=True, order=True)
@@ -71,6 +72,10 @@ class LookupJob:
         ):
             raise ValueError("A lookup needs a nonempty immutable key tuple")
 
+    @property
+    def num_objects(self) -> int:
+        return len(self.blocks)
+
 
 @dataclass(frozen=True)
 class TransferJob:
@@ -80,6 +85,8 @@ class TransferJob:
     request_id: str
     operation: Literal["load", "store"]
     blocks: tuple[BlockTransfer, ...]
+    handoff: HandoffHandle | None = None
+    readiness_timeout: float = 30.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, TransferId):
@@ -94,6 +101,44 @@ class TransferJob:
             or any(not isinstance(block, BlockTransfer) for block in self.blocks)
         ):
             raise ValueError("A transfer needs a nonempty immutable block tuple")
+        if self.handoff is not None:
+            if self.operation != "load" or not isinstance(self.handoff, HandoffHandle):
+                raise ValueError("Only a load can wait on a P/D handoff")
+            if (
+                type(self.readiness_timeout) not in (int, float)
+                or not 0 < self.readiness_timeout <= 3600
+            ):
+                raise ValueError("Readiness timeout must be in (0, 3600] seconds")
+
+    @property
+    def num_objects(self) -> int:
+        return len(self.blocks)
+
+
+@dataclass(frozen=True)
+class ControlJob:
+    """Publish per-rank readiness, or release a failed producer without it."""
+
+    id: TransferId
+    request_id: str
+    handle: HandoffHandle
+    operation: Literal["publish", "release"]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, TransferId) or not isinstance(
+            self.handle, HandoffHandle
+        ):
+            raise ValueError(
+                "Control jobs require typed generation and handoff identities"
+            )
+        if not isinstance(self.request_id, str) or not self.request_id:
+            raise ValueError("Control jobs require a request ID")
+        if self.operation not in ("publish", "release"):
+            raise ValueError("Unknown UMBP control operation")
+
+    @property
+    def num_objects(self) -> int:
+        return 1
 
 
 @dataclass(frozen=True)
@@ -170,7 +215,9 @@ class CompletionBarrier:
     accessing the retained blocks. Receipts may arrive in different steps.
     """
 
-    def __init__(self, job: TransferJob | LookupJob, ranks: frozenset[int]) -> None:
+    def __init__(
+        self, job: TransferJob | LookupJob | ControlJob, ranks: frozenset[int]
+    ) -> None:
         if (
             not isinstance(ranks, frozenset)
             or not ranks
@@ -187,7 +234,7 @@ class CompletionBarrier:
             if (
                 type(rank) is not int
                 or rank not in self.ranks
-                or len(result.successes) != len(self.job.blocks)
+                or len(result.successes) != self.job.num_objects
             ):
                 raise ValueError("UMBP completion disagrees with the submitted job")
             if rank in received and received[rank] != result:
@@ -215,7 +262,7 @@ class CompletionBarrier:
                 not result.cancelled and result.successes[i]
                 for result in self._received.values()
             )
-            for i in range(len(self.job.blocks))
+            for i in range(self.job.num_objects)
         )
 
 
@@ -223,13 +270,13 @@ class CompletionBarrier:
 class JobOutcome:
     """Scheduler-authorized finalization, after every rank's last native access."""
 
-    job: TransferJob | LookupJob
+    job: TransferJob | LookupJob | ControlJob
     successes: tuple[bool, ...]
 
     def __post_init__(self) -> None:
         RankCompletion(self.successes)
-        if not isinstance(self.job, TransferJob | LookupJob) or (
-            len(self.successes) != len(self.job.blocks)
+        if not isinstance(self.job, TransferJob | LookupJob | ControlJob) or (
+            len(self.successes) != self.job.num_objects
         ):
             raise ValueError("Outcome must describe every object in its job")
 
@@ -239,7 +286,7 @@ class UMBPConnectorMetadata(KVConnectorMetadata):
     """One ordered scheduler step; finalizations precede new job admission."""
 
     epoch: str
-    jobs: tuple[TransferJob | LookupJob, ...] = ()
+    jobs: tuple[TransferJob | LookupJob | ControlJob, ...] = ()
     cancelled: tuple[TransferId, ...] = ()
     finalized: tuple[JobOutcome, ...] = ()
     worker_generations: tuple[str, ...] = ()
@@ -251,7 +298,7 @@ class UMBPConnectorMetadata(KVConnectorMetadata):
         ):
             raise ValueError("Worker generations must be immutable nonempty strings")
         for values, types in (
-            (self.jobs, (TransferJob, LookupJob)),
+            (self.jobs, (TransferJob, LookupJob, ControlJob)),
             (self.cancelled, (TransferId,)),
             (self.finalized, (JobOutcome,)),
         ):

@@ -7,6 +7,8 @@ must retain cache-manager blocks until the all-rank completion barrier passes.
 Calls into this component are serialized by the model-runner thread.
 """
 
+import ctypes
+import time
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Protocol
@@ -15,12 +17,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.key import UMBPKeySpace
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.layout import UMBPLayout
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.metadata import (
     BlockKey,
+    ControlJob,
     RankCompletion,
     TransferId,
     TransferJob,
     UMBPWorkerMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.store import (
+    BufferSlice,
+    MemoryRegion,
     StoreBusyError,
     TransferObject,
     UMBPStore,
@@ -43,6 +48,10 @@ class _Pending:
     fence: ComputeFence
     future: Future[tuple[bool, ...]] | None = None
     cancelled: bool = False
+    ready_future: Future[tuple[bool, ...]] | None = None
+    ready: bool = False
+    deadline: float = 0.0
+    next_probe: float = 0.0
 
 
 def _ranges(objects: tuple[TransferObject, ...]) -> tuple[tuple[int, int], ...]:
@@ -111,6 +120,7 @@ class UMBPTransferWorker:
         self._highest_sequence = -1
         self._pending: dict[TransferId, _Pending] = {}
         self._closed = False
+        self._ready_region: MemoryRegion | None = None
         try:
             for region in layout.regions:
                 store.register_region(region)
@@ -146,6 +156,47 @@ class UMBPTransferWorker:
             )
         )
 
+    def control(self, job: ControlJob) -> Future[tuple[bool, ...]]:
+        """Use the same bounded store for immutable one-byte ready markers."""
+        if self._closed or job.id.epoch != self._epoch:
+            raise ValueError("Control job belongs to a closed or different worker")
+        if job.handle.namespace != self._keyspace.prefix:
+            raise ValueError("Readiness namespace disagrees with the worker layout")
+        if job.operation == "release" or time.time() * 1000 >= job.handle.expires_at_ms:
+            result: Future[tuple[bool, ...]] = Future()
+            result.set_result((job.operation == "release",))
+            return result
+        if self._ready_region is None:
+            owner = ctypes.create_string_buffer(4096)
+            owner[0] = b"\x01"
+            region = MemoryRegion(ctypes.addressof(owner), 4096, owner)
+            self._store.register_region(region)
+            self._ready_region = region
+        region = self._ready_region
+        return self._store.store(
+            (
+                TransferObject(
+                    job.handle.ready_key(self._rank),
+                    1,
+                    (BufferSlice(region, 0, 1, 0),),
+                ),
+            )
+        )
+
+    def _ready(self, pending: _Pending) -> bool:
+        handle = pending.job.handoff
+        if handle is None or pending.ready:
+            return True
+        if pending.ready_future is None:
+            if time.monotonic() < pending.next_probe:
+                return False
+            pending.ready_future = self._store.lookup((handle.ready_key(self._rank),))
+        if pending.ready_future.done():
+            pending.ready = pending.ready_future.result() == (True,)
+            pending.ready_future = None
+            pending.next_probe = time.monotonic() + 0.01
+        return pending.ready
+
     def submit(self, job: TransferJob, fence: ComputeFence) -> bool:
         """Admit an immutable job; caller has already pinned its GPU blocks."""
         if self._closed:
@@ -162,6 +213,8 @@ class UMBPTransferWorker:
         if len(self._pending) >= self._max_pending:
             return False
         assert self._layout is not None
+        if job.handoff is not None and job.handoff.namespace != self._keyspace.prefix:
+            raise ValueError("Handoff namespace disagrees with the worker layout")
         if any(
             block.group_id not in self._layout.prefix_cacheable_group_ids
             for block in job.blocks
@@ -183,7 +236,13 @@ class UMBPTransferWorker:
                 ranges, other.ranges
             ):
                 return False
-        self._pending[job.id] = _Pending(job, objects, ranges, fence)
+        self._pending[job.id] = _Pending(
+            job,
+            objects,
+            ranges,
+            fence,
+            deadline=time.monotonic() + job.readiness_timeout,
+        )
         self._highest_sequence = job.id.sequence
         return True
 
@@ -193,6 +252,8 @@ class UMBPTransferWorker:
             pending.cancelled = True
             if pending.future is not None:
                 pending.future.cancel()
+            if pending.ready_future is not None:
+                pending.ready_future.cancel()
 
     def poll(self) -> UMBPWorkerMetadata:
         """Return each local completion once, after its final native access."""
@@ -205,10 +266,21 @@ class UMBPTransferWorker:
                 # that prior GPU work stopped touching the retained allocation.
                 if not pending.fence.query():
                     continue
-                if pending.cancelled:
+                expired = pending.job.handoff is not None and (
+                    time.monotonic() >= pending.deadline
+                    or time.time() * 1000 >= pending.job.handoff.expires_at_ms
+                )
+                if pending.cancelled or expired:
+                    # An existence probe owns no KV addresses. The store keeps
+                    # its native call alive/bounded and drains it at shutdown;
+                    # this load can fail safely before any KV read was issued.
+                    if pending.ready_future is not None:
+                        pending.ready_future.cancel()
                     result = failed
                 else:
                     try:
+                        if not self._ready(pending):
+                            continue
                         operation = (
                             self._store.load
                             if pending.job.operation == "load"
@@ -241,3 +313,4 @@ class UMBPTransferWorker:
         self._store.close()
         self._pending.clear()
         self._layout = None
+        self._ready_region = None

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorTransferResults
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.metadata import (
+    ControlJob,
     LookupJob,
     RankCompletion,
     TransferId,
@@ -29,7 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.worker import (
 
 @dataclass
 class _TrackedJob:
-    job: TransferJob | LookupJob
+    job: TransferJob | LookupJob | ControlJob
     fence: ComputeFence
     future: Future[tuple[bool, ...]] | None = None
     completion: RankCompletion | None = None
@@ -54,6 +55,7 @@ class UMBPWorkerLifecycle:
         self._highest_sequence = -1
         self._jobs: dict[TransferId, _TrackedJob] = {}
         self._finished_recving: set[str] = set()
+        self._finished_sending: set[str] = set()
         self._invalid_blocks: set[int] = set()
         self._retired: dict[TransferId, frozenset[int]] = {}
         self._closed = False
@@ -90,6 +92,10 @@ class UMBPWorkerLifecycle:
                     )
                     if not success
                 )
+            elif isinstance(tracked.job, ControlJob):
+                # Both successful publication and failed delivery release the
+                # producer. The consumer still validates readiness and every GET.
+                self._finished_sending.add(tracked.job.request_id)
             del self._jobs[outcome.job.id]
             self._retired[outcome.job.id] = frozenset({self._worker.rank})
 
@@ -128,17 +134,21 @@ class UMBPWorkerLifecycle:
         for tracked in self._jobs.values():
             if tracked.completion is not None:
                 continue
-            failed = (False,) * len(tracked.job.blocks)
+            failed = (False,) * tracked.job.num_objects
             if tracked.rejected:
                 if tracked.fence.query():
                     tracked.completion = RankCompletion(failed, tracked.cancelled)
-            elif isinstance(tracked.job, LookupJob):
+            elif isinstance(tracked.job, LookupJob | ControlJob):
                 if tracked.future is None:
                     if tracked.cancelled:
                         tracked.completion = RankCompletion(failed, True)
                         continue
                     try:
-                        tracked.future = self._worker.lookup(tracked.job.blocks)
+                        tracked.future = (
+                            self._worker.lookup(tracked.job.blocks)
+                            if isinstance(tracked.job, LookupJob)
+                            else self._worker.control(tracked.job)
+                        )
                     except StoreBusyError:
                         continue
                     except Exception:
@@ -153,11 +163,13 @@ class UMBPWorkerLifecycle:
     def get_transfer_results(
         self, finished_req_ids: set[str]
     ) -> KVConnectorTransferResults:
-        # Store jobs own their block references independently of request free;
-        # no sending request ID is ever emitted by this shared lifecycle.
         self._poll()
-        result = KVConnectorTransferResults(finished_recving=self._finished_recving)
+        result = KVConnectorTransferResults(
+            finished_recving=self._finished_recving,
+            finished_sending=self._finished_sending,
+        )
         self._finished_recving = set()
+        self._finished_sending = set()
         return result
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -186,5 +198,6 @@ class UMBPWorkerLifecycle:
         self._worker.close()
         self._jobs.clear()
         self._finished_recving.clear()
+        self._finished_sending.clear()
         self._invalid_blocks.clear()
         self._retired.clear()

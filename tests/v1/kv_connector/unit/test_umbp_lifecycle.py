@@ -42,6 +42,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.lifecycle import (
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.metadata import (
     BlockKey,
     BlockTransfer,
+    ControlJob,
     JobOutcome,
     LookupJob,
     RankCompletion,
@@ -50,13 +51,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.metadata import (
     UMBPConnectorMetadata,
     UMBPWorkerMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.umbp.pd import UMBPHandoffPlanner
+from vllm.distributed.kv_transfer.kv_connector.v1.umbp.protocol import HandoffHandle
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.scheduler import (
     UMBPTransferScheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.store import UMBPStore
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.worker import UMBPTransferWorker
+from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.kv_cache_utils import BlockHash, get_request_block_hasher
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVQuantMode
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -85,12 +89,12 @@ def feedback(scheduler, metadata):
 def setup():
     resources = []
 
-    def create(*, limit=8, worker_limit=8, store_limit=8, natives=None):
+    def create(*, limit=8, worker_limit=8, store_limit=8, natives=None, epoch="engine"):
         groups = [KVCacheGroupSpec([name], attention_spec()) for name in ("a", "b")]
         cfg, _, _ = allocation(groups, capacity=8)
         manager = KVCacheManager(cfg, 64, 4, 4)
         scheduler = UMBPTransferScheduler(
-            manager, epoch="engine", ranks=frozenset({0, 1}), max_pending=limit
+            manager, epoch=epoch, ranks=frozenset({0, 1}), max_pending=limit
         )
         workers = []
         natives = natives or [NativeStore(), NativeStore()]
@@ -103,7 +107,7 @@ def setup():
                 native, SimpleNamespace(CPU="cpu", GPU="gpu"), max_pending=store_limit
             )
             worker = UMBPTransferWorker(
-                store, layout, keys, epoch="engine", rank=rank, max_pending=worker_limit
+                store, layout, keys, epoch=epoch, rank=rank, max_pending=worker_limit
             )
             workers.append(UMBPWorkerLifecycle(worker, max_pending=limit))
             resources.append((native, workers[-1], fences))
@@ -141,6 +145,7 @@ def setup():
             request=request,
             dispatch=dispatch,
             fences=fences,
+            namespace=keys.prefix,
         )
 
     yield create
@@ -513,7 +518,7 @@ def test_cancelled_lookup_drains_while_native_pressure_retries_the_next_job(setu
 @pytest.fixture
 def engine(monkeypatch):
     """Real factory, Scheduler, cache manager and worker connector; fake GPU/IO."""
-    resources = []
+    resources: list[tuple[NativeStore, KVConnectorBase_V1]] = []
 
     class Event(Fence):
         def __init__(self, **kwargs):
@@ -536,6 +541,10 @@ def engine(monkeypatch):
         groups=None,
         revision="unit-revision",
         dtype="float16",
+        kv_role="kv_both",
+        enable_pd=False,
+        handoff_timeout=30.0,
+        load_failure_policy="recompute",
     ):
         groups = groups or [KVCacheGroupSpec(["a"], attention_spec())]
         cfg, raw, caches = allocation(groups, capacity=32)
@@ -545,8 +554,8 @@ def engine(monkeypatch):
             max_model_len=64,
             max_num_seqs=4,
             max_num_batched_tokens=budget,
-            kv_role="kv_both",
-            kv_load_failure_policy="recompute",
+            kv_role=kv_role,
+            kv_load_failure_policy=load_failure_policy,
             kv_connector="UMBPConnector",
             kv_connector_module_path="vllm.distributed.kv_transfer.kv_connector.v1.umbp.connector",
             kv_connector_extra_config={
@@ -554,6 +563,8 @@ def engine(monkeypatch):
                 "model": "test-model",
                 "revision": revision,
                 "lookup_timeout": timeout,
+                "handoff_timeout": handoff_timeout,
+                "enable_pd": enable_pd or kv_role != "kv_both",
                 "storage": {
                     "page_size_bytes": 4096,
                     "dram_capacity_bytes": 8192,
@@ -561,6 +572,17 @@ def engine(monkeypatch):
                 },
             },
         )
+        if enable_pd or kv_role != "kv_both":
+            extra = config.kv_transfer_config.kv_connector_extra_config
+            extra["storage"]["master_address"] = "unit-master:1234"
+            extra["nodes"] = [
+                {
+                    "node_id": f"unit-{len(resources)}",
+                    "node_address": "127.0.0.1",
+                    "io_engine_host": "127.0.0.1",
+                    "peer_service_port": 12000 + len(resources),
+                }
+            ]
         # Avoid async-scheduler policy defaults in a serialized lifecycle test.
         config.scheduler_config.async_scheduling = False
         native = NativeStore()
@@ -584,6 +606,7 @@ def engine(monkeypatch):
         jobs = []
         computed: dict[str, int] = {}
         outputs = []
+        engine_outputs = []
 
         def step():
             scheduled = scheduler.schedule()
@@ -625,7 +648,9 @@ def engine(monkeypatch):
                 pooler_output=[],
                 kv_connector_output=output,
             )
-            scheduler.update_from_output(scheduled, result)
+            returned = scheduler.update_from_output(scheduled, result)
+            for batch in returned.values():
+                engine_outputs.extend(batch.outputs)
             return scheduled
 
         def until(condition):
@@ -659,6 +684,7 @@ def engine(monkeypatch):
             jobs=jobs,
             computed=computed,
             outputs=outputs,
+            engine_outputs=engine_outputs,
             step=step,
             until=until,
             drain=drain,
@@ -672,9 +698,12 @@ def engine(monkeypatch):
         assert not native.registered
 
 
+@pytest.mark.parametrize("enable_pd", [False, True])
 @pytest.mark.parametrize("local_prefix", [0, 4])
-def test_full_scheduler_offload_restores_only_the_missing_prefix(engine, local_prefix):
-    e = engine(limit=1)
+def test_full_scheduler_offload_restores_only_the_missing_prefix(
+    engine, local_prefix, enable_pd
+):
+    e = engine(limit=1, enable_pd=enable_pd)
     first = e.request(100)
     e.scheduler.add_request(first)
     e.drain()
@@ -748,7 +777,7 @@ def test_connector_startup_rejects_mismatched_layout_generation_and_pd_role(engi
     with pytest.raises(RuntimeError, match="generation"):
         connector.set_xfer_handshake_metadata({0: handshake})
     e.config.kv_transfer_config.kv_role = "kv_producer"
-    with pytest.raises(ValueError, match="handoff"):
+    with pytest.raises(ValueError, match="enable_pd"):
         UMBPConnector(e.config, KVConnectorRole.SCHEDULER, e.cfg)
 
 
@@ -971,3 +1000,309 @@ def test_pool_reuse_between_engines_requires_matching_model_identity(
             isinstance(job, TransferJob) and job.operation == "store"
             for job in second.jobs
         )
+
+
+def decode_request(request_id, prefill_request, params):
+    request = Request(
+        request_id,
+        list(prefill_request.all_token_ids),
+        SamplingParams(max_tokens=1),
+        None,
+        block_hasher=get_request_block_hasher(4, sha256),
+    )
+    request.kv_transfer_params = params
+    return request
+
+
+def complete_prefill(prefill, *, tokens=16):
+    request = prefill.request(220, tokens=tokens)
+    request.kv_transfer_params = {"do_remote_decode": True}
+    prefill.scheduler.add_request(request)
+    prefill.drain()
+    params = next(
+        output.kv_transfer_params
+        for output in prefill.engine_outputs
+        if output.kv_transfer_params
+    )
+    return request, params, HandoffHandle.from_dict(params["umbp_handoff"])
+
+
+@pytest.mark.parametrize("failed_rank", [None, 1])
+def test_pd_readiness_requires_successful_export_from_every_rank(
+    setup, monkeypatch, failed_rank
+):
+    s = setup(epoch="e" * 64)
+    if failed_rank is not None:
+        monkeypatch.setattr(
+            s.natives[failed_rank],
+            "batch_put_ranges_from_ptr",
+            lambda keys, *args: [False] * len(keys),
+        )
+    planner = UMBPHandoffPlanner(
+        s.manager,
+        s.scheduler,
+        namespace=s.namespace,
+        producer=True,
+        consumer=False,
+        timeout=30.0,
+    )
+    request, blocks = s.request()
+    request.num_computed_tokens = 4
+    request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    request.kv_transfer_params = {"do_remote_decode": True}
+    delayed, params = planner.request_finished(request)
+    assert delayed and params is not None
+    handle = HandoffHandle.from_dict(params["umbp_handoff"])
+    planner.build_jobs()
+    export = s.dispatch(ready=False).jobs[0]
+    s.fences[0].event.set()
+    assert feedback(s.scheduler, collect(s.workers[0], export)) == ()
+    planner.build_jobs()
+    assert not s.scheduler.build_connector_meta().jobs
+    assert all(
+        handle.ready_key(rank) not in native.data
+        for rank, native in enumerate(s.natives)
+    )
+    assert all(s.manager.block_pool.blocks[b.block_id].ref_cnt == 2 for b in blocks)
+
+    s.fences[1].event.set()
+    outcomes = feedback(s.scheduler, collect(s.workers[1], export))
+    assert len(outcomes) == 1
+    planner.update_outcome(outcomes[0])
+    planner.build_jobs()
+    control = s.dispatch().jobs[0]
+    assert isinstance(control, ControlJob)
+    assert control.operation == ("publish" if failed_rank is None else "release")
+    for worker in s.workers:
+        feedback(s.scheduler, collect(worker, control))
+        assert not worker.get_transfer_results({request.request_id}).finished_sending
+    assert all(s.manager.block_pool.blocks[b.block_id].ref_cnt == 1 for b in blocks)
+    s.dispatch()
+    for rank, worker in enumerate(s.workers):
+        assert worker.get_transfer_results({request.request_id}).finished_sending == {
+            request.request_id
+        }
+        feedback(s.scheduler, worker.build_connector_worker_meta())
+        assert (handle.ready_key(rank) in s.natives[rank].data) == (failed_rank is None)
+    planner.finished_sending(request.request_id)
+    s.manager.free(request)
+    assert not s.scheduler.has_pending_push_work() and not planner.has_pending()
+    assert s.manager.block_pool.get_num_free_blocks() == 7
+
+
+@pytest.mark.parametrize("tokens", [13, 16])
+@pytest.mark.parametrize("local_prefix", [0, 4])
+def test_pd_handle_precedes_readiness_and_decode_loads_only_missing_prefix(
+    engine, monkeypatch, local_prefix, tokens
+):
+    prefill = engine(kv_role="kv_producer", limit=1)
+    decode = engine(kv_role="kv_consumer", limit=1)
+    decode.native.data = prefill.native.data
+    first = prefill.request(200, tokens=tokens)
+    first.kv_transfer_params = {"do_remote_decode": True}
+    prefill.scheduler.add_request(first)
+    prefill.until(
+        lambda: any(output.kv_transfer_params for output in prefill.engine_outputs)
+    )
+    params = next(
+        output.kv_transfer_params
+        for output in prefill.engine_outputs
+        if output.kv_transfer_params
+    )
+    handle = HandoffHandle.from_dict(params["umbp_handoff"])
+    boundary = tokens // 4 * 4
+    assert handle.token_boundary == boundary
+    assert handle.ready_key(0) not in prefill.native.data
+    assert first.request_id in prefill.scheduler.requests
+    assert prefill.scheduler.requires_kv_delivery
+    assert not decode.scheduler.requires_kv_delivery
+    if local_prefix:
+        seed = decode.request(201, tokens=local_prefix)
+        decode.scheduler.kv_cache_manager.allocate_slots(seed, local_prefix)
+        block = decode.scheduler.kv_cache_manager.get_block_ids(seed.request_id)[0][0]
+        decode.caches["a"][block].fill_(7)
+        decode.scheduler.kv_cache_manager.free(seed)
+    get = MagicMock(wraps=decode.native.batch_get_ranges_into_ptr)
+    monkeypatch.setattr(decode.native, "batch_get_ranges_into_ptr", get)
+    second = decode_request("decode-200", first, params)
+    decode.scheduler.add_request(second)
+    decode.step()
+    assert second.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    get.assert_not_called()
+    assert second.request_id not in decode.computed
+    prefill.drain()
+    assert handle.ready_key(0) in prefill.native.data
+    assert prefill.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 31
+    decode.until(
+        lambda: second.request_id in decode.scheduler.finished_recving_kv_req_ids
+    )
+    blocks = decode.scheduler.kv_cache_manager.get_block_ids(second.request_id)[0]
+    assert all(
+        torch.all(decode.caches["a"][block] == index + 7)
+        for index, block in enumerate(blocks[: boundary // 4])
+    )
+    decode.drain()
+    loads = [
+        job
+        for job in decode.jobs
+        if isinstance(job, TransferJob) and job.operation == "load"
+    ]
+    assert len(loads) == 1 and len(loads[0].blocks) == (boundary - local_prefix) // 4
+    assert decode.computed[second.request_id] == tokens + 1 - boundary
+    assert get.call_count == 1
+    assert len(get.call_args.args[0]) == (boundary - local_prefix) // 4
+    assert all(not output.invalid_block_ids for output in decode.outputs)
+
+
+def test_pd_failed_export_never_publishes_readiness_and_decode_recomputes(
+    engine, monkeypatch
+):
+    prefill = engine(kv_role="kv_producer")
+    decode = engine(kv_role="kv_consumer", handoff_timeout=0.02)
+    decode.native.data = prefill.native.data
+    first = prefill.request(210, tokens=16)
+    first.kv_transfer_params = {"do_remote_decode": True}
+    monkeypatch.setattr(
+        prefill.native,
+        "batch_put_ranges_from_ptr",
+        lambda keys, *args: [False] * len(keys),
+    )
+    prefill.scheduler.add_request(first)
+    prefill.drain()
+    params = next(
+        output.kv_transfer_params
+        for output in prefill.engine_outputs
+        if output.kv_transfer_params
+    )
+    handle = HandoffHandle.from_dict(params["umbp_handoff"])
+    assert handle.ready_key(0) not in prefill.native.data
+    assert not any(
+        isinstance(job, ControlJob) and job.operation == "publish"
+        for job in prefill.jobs
+    )
+    second = decode_request("decode-210", first, params)
+    decode.scheduler.add_request(second)
+    decode.drain()
+    assert decode.computed[second.request_id] == 17
+    failures = [output for output in decode.outputs if output.invalid_block_ids]
+    assert len(failures) == 1 and second.request_id in failures[0].finished_recving
+    assert decode.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 31
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("namespace", "vllm-umbp:v1:" + "f" * 64),
+        ("boundary_hash", "00" * 32),
+        ("expires_at_ms", 1),
+        ("version", 2),
+    ],
+)
+def test_pd_invalid_handoff_never_authorizes_a_receive(
+    engine, monkeypatch, field, value
+):
+    prefill = engine(kv_role="kv_producer")
+    decode = engine(kv_role="kv_consumer")
+    decode.native.data = prefill.native.data
+    first, params, _ = complete_prefill(prefill)
+    params["umbp_handoff"][field] = value
+    get = MagicMock(wraps=decode.native.batch_get_ranges_into_ptr)
+    monkeypatch.setattr(decode.native, "batch_get_ranges_into_ptr", get)
+    second = decode_request("invalid-handoff", first, params)
+    decode.scheduler.add_request(second)
+    decode.drain()
+    get.assert_not_called()
+    assert decode.computed[second.request_id] == 17
+    assert not any(output.finished_recving for output in decode.outputs)
+    assert decode.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 31
+
+
+@pytest.mark.parametrize("policy", ["recompute", "fail"])
+def test_pd_eviction_after_readiness_obeys_receive_failure_policy(engine, policy):
+    prefill = engine(kv_role="kv_producer")
+    decode = engine(kv_role="kv_consumer", load_failure_policy=policy)
+    decode.native.data = prefill.native.data
+    first, params, handle = complete_prefill(prefill)
+    assert handle.ready_key(0) in prefill.native.data
+    victim = next(key for key in prefill.native.data if ":pd-ready:" not in key)
+    del prefill.native.data[victim]
+    second = decode_request("evicted-handoff", first, params)
+    decode.scheduler.add_request(second)
+    decode.drain()
+    failures = [output for output in decode.outputs if output.invalid_block_ids]
+    assert len(failures) == 1 and second.request_id in failures[0].finished_recving
+    if policy == "recompute":
+        assert decode.computed[second.request_id] == 17
+        assert second.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    else:
+        assert second.request_id not in decode.computed
+        assert second.status == RequestStatus.FINISHED_ERROR
+    assert decode.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 31
+
+
+@pytest.mark.parametrize("abort", [False, True])
+def test_pd_blocked_readiness_probe_can_retire_without_issuing_kv_io(
+    engine, monkeypatch, abort
+):
+    prefill = engine(kv_role="kv_producer")
+    decode = engine(kv_role="kv_consumer", handoff_timeout=0.1, limit=1)
+    decode.native.data = prefill.native.data
+    first, params, _ = complete_prefill(prefill)
+    decode.native.release.clear()
+    get = MagicMock(wraps=decode.native.batch_get_ranges_into_ptr)
+    monkeypatch.setattr(decode.native, "batch_get_ranges_into_ptr", get)
+    second = decode_request("blocked-readiness", first, params)
+    decode.scheduler.add_request(second)
+    decode.step()
+    assert decode.native.entered.wait(5)
+    assert second.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    if abort:
+        decode.scheduler.finish_requests(
+            [second.request_id], RequestStatus.FINISHED_ABORTED
+        )
+    decode.until(lambda: any(output.finished_recving for output in decode.outputs))
+    # The still-running EXISTS call carries no KV addresses, so unlike a GET it
+    # need not retain the failed/aborted receive's allocations until it returns.
+    assert not decode.native.release.is_set()
+    get.assert_not_called()
+    decode.native.release.set()
+    decode.drain()
+    if abort:
+        assert second.status == RequestStatus.FINISHED_ABORTED
+        assert second.request_id not in decode.computed
+    else:
+        assert decode.computed[second.request_id] == 17
+    get.assert_not_called()
+    assert decode.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 31
+
+
+def test_pd_unequal_dense_groups_restore_a_jointly_aligned_boundary(engine):
+    groups = [
+        KVCacheGroupSpec([name], replace(attention_spec(), block_size=size))
+        for name, size in (("a", 4), ("b", 8))
+    ]
+    prefill = engine(kv_role="kv_producer", groups=groups)
+    decode = engine(kv_role="kv_consumer", groups=groups)
+    decode.native.data = prefill.native.data
+    first, params, handle = complete_prefill(prefill, tokens=17)
+    assert handle.token_boundary == 16
+    second = decode_request("unequal-groups", first, params)
+    decode.scheduler.add_request(second)
+    decode.until(
+        lambda: second.request_id in decode.scheduler.finished_recving_kv_req_ids
+    )
+    blocks = decode.scheduler.kv_cache_manager.get_block_ids(second.request_id)
+    for group, spec in enumerate(groups):
+        for index, block in enumerate(
+            blocks[group][: 16 // spec.kv_cache_spec.block_size]
+        ):
+            assert torch.all(decode.caches[spec.layer_names[0]][block] == index + 7)
+    decode.drain()
+    loads = [
+        job
+        for job in decode.jobs
+        if isinstance(job, TransferJob) and job.operation == "load"
+    ]
+    assert len(loads) == 1 and len(loads[0].blocks) == 6
+    assert decode.computed[second.request_id] == 2
+    assert decode.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 31
