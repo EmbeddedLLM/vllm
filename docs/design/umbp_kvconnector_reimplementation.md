@@ -1141,3 +1141,216 @@ Remaining gates include native multi-node/TP and SSD P/D, forced HBM/storage
 pressure, lifetime/fault/corruption cases, hybrid/Kimi state, exact-current
 vLLM native binaries, matched GSM8K, routing/prefetch/llm-d and performance.
 Neither the same-host smoke nor 205 CPU tests complete the implementation goal.
+
+## Two-host native validation (2026-09-14)
+
+This experiment retains Python source `efac63da24ddba5374d4a55ad30923c400c239a4`
+and unchanged MoRI release `67632e80e2e492184b589904b63225f82d45537c`.
+It uses physical GPU 0 on each authorized MI355X host, one TP1 Qwen engine per
+role, the same pre-existing read-only model revision, and separate DRAM-only
+and ext4 SSD-only arms. Runtime/JIT/SSD scratch is under each host's SSD0 run
+root; the shared NFS model cache is not used for KV scratch. There is no model
+download, GDS/SPDK enablement, filesystem provisioning or kernel change.
+
+### Test contract and environment preparation
+
+The native gate completes a 4096-byte PUT on 003 **before** registering the
+consumer on 004. The consumer then poisons its destination and verifies every
+received byte; this tests a cross-host GET, not the earlier consumer-local GET.
+For each medium, a fresh no-connector engine supplies the 584-token-prompt,
+15-output-token baseline. Separate producer/consumer engines then exercise
+cold P/D (576 external/0 local tokens) and a 256-token local-prefix case
+(320 external/256 local). The actual producer handle and first token are
+forwarded unchanged. Output IDs must match the complete baseline exactly,
+with no failed-GET recomputation fallback.
+
+The master is on 003; native peer/I/O services use each host's management IP
+and `ionic_0`. Host networking is explicit: native listeners are reachable on
+deployment interfaces, not isolated to the Docker network. Only the selected
+GPU render node, KFD and one verbs device are exposed. The controller uses
+SSH stdio for actor commands/results; no extra application command server or
+runner credentials are installed in the containers. Read-only root/source/model
+mounts, capability dropping, fixed UID/GID, bounded resources, immediate GPU
+checks and existing-directory cooperative locks match the prior safety model.
+
+Keep the same pinned image contents across hosts. The nightly tag
+`vllm/vllm-openai-rocm:nightly-1dc464d42681d22f38caf1fdc1eb632dc4421c45`
+exists on 003 but was absent on 004. A registry tag pull returned not-found,
+while read-only manifest inspection proved that the exact immutable digest
+remains available. The fourth frozen attempt pulls by digest and restores
+the original tag on 004:
+
+```bash
+docker pull vllm/vllm-openai-rocm@sha256:40e19c756e3dc9ffc9117770904d40376c7d3bf529cc76ddc379cde7ac4dae2d
+docker image tag \
+  vllm/vllm-openai-rocm@sha256:40e19c756e3dc9ffc9117770904d40376c7d3bf529cc76ddc379cde7ac4dae2d \
+  vllm/vllm-openai-rocm:nightly-1dc464d42681d22f38caf1fdc1eb632dc4421c45
+```
+
+These commands are inside the marker-owned lifecycle, not standalone cleanup
+instructions. Both Docker daemons are 29.7.1 and expose the manifest digest as
+the image ID. The controller verifies that identity before execution. No
+pre-existing image needs deletion: 004's Docker filesystem had 167.8 GB free.
+Its existing ext4 loop-backed Docker filesystem uses an NFS backing file;
+the experiment neither moves it nor changes the daemon. The added tag/digest
+on 004 must be removed after recovery; the original image on 003 is preserved.
+Public images cannot be relabelled without changing identity, so the exact
+baseline-absent tag/digest and ownership marker control this image cleanup.
+
+Preparation failures remain evidence, not serving passes:
+
+- Attempt 1: `setsid` forked and its parent returned before the remote script
+  remained attached to SSH. Neither image installation nor model execution ran.
+- Attempt 2: `setsid --wait` fixed supervision; live no-GPU launcher termination
+  was added to the failure gate. 003 passed source/import probes, but 004's
+  registry tag pull failed. No native or model actor ran.
+- Attempt 3: a bounded image relay through the VPS was explicitly cancelled
+  after the exact registry digest was found. The controller exited 130 and
+  its transfer SSH processes terminated; no model actor ran.
+
+All three attempts recovered their task runtime state to the VPS, compared
+SHA256 against a second remote stream, and removed their exact run roots.
+Independent audits passed against the original image/container inventories,
+model snapshot checks, GPU memory/process baselines and task port/path checks.
+The verifier rejects the first failed attempt rather than accepting partial
+setup evidence.
+
+### Fourth attempt: three passing cases, SSD partial receive failed
+
+The two-host experiment at source `efac63da2` reached actual model execution
+on 003 and 004 using the same pinned runtime. Its full acceptance gate failed;
+do not label this a complete multi-node pass. The observed cases are:
+
+| Storage | Decoder case | External/local tokens | Decoder wall time | Result |
+| --- | --- | --- | --- | --- |
+| DRAM | Cold | 576/0 | 2.864 s | Baseline token IDs matched |
+| DRAM | Partial prefix | 320/256 | 3.437 s | Baseline token IDs matched |
+| SSD | Cold | 576/0 | 7.519 s | Baseline token IDs matched |
+| SSD | Partial prefix | 320/256 planned, not completed | 119.798 s | Error, zero output tokens |
+
+Each successful P/D response concatenates the producer's first token and the
+decoder's 14 tokens to match the 15-token no-connector baseline exactly.
+No-connector request times were 0.769 s in the DRAM arm and 0.174 s in the SSD
+arm. These are single smoke observations, with JIT/readiness/storage waiting
+and different warmup histories, not matched performance measurements.
+
+Before either model arm, a native producer PUT on 003 completed before the
+consumer on 004 registered. A poisoned CPU destination on 004 then verified
+all 4096 bytes. Native GET logs show `local=0 remote=1` for each storage mode;
+this establishes a cross-host native data transfer, unlike the earlier
+consumer-local transport probe. It does not repair the native byte-accounting
+gap or establish network bandwidth. The SSD backend explicitly fell back from
+unavailable `io_uring` to POSIX; no GDS/SPDK path was tested.
+
+DRAM decoder native GET batches contain 16/16/4 objects for cold and 16/4 for
+partial. SSD decoder GETs contain only the cold 16/16/4 batches: no partial
+GET was issued before its readiness deadline. The SSD partial receipt reports
+`finish_reason=error`, no output IDs and zero completed cached tokens, despite
+the scheduler's counters advertising 320 external and 256 local tokens.
+Admission counters are not evidence of completed transfers.
+
+The SSD producer logged data PUTs but only one ready-marker PUT across the two
+exports. The second export therefore lacks a logged ready publication. Its
+per-object PUT return values and scheduler export outcome were not captured,
+so the logs do **not** yet establish which object or native condition failed.
+Staging-arena-busy and heartbeat-sequence warnings are preserved as diagnostic
+evidence, not asserted as the root cause. Keep the failed case and the original
+120-second deadline; add per-object outcome evidence before a targeted retry.
+Never bypass readiness or silently recompute to turn this gate green.
+
+The original `verify-multinode-r1.py` still requires all four passing cases.
+The separate `summarize-multinode-r4-results.py` checks the three successful
+cases **and requires the observed SSD failure**, including missing partial GETs
+and the error receipt. A successful evidence report is not a successful model
+acceptance gate.
+
+Independent verification finished: the unchanged full-arm verifier exited 1
+at token equality for SSD partial P/D. The partial-evidence reporter exited 0
+with `partial_evidence_verified=true` and `multinode_pd_smoke_verified=false`.
+It compared every actor RPC receipt with the recovered JSON, checked both
+archive and native-library hashes, actual image/import/backend/layout markers,
+distinct host GPU UUIDs, handoff/token chains, cache-counter deltas and native
+GET/ready-PUT counts. This preserves the failed gate while independently
+substantiating the three passing cases.
+
+The controller terminated with exit 1 at the SSD partial token-equality
+assertion. Both recovery archives were verified against a second remote
+SHA256 stream before deleting the task roots:
+
+| Host | Recovered bytes | Archive SHA256 |
+| --- | --- | --- |
+| 003 | 769,516,820 | `83c9491158e1061aa32f6a6cef8362e3207954500aeec69c35dfcf250fb1c813` |
+| 004 | 769,396,766 | `f70b750c8fe6c7f96defc344fc123dda17ea94d4e25e4361734364d3873f7761` |
+
+Independent post-clean audits passed on both hosts. They checked absent task
+roots, process working directories, labelled Docker objects and task listeners;
+no KFD processes; baseline VRAM on all eight GPUs; SSD0 mount identity; unchanged
+pre-existing model snapshot checks; and exact pre-run Docker image/container
+inventories. A separate read-only check found no surviving Docker image
+save/load processes from image preparation. 004's task-created image/tag/digest
+was removed; 003's pre-existing image was preserved. No weights were downloaded
+or removed. GEAK's recovery-before-deletion contract governed teardown.
+
+### Two-host commands and evidence
+
+All paths below are on the controller VPS under
+`/home/ubuntu/vllmumbp/local-logs/umbp-kvconnector-reimplementation-20260914`.
+The frozen launch commands were:
+
+```bash
+cd /home/ubuntu/vllmumbp
+sha256sum -c local-logs/umbp-kvconnector-reimplementation-20260914/multinode-r4-launch-hashes.txt
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/multinode-r4-controller.py failure gate1
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/multinode-r4-controller.py smoke smoke1
+```
+
+The injected failure gate intentionally exits 42 after testing live no-GPU
+launcher termination and verified cleanup. The smoke exits 1 for the model
+failure described above. Do not overwrite the existing `gate1`/`smoke1`
+directories: a new run requires fresh attempt names, runner preflight and
+review of its immutable manifest. Do not run two attempts concurrently.
+The controller owns remote setup, execution, recovery and exact cleanup;
+do not launch its container fragments independently.
+
+The read-only evidence/cleanup commands are:
+
+```bash
+cd /home/ubuntu/vllmumbp
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/verify-multinode-r1.py \
+  local-logs/umbp-kvconnector-reimplementation-20260914/multinode-r4-smoke1
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/summarize-multinode-r4-results.py \
+  local-logs/umbp-kvconnector-reimplementation-20260914/multinode-r4-smoke1
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/multinode-r4-audit.py \
+  local-logs/umbp-kvconnector-reimplementation-20260914/multinode-r4-smoke1
+```
+
+Each invocation was logged through `tee` with `set -o pipefail`, preserving its
+actual exit status. Full logs are `multinode-r4-failure-gate1.log`,
+`multinode-r4-smoke1.log`, `verify-multinode-r4.log`,
+`multinode-r4-case-report.log`, `multinode-r4-final-audit.log` and
+`multinode-r4-image-transfer-process-audit.log`. Per-actor logs, JSON receipts,
+SSH RPC envelopes and both recovery archives are in `multinode-r4-smoke1/`.
+
+Frozen identities:
+
+- Controller: `3895fe850fefde0ed5b117cd1b0e0cf694fa519477d364e004f9483a9c504ad8`.
+- Host lifecycle: `964183bc372eb73b7fbc9b2f6b6b2585ca20124ca9f1763a713dd9ff71c1bc36`.
+- Manifest: `46b45302257ac27dae084c614d3f17fea4a24e7d818ce4385d0c59d82446ae77`.
+- Strict verifier: `4204d6dac4e0eacde64b8cb45a8a18679d91bc0a3ca47960bb705fef92fe0ceb`.
+- Partial-evidence reporter: `52808f114426e63dc25eaa89469b5ac9bb3c2de5adb626a6bf7cf3da70e8adc8`.
+- Cleanup auditor: `cf97af66e9c693657a57a2e5917d9ce3ac94b9ee3f2b09d7a1ed13a79a60d7c1`.
+
+The complete per-input hashes are in `multinode-r4-launch-hashes.txt`. The source
+archive is still `efac63da24ddba5374d4a55ad30923c400c239a4`, paired with MoRI
+`67632e80e2e492184b589904b63225f82d45537c` and native library
+`d2c9b02ed7da9a727e43f1f8155b97b7fb7fea71e6fd9ac31e09cc9a47702c60`.
+No implementation source or model weight changed in this two-host attempt.
+The earlier-image vLLM native-extension limitation remains: this is current
+Python connector code with precompiled native extensions, not an exact-current
+vLLM native build. llm-d and mori-sched do not participate in these offline
+`LLM` tests; their previous repository pins above remain provenance only.
