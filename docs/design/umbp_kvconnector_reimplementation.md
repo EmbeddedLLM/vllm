@@ -1,9 +1,11 @@
 # UMBP reimplementation through KVConnectors
 
-Status: **in progress; limited native Qwen offload and same-host P/D smokes
-passed; multi-node, pressure, accuracy and performance acceptance pending**. Current Python-source
-checkpoint: `efac63da24ddba5374d4a55ad30923c400c239a4`; the serving smoke reused
-older nightly vLLM native binaries, as detailed in the revision 3 evidence below.
+Status: **in progress; limited native Qwen offload and same-/two-host P/D
+smokes passed; broader multi-node/TP, pressure, accuracy and performance
+acceptance pending**. Current Python-source checkpoint:
+`408c3b752eaf18dd9c055d9ab5bac3208c5071df`. The serving tests reused older nightly
+vLLM native binaries. The latest two-host DRAM/SSD cold/partial P/D results,
+source verification and cleanup evidence are recorded in the final section.
 
 ## Target and preserved baseline
 
@@ -137,17 +139,17 @@ completion behavior; it is not being relabeled as UMBP offloading.
 | --- | --- | --- |
 | Native API and owned ranged storage | `umbp/store.py`; CPU contracts, then real native pointer tests | CPU contracts and eight native CPU/GPU DRAM/SSD buffer cases passed; broader pressure/fault validation pending |
 | Explicit storage configuration | `umbp/config.py`; page/scratch checks, DRAM/SSD policy and private-path lifetime | CPU tests and native DRAM-only/SSD-only startup/cleanup passed; pressure and tier migration pending |
-| Compatible P/D/offload keys | `umbp/key.py`, `umbp/layout.py`; descriptor integration and identity isolation | Worker-derived namespace handshake and generation exchange implemented; same-host matching-TP1 P/D smoke passed, broader native topology pending |
+| Compatible P/D/offload keys | `umbp/key.py`, `umbp/layout.py`; descriptor integration and identity isolation | Worker-derived namespace handshake and generation exchange implemented; same-/two-host matching-TP1 P/D smokes passed, broader native topology pending |
 | Scheduler lookup and allocation | KVConnector lookup, metadata, block ownership, asynchronous feedback | Dense offload and P/D planners exercised through real Scheduler; hybrid boundaries pending |
 | Worker load/store and errors | Registered cache views, compute fences, completion snapshots and error block IDs | Real connector hooks and post-forward event recording wired; CPU runner tests pass, native GPU ordering pending |
-| P/D handoff and incremental transfer | Producer/consumer protocol, all-rank commit, local-prefix reuse, two-engine transfer accounting | Same-host separate-GPU Qwen cold/partial P/D passed at `efac63da2`; native multi-rank/multi-node and hybrid handoff pending |
+| P/D handoff and incremental transfer | Producer/consumer protocol, all-rank commit, local-prefix reuse, two-engine transfer accounting | Same-host DRAM and two-host DRAM/SSD Qwen cold/partial P/D passed; native multi-rank, pressure/fault and hybrid handoff pending |
 | Single-node DRAM and ext4 SSD offload | MoRI embedded deployment, forced eviction, byte/source reconciliation | Qwen local-cache-reset smoke passed at `2dc83e970`; forced HBM overwrite/pressure and performance pending |
-| Multi-node DRAM/SSD restore | Master-led deployment, peer failures, safe recompute and recovery | Pending |
+| Multi-node DRAM/SSD restore | Master-led deployment, peer failures, safe recompute and recovery | Forced cross-host native buffer reads and P/D smokes passed; ordinary multi-node offload, pressure and peer/master faults pending |
 | TP and hybrid cache geometry | Exact layouts, complete group/shard restoration, cancellation and preemption | Layout/rank barriers and unequal dense-group scheduler tests pass; native TP and hybrid boundary semantics pending |
 | Placement and MoRI scheduling | Current authoritative placement API, lifecycle events, tier/locality/cost routing | Pending |
 | CPU/HBM prefetch and admission | Token-identity control, connector-owned load, TTL/cancel/drain/no-model invariants | Pending |
 | llm-d integration and fault recovery | Routing, prefetch, replay/gaps, staleness, reconnect/fail-open tests | Pending |
-| Qwen correctness and accuracy | Matched no-connector/offload/P-D outputs and GSM8K evidence | One-prompt offload and same-host P/D token matches passed; matched GSM8K acceptance pending |
+| Qwen correctness and accuracy | Matched no-connector/offload/P-D outputs and GSM8K evidence | One-prompt offload and same-/two-host P/D token matches passed; matched GSM8K acceptance pending |
 | Kimi K3 acceptance | Requested TP8/AITER settings, hybrid layouts, long-context restore and semantic tests | Pending |
 | Transfer effectiveness | Source counters, physical transfer proof, matched warmup/latency/throughput protocol | Pending |
 | Reproduction and zero remote residue | Exact source/runtime/model manifests, VPS logs, audited cleanup | Native/offload and P/D attempts recovered to VPS with per-attempt cleanup audits; repeat for every run |
@@ -1354,3 +1356,211 @@ The earlier-image vLLM native-extension limitation remains: this is current
 Python connector code with precompiled native extensions, not an exact-current
 vLLM native build. llm-d and mori-sched do not participate in these offline
 `LLM` tests; their previous repository pins above remain provenance only.
+
+## Native SSD staging pressure and bounded PUT retries
+
+A native-only diagnostic on 003 reproduced read-to-write staging pressure at
+the unchanged `efac63da2` source and pinned MoRI binary. A fresh singleton peer
+used the same 4 MiB pages and 16 staging slots as the model experiment. It
+stored 16 distinct 4096-byte objects, passed a new-key write-only control, then
+read all 16 into a poisoned buffer and verified all 65,536 bytes. A subsequent
+new-key PUT failed 62 times before succeeding on attempt 63 at 3.112 seconds.
+The DRAM control succeeded on its first attempt at 0.000175 seconds. Both arms
+verified a final 4096-byte GET into poisoned bytes.
+
+The native source retains SSD read staging leases for 3000 ms, sharing the arena
+with writes. The diagnostic's factory log confirms 16 staging pages and POSIX
+SSD I/O. This demonstrates a native transient failure mechanism; it does not
+retroactively identify every failed object in the earlier model export, whose
+native return values were not logged. Diagnostic retries were an intervention
+in the harness, not a passing production connector result.
+
+Independent `verify-pressure-r1.py` compared RPC envelopes with recovered JSON,
+checked the archive/native-library hashes, source/import markers, native
+GET/PUT counts and both control outcomes. `verify-pressure-r1.log` reports
+`native_pressure_evidence_verified=true` and `model_fix_verified=false`.
+No model was mounted, downloaded or executed. All user buffers were CPU
+allocations; the established native runtime retained the selected GPU0/verbs
+device exposure. The native binary and vLLM source archive were unchanged.
+
+The pressure controller exited 0. Its recovery archive has 671,241,695 bytes and
+SHA256 `053098e5dd644789136b1cffe4497a658db638a468771292e138cbe4c78afedb`.
+The preceding live no-GPU failure gate exited 42 and recovered SHA256
+`ff88e8ed76507c1446fbdf029545ca1fb1c1ad8a8b5a2c5131cb3d768a3745ab`.
+003's task root/container were removed only after verification; independent
+cleanup audit passed, preserving original Docker inventories and model checks.
+004 was not used by this probe. The image was pre-existing and preserved.
+
+The frozen manifest, launch hashes, controller and native probe are
+`pressure-r1-manifest.md`, `pressure-r1-launch-hashes.txt`,
+`pressure-r1-controller.py` and `pressure-r1-input/pressure.py` in the same VPS
+bundle. Commands executed from `/home/ubuntu/vllmumbp`, with pipefail/tee logs:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/pressure-r1-controller.py failure gate1
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/pressure-r1-controller.py smoke probe1
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/verify-pressure-r1.py \
+  local-logs/umbp-kvconnector-reimplementation-20260914/pressure-r1-probe1
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/pressure-r1-audit.py \
+  local-logs/umbp-kvconnector-reimplementation-20260914/pressure-r1-probe1
+```
+
+### Retry contract at `408c3b752`
+
+Commit `408c3b752eaf18dd9c055d9ab5bac3208c5071df` adds
+`storage.store_retry_timeout_s`, default 5 seconds, finite range 0–60; zero
+disables retries. The low-level directly constructed `UMBPStore` defaults to
+zero; the connector's configuration factory supplies its configured budget.
+DRAM-only peers also receive the setting because they may write remote SSDs.
+
+Only failed immutable PUT objects are retried. Successful objects are not
+resubmitted. One monotonic budget is shared across all chunks of an operation,
+with 10 ms initial backoff doubling to 100 ms. Native exceptions and malformed
+results remain failed futures, not retry candidates; GETs are not retried.
+Because the pinned API returns only booleans, it cannot distinguish transient
+capacity failures from other false outcomes. Persistent false results consume
+the bounded budget and remain failures; no success is inferred from retries.
+
+The future retains source buffers and scheduler ownership through all retries.
+Shutdown wakes retry waits, then drains native calls before deregistration.
+This budget does not bound a running native call, extend a P/D handle's expiry,
+or relax readiness. Exhausted exports still cannot publish ready records.
+Diagnostics include bounded failed-object indices and export failure counts,
+without cache keys, buffer addresses or native exception messages.
+
+CPU regression evidence: `cpu-tests-r24.log`, 225 passed, 8 native skips,
+21.05 seconds. Tests cover selective retry/order, operation-wide exhaustion,
+malformed/exception outcomes during retry, unchanged GET failure behavior,
+shutdown/ownership and scheduler readiness before/after retry success or
+failure. `retry-pre-commit-r3.log` and `retry-code-commit.log` passed all
+applicable hooks. Earlier formatting/type-check failures are retained.
+Model-level verification of this new source is a separate gate below; the
+native diagnostic and CPU tests do not themselves pass it.
+
+## Two-host DRAM and SSD P/D retest at `408c3b752`
+
+The `multinode-r5` controller and independent full-arm verifier both passed all
+four cold/partial model cases. Recovered-source verification and the read-only
+post-cleanup audit also passed. This completes these limited TP1 smoke gates,
+not the broader multi-node feature acceptance matrix.
+The test preserves the previous model/native cases, 120-second handoff expiry,
+baseline token oracle, fail-on-receive-error policy and pinned MoRI binary.
+Only the vLLM source checkpoint and its verified source-install identity changed.
+
+| Medium | Decoder case | External tokens | Local tokens | Producer + decoder token IDs match baseline | Decoder wall time |
+| --- | --- | ---: | ---: | --- | ---: |
+| DRAM | Cold | 576 | 0 | Yes, 15 tokens | 3.222611 s |
+| DRAM | Partial prefix | 320 | 256 | Yes, 15 tokens | 3.375032 s |
+| ext4 SSD | Cold | 576 | 0 | Yes, 15 tokens | 5.122930 s |
+| ext4 SSD | Partial prefix | 320 | 256 | Yes, 15 tokens | 2.791323 s |
+
+The ordinary no-connector baselines took 0.765024 and 0.164925 seconds for the
+584-token prompt and identical 15-token output. Cold P/D returned one token
+from 003 and 14 from 004. The partial case first warmed 257 prompt tokens on
+004, preserving 256 locally reusable tokens. Both media first passed the
+forced cross-host 4096-byte poisoned-buffer transport check. These are smoke
+wall times including readiness/JIT effects, not a repeated matched benchmark.
+
+The SSD producer logged `chunk_start=16, attempts=2, initial_failed=7,
+remaining_failed=0`. Thus this model run actually exercised selective retries;
+the final export and receive completed under the unchanged deadlines. It does
+not prove general staging fairness or replace the earlier native-only diagnostic.
+The failed `multinode-r4` SSD partial case and physical-byte-accounting failure
+remain preserved. No physical traffic savings, pressure robustness or GDS are
+claimed. SSD used host-staged POSIX fallback on the existing local ext4 SSD0;
+the read-only model weights remained on the separate shared NFS cache.
+
+### Retest provenance and commands
+
+- vLLM Python source: `408c3b752eaf18dd9c055d9ab5bac3208c5071df`.
+- MoRI: unchanged `67632e80e2e492184b589904b63225f82d45537c`, tag `v1.2.3.post1`.
+- MoRI native library SHA256: `d2c9b02ed7da9a727e43f1f8155b97b7fb7fea71e6fd9ac31e09cc9a47702c60`.
+- Both runtimes: `vllm/vllm-openai-rocm:nightly-1dc464d42681d22f38caf1fdc1eb632dc4421c45`,
+  exact digest `sha256:40e19c756e3dc9ffc9117770904d40376c7d3bf529cc76ddc379cde7ac4dae2d`.
+  Native vLLM extensions are still the image's older binaries, not a current-source rebuild.
+- Model: `Qwen/Qwen3-0.6B`, revision `c1899de289a04d12100db370d81485cdf75e47ca`;
+  pre-existing on both hosts, no downloads.
+- llm-d-router/llm-d pins in the baseline table remain provenance only;
+  neither llm-d nor mori-sched participates in this offline `LLM` test.
+
+From `/home/ubuntu/vllmumbp`, commands executed with `set -o pipefail` and both
+streams logged through `tee`:
+
+```bash
+sha256sum -c local-logs/umbp-kvconnector-reimplementation-20260914/multinode-r5-launch-hashes.txt
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/multinode-r5-controller.py failure gate1
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/multinode-r5-controller.py smoke smoke1
+```
+
+The injected no-GPU failure gate exited 42 after verifying bounded live-launcher
+termination, recovery and cleanup on both hosts. Never overwrite existing
+attempt directories or launch overlapping attempts. A rerun requires fresh
+attempt names, runner preflight and manifest review. The controller owns setup,
+GPU execution, evidence recovery and exact cleanup; do not launch its fragments
+individually.
+
+Read-only verification commands after controller completion:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/verify-multinode-r1.py \
+  local-logs/umbp-kvconnector-reimplementation-20260914/multinode-r5-smoke1
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/verify-multinode-r5-source.py \
+  local-logs/umbp-kvconnector-reimplementation-20260914/multinode-r5-smoke1
+PYTHONDONTWRITEBYTECODE=1 repos/vllm/.venv/bin/python \
+  local-logs/umbp-kvconnector-reimplementation-20260914/multinode-r5-audit.py \
+  local-logs/umbp-kvconnector-reimplementation-20260914/multinode-r5-smoke1
+```
+
+Frozen SHA256 identities:
+
+- Controller: `da992ad97290368809e6af2cd5b50a3594e3dd01780047e7e7c15580f43d9d14`.
+- Host lifecycle: `1c1f441222b820a149b595c3e07d3da16e3b11fe7018f93ac77ea447e3dafcc5`.
+- Manifest: `15480d3e5cee65dab8ae2a24a1fa65011e90b116a1ae1641d82b98d176be7d05`.
+- Source archive: `3a18076a55fc705631de97319fa04e3bb08ffd397529db7a02501a683546a895`.
+- Installed-source hash list: `33805af9d1d8cdd6f63289ce8c89ed737892ef3d21b118e21c4db13edcf94157`.
+- Unchanged strict model verifier: `4204d6dac4e0eacde64b8cb45a8a18679d91bc0a3ca47960bb705fef92fe0ceb`.
+- Additional source verifier: `c1f4f715fa797148c316c87e72446656d01eb2fd046ae113358a46111ec05e44`.
+- Cleanup auditor: `5cf1ee14c67346a728957676b8a493f460fbe986e096f5a551bf8e703f01a6ce`.
+
+Full launch/per-input hashes and verifier hashes are in
+`multinode-r5-launch-hashes.txt` and `multinode-r5-verifier-hashes.txt`.
+The log is `multinode-r5-smoke1.log`; per-actor logs, RPC envelopes, result JSON
+and recovery artifacts are in `multinode-r5-smoke1/` on the VPS.
+
+The controller exited 0 after verifying both recovery archives against second
+stable remote streams and removing each exact marked task root and container.
+The image added on 004 was removed; 003's pre-existing image was retained.
+
+| Host | Recovery bytes | SHA256 |
+| --- | ---: | --- |
+| 003 | 769,625,463 | `08805795fdd2b69e5b82b90e1790903fed8c9d11064301b4ed05dee3d4d2a3a6` |
+| 004 | 769,401,320 | `d2909f4773d61458115da7af5f8b79ab70752ed76d22a735ee8439c309706a39` |
+
+All three independent checks exited 0:
+
+- `verify-multinode-r5.log`: the unchanged full-arm verifier compared every RPC
+  receipt with the recovered JSON, verified archives/native binary, distinct
+  host GPU UUIDs, actual attention/layout, handoff and baseline token equality,
+  external/local cache counters and native GET batches of 16/16/4 then 16/4
+  in each medium. It reports `multinode_pd_smoke_verified=true`,
+  `is_benchmark=false` and `physical_byte_accounting_verified=false`.
+- `verify-multinode-r5-source.log`: all 13 installed UMBP Python modules in
+  each recovered runtime match the frozen `408c3b752` hash list; actual installed
+  version/import markers match. It reports `multinode_source_identity_verified=true`.
+- `multinode-r5-final-audit.log`: exact task roots, processes, listeners and
+  labelled Docker resources absent; GPU memory returned to baseline on all
+  eight GPUs per host, with no KFD processes. Original container/image
+  inventories, SSD0 filesystem identity and pre-existing model size/config
+  checks were preserved. It reports `multinode_post_cleanup_audit_pass=true`.
+
+No task-created files or resources remain on either GPU host. The retained
+VPS archives allow reproduction review; these checks do not verify model
+accuracy, physical transfer bytes or sustained staging-pressure behavior.
