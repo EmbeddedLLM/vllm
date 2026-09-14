@@ -157,6 +157,9 @@ The proposed flow is:
 5. Publish successful loads through vLLM's cache manager. Report failed receive
    requests and affected block IDs through the connector failure APIs so the
    configured recompute/fail policy can run without consuming unwritten KV.
+   Keep receive destinations pinned until every rank's completion/error snapshot
+   has been consumed; native completion alone must not allow failed block IDs
+   to be reused before the scheduler processes their errors.
 
 Best-effort offload failure is a future miss, not a mandatory-delivery failure.
 P/D handoff has stronger completion requirements and must be represented as such.
@@ -344,6 +347,9 @@ The local prototype starts from `EmbeddedLLM/vllm:umbpkvconnector` at
 - `6b71857f514ac5b5b568c1bfeaca9fa7e7de6f35`: page mapping and fenced transfers.
 - `2f891e734513fa26d3c469c62b7dba64b3c2f656`: explicit native storage policy,
   layout-derived sizing checks and private SSD-path lifetime.
+- `4ab562728fff64cd2c12de8068f263e938c94c90`: cache-manager-owned transfer jobs,
+  rank-local asynchronous lookup, all-rank finalization and receive/error
+  snapshot retirement.
 
 MoRI remains unchanged at release commit
 `67632e80e2e492184b589904b63225f82d45537c`. The preserved llm-d-router reference
@@ -351,12 +357,15 @@ is `7541552c71642f2756517a7aeb3c0c35720c06d0`; llm-d is
 `d557f83e1e5f1e5a6ed54ef154c554cf6c775e33`. Neither has yet been ported or
 validated against this new connector implementation.
 
-Current evidence: **148 CPU tests passed** (146 UMBP component tests and two
-existing output-aggregation regressions). These cover physical layouts,
-generation/rank receipts, policy translation, private-path isolation and
-lifetime/failure cases using CPU buffers and a native-API fake. They do not
-establish HIP/RDMA/SSD correctness, actual vLLM
-scheduler ownership, complete P/D serving, model accuracy or performance.
+Current evidence at `4ab562728`: **164 CPU tests passed** (161 UMBP tests and
+three existing connector/output-aggregation regressions). These cover physical
+layouts, generation/rank receipts, policy translation, private-path isolation
+and lifetime/failure cases using CPU buffers and a native-API fake. Composed
+tests use the real KVCacheManager/BlockPool and both vLLM model-runner output
+collectors. They verify source pins, exclusive load destinations, all-rank
+finalization and delayed release until receive/error snapshots retire.
+They do not establish full Scheduler request-state integration, HIP/RDMA/SSD
+correctness, complete P/D serving, model accuracy or performance.
 No UMBPConnector is registered yet. Earlier integration results from other
 branches/releases are not carried over as validation of this prototype.
 
