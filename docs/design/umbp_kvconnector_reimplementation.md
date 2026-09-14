@@ -46,6 +46,20 @@ External HBM/DRAM placement reports are advisory, not proof that a corresponding
 UMBP object can be read. The new implementation must not equate a routing hint
 with completed, servable KV.
 
+Two additional release details affect the upcoming configuration layer:
+
+- `distributed.ranged_scratch_size` defaults to zero, disabling the remote
+  ranged-I/O arenas. Configure it explicitly to fit at least the largest
+  object, budgeting separate GET and PUT arenas on every worker.
+- The legacy distributed `medium` selects **one** local medium. Merely enabling
+  DRAM and SSD is not a tiering policy. Simultaneous peer-local DRAM/SSD tiering
+  requires an explicit `backend_policy_path`; without that policy, different
+  peers may serve different media, but this is not local promotion/demotion.
+
+These are source observations from the pinned
+[configuration contract](https://github.com/ROCm/mori/blob/67632e80e2e492184b589904b63225f82d45537c/src/umbp/include/umbp/common/config.h),
+not native behavior established by the CPU tests below.
+
 ## Intended architecture and ownership
 
 The planned `UMBPConnector` has producer, consumer and combined-cache roles.
@@ -108,13 +122,13 @@ completion behavior; it is not being relabeled as UMBP offloading.
 | Requirement | Destination / evidence needed | Current state |
 | --- | --- | --- |
 | Native API and owned ranged storage | `umbp/store.py`; CPU contracts, then real native pointer tests | CPU contracts implemented; native pending |
-| Compatible P/D/offload keys | `umbp/key.py`; canonical descriptor integration and identity isolation | Key namespace implemented; descriptor wiring pending |
+| Compatible P/D/offload keys | `umbp/key.py`, `umbp/layout.py`; descriptor integration and identity isolation | Logical rank-local descriptors implemented; scheduler handshake pending |
 | Scheduler lookup and allocation | KVConnector lookup, metadata, block ownership, asynchronous feedback | Pending |
-| Worker load/store and errors | Registered cache views, compute fences, completion snapshots and error block IDs | Pending |
+| Worker load/store and errors | Registered cache views, compute fences, completion snapshots and error block IDs | Transfer component CPU-tested; connector hooks/error-block delivery pending |
 | P/D handoff and incremental transfer | Producer/consumer protocol, all-rank commit, local-prefix reuse, two-engine transfer accounting | Pending |
 | Single-node DRAM and ext4 SSD offload | MoRI embedded deployment, forced eviction, byte/source reconciliation | Pending |
 | Multi-node DRAM/SSD restore | Master-led deployment, peer failures, safe recompute and recovery | Pending |
-| TP and hybrid cache geometry | Exact layouts, complete group/shard restoration, cancellation and preemption | Pending |
+| TP and hybrid cache geometry | Exact layouts, complete group/shard restoration, cancellation and preemption | Layout and rank-barrier CPU tests pass; real scheduler/hybrid semantics pending |
 | Placement and MoRI scheduling | Current authoritative placement API, lifecycle events, tier/locality/cost routing | Pending |
 | CPU/HBM prefetch and admission | Token-identity control, connector-owned load, TTL/cancel/drain/no-model invariants | Pending |
 | llm-d integration and fault recovery | Routing, prefetch, replay/gaps, staleness, reconnect/fail-open tests | Pending |
@@ -179,3 +193,82 @@ PYTHONDONTWRITEBYTECODE=1 "$TEST_VENV/bin/python" -m pytest \
 test. Existing connector regression suites and full plugin import/configuration
 checks must run during scheduler/worker integration. No native validation or
 end-to-end serving result has been inherited from the previous UMBP work.
+
+## Second implementation checkpoint: layout and transfer lifecycle
+
+Implemented components, still without a registered `UMBPConnector`:
+
+- `umbp/layout.py` validates views against vLLM's allocator and deduplicates
+  registration of shared backing allocations. Objects concatenate sorted layers
+  in logical H/N/C order. Physical LBHNC/LBNHC/LHBNC/BLHNC/BLNHC/BHLNC packing,
+  cache capacity and kernel-block splitting do not alter the stored bytes.
+  Padded bytes are omitted from ordinary layer views. Group-specific specs,
+  layer identity, dtype/encoding, topology and CP interleave enter the identity.
+- `umbp/worker.py` owns registered allocations, bounds admitted jobs, defers I/O
+  until the supplied compute fence passes, and rejects conflicting transfers by
+  physical byte ranges, including aliases across cache groups. A failed compute
+  fence is fatal; it cannot be interpreted as completed work or a cache miss.
+  Native queue pressure is retried within the bounded admitted set. Native
+  exceptions produce failed per-object receipts, including destinations that
+  may already have changed. Cancellation never claims to stop running DMA.
+- `umbp/metadata.py` uses an engine generation plus monotonically increasing
+  job sequence, independent of reusable request IDs. Rank receipts aggregate
+  idempotently. The completion barrier waits for every required rank even after
+  a failure, and requires every object to succeed before publication.
+
+Test design: the mapper's contract is logical group-block bytes in/out, with
+no overwrite outside the selected block; the worker's contract is an immutable
+job plus compute fence in and final per-rank outcomes out. Guarded failures
+include wrong strides, packed-layer overwrite, kernel-block ordering, early
+release, alias conflicts, partial native writes, duplicate acknowledgements and
+stale generations. CPU buffers plus deterministic thread barriers are the
+cheapest useful tests. The existing `KVOutputAggregator` is also exercised with
+the new worker metadata; this does not exercise scheduler ownership.
+
+The combined suite passed **114 CPU tests** (112 UMBP component tests plus two
+existing output-aggregator regressions). It includes all 36 source/destination
+physical-layout pairs with packed layers and unequal cache capacities, split
+kernel blocks, padded hybrid/Mamba geometry, per-layer uniform-wrapper specs,
+native read cancellation, queued cancellation, shutdown/fence draining, native
+failure after a partial write, and multi-rank/multi-group completion barriers.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 "$TEST_VENV/bin/python" -m pytest \
+  --confcutdir=tests/v1/kv_connector/unit \
+  tests/v1/kv_connector/unit/test_umbp_store.py \
+  tests/v1/kv_connector/unit/test_umbp_key.py \
+  tests/v1/kv_connector/unit/test_umbp_layout.py \
+  tests/v1/kv_connector/unit/test_umbp_worker.py \
+  tests/v1/kv_connector/unit/test_output_aggregator.py -q
+```
+
+Limitations and next integration work remain mandatory:
+
+1. Build the native configuration/policy adapter and actual connector hooks.
+   The scheduler must pin blocks, handle rejected admission with explicit failed
+   rank receipts, and deliver invalid load block IDs and request completions.
+   Worker job admission must follow increasing sequence order; a retired job
+   cannot be replayed to restart I/O. Constructor and shutdown ownership need
+   to be checked again in the real model-runner lifecycle.
+2. Exchange worker-derived identities before scheduler lookup. Scheduler configs
+   may flatten a `UniformTypeKVCacheSpecs` wrapper, so reconstructing the worker
+   identity from a representative scheduler layer is not sound. Quantization
+   scales/calibration not represented by a cache spec need an explicit compatible
+   identity or rejection; the current tests do not establish their portability.
+3. The current format deliberately requires matching TP/PP/CP topology. This is
+   not heterogeneous-TP resharding. Mamba byte-layout tests do not prove recurrent
+   checkpoint validity. Sliding windows, partial tails, preemption and boundary
+   state must be composed with the actual cache coordinator before serving.
+4. Non-prefix-cacheable state cannot use a prefix hash. The worker rejects such
+   jobs until request-scoped handoff keys and boundary-state handling exist.
+   Do not silently exclude required groups and then advertise a full P/D hit.
+5. A two-worker CPU buffer round trip is not two-engine P/D. Still required:
+   producer completion/decoder handoff, local-prefix-aware lookup, all-rank
+   publication, model output/accuracy tests, real MoRI GPU/RDMA/SSD evidence,
+   routing/prefetch migration, transfer-effectiveness measurements and cleanup.
+
+All applicable pre-commit checks must pass for each local checkpoint. The
+unrelated Actionlint hook is skipped for these Python/Markdown-only changes:
+its Go toolchain installer fails with a download/version-resolution error,
+and no `.github/workflows/` files are changed. Repository lint policy is
+unchanged. Full transcripts and failed intermediate runs remain on the VPS.
