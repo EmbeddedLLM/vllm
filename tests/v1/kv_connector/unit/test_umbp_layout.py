@@ -40,9 +40,17 @@ def attention_spec(**kwargs):
     )
 
 
-def allocation(groups, *, layout=KVCacheLayout.LBHNC, capacity=3, kernel_size=None):
+def allocation(
+    groups,
+    *,
+    layout=KVCacheLayout.LBHNC,
+    capacity=3,
+    kernel_size=None,
+    disjoint_groups=False,
+):
     placements = []
     layer_specs = {}
+    offset = 0
     for group in groups:
         for name in group.layer_names:
             layer_specs[name] = (
@@ -58,7 +66,8 @@ def allocation(groups, *, layout=KVCacheLayout.LBHNC, capacity=3, kernel_size=No
                     break
             else:
                 batches.append([name])
-        offset = 0
+        if not disjoint_groups:
+            offset = 0
         for names in batches:
             spec = layer_specs[names[0]]
             strides = compute_layout_strides(spec, capacity, len(names), layout)

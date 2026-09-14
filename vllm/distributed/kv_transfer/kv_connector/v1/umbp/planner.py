@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Request planning for immutable full-attention/MLA group blocks.
+"""Request planning for dense KV and validated recurrent checkpoints.
 
 Ordinary offload and optional P/D handoff share the transfer ownership ledger.
-Hybrid checkpoint and non-prefix state must not silently use this dense-prefix
-algorithm. The connector rejects those configurations until their planner lands.
+Recurrent saves use the scheduler's exact boundary offers, never mutable table
+positions. Hybrid P/D requires separate mandatory-export planning.
 """
 
 import time
@@ -31,6 +31,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_block_hashes,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
 
@@ -66,7 +67,18 @@ class UMBPRequestPlanner:
             group.kv_cache_spec.block_size
             for group in manager.kv_cache_config.kv_cache_groups
         )
-        self._alignment = lcm(*self._sizes)
+        self._checkpoint_groups = frozenset(
+            index
+            for index, group in enumerate(manager.kv_cache_config.kv_cache_groups)
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        )
+        self._hash_units = tuple(
+            manager.block_pool.hash_block_size
+            if group in self._checkpoint_groups
+            else size
+            for group, size in enumerate(self._sizes)
+        )
+        self._alignment = lcm(*self._hash_units)
         self._timeout = lookup_timeout
         self._requests: dict[str, Request] = {}
         self._lookups: dict[str, _Lookup] = {}
@@ -84,7 +96,7 @@ class UMBPRequestPlanner:
         return resolve_block_hashes(
             request.block_hashes,
             self.manager.block_pool.hash_block_size,
-            self._sizes[group],
+            self._hash_units[group],
         )
 
     def get_num_new_matched_tokens(
@@ -99,8 +111,14 @@ class UMBPRequestPlanner:
         maximum = (request.num_tokens - 1) // self._alignment * self._alignment
         if maximum <= num_computed_tokens:
             return 0, False
-        if num_computed_tokens % self._alignment:
-            raise ValueError("Dense external lookup requires an aligned local prefix")
+        if any(
+            num_computed_tokens % size
+            for group, size in enumerate(self._sizes)
+            if group not in self._checkpoint_groups
+        ):
+            # A fine-grained local hit may end inside an attention block. Do
+            # not overwrite its shared prefix with a whole-object receive.
+            return 0, False
         lookup = self._lookups.get(request.request_id)
         if lookup is not None and (
             lookup.local != num_computed_tokens
@@ -134,7 +152,7 @@ class UMBPRequestPlanner:
         if lookup.job is None:
             keys = tuple(
                 BlockKey(bytes(hashes[index]), group)
-                for group, size in enumerate(self._sizes)
+                for group, size in enumerate(self._hash_units)
                 for hashes in (self._hashes(request, group),)
                 for index in range(num_computed_tokens // size, maximum // size)
             )
@@ -159,11 +177,21 @@ class UMBPRequestPlanner:
             raise ValueError("External allocation disagrees with the lookup result")
         items = tuple(
             BlockTransfer(
-                bytes(hashes[index]), group, blocks.blocks[group][index].block_id
+                bytes(hashes[index]),
+                group,
+                blocks.blocks[group][
+                    (lookup.hit - 1) // self._sizes[group]
+                    if group in self._checkpoint_groups
+                    else index
+                ].block_id,
             )
-            for group, size in enumerate(self._sizes)
+            for group, size in enumerate(self._hash_units)
             for hashes in (self._hashes(request, group),)
-            for index in range(lookup.local // size, lookup.hit // size)
+            for index in (
+                (lookup.hit // size - 1,)
+                if group in self._checkpoint_groups
+                else range(lookup.local // size, lookup.hit // size)
+            )
         )
         job = self.transfers.transfer(request, "load", items)
         if job is None:
@@ -179,12 +207,64 @@ class UMBPRequestPlanner:
             return
         hit = lookup.maximum
         assert isinstance(outcome.job, LookupJob)
-        offsets = [lookup.local // size for size in self._sizes]
+        offsets = [lookup.local // size for size in self._hash_units]
+        checkpoints: dict[int, set[int]] = {
+            group: set() for group in self._checkpoint_groups
+        }
         for key, success in zip(outcome.job.blocks, outcome.successes, strict=True):
-            if not success:
+            if key.group_id in checkpoints:
+                if success:
+                    checkpoints[key.group_id].add(
+                        (offsets[key.group_id] + 1) * self._hash_units[key.group_id]
+                    )
+            elif not success:
                 hit = min(hit, offsets[key.group_id] * self._sizes[key.group_id])
             offsets[key.group_id] += 1
-        lookup.hit = hit // self._alignment * self._alignment
+        hit = hit // self._alignment * self._alignment
+        while hit > lookup.local and any(
+            hit not in boundaries for boundaries in checkpoints.values()
+        ):
+            hit -= self._alignment
+        lookup.hit = max(lookup.local, hit)
+
+    def _checkpoint_items(
+        self, request: Request, offers: list[tuple[int, int, int]], end: int
+    ) -> tuple[BlockTransfer, ...]:
+        saved = self._saved.get(request.request_id, set())
+        items: dict[BlockKey, BlockTransfer] = {}
+        for group, block_id, boundary in offers:
+            if (
+                group not in self._checkpoint_groups
+                or boundary <= 0
+                or boundary > end
+                or boundary % self._hash_units[group]
+            ):
+                continue
+            hashes = self._hashes(request, group)
+            index = boundary // self._hash_units[group] - 1
+            if index >= len(hashes):
+                continue
+            key = BlockKey(bytes(hashes[index]), group)
+            if key not in saved:
+                items.setdefault(key, BlockTransfer(key.block_hash, group, block_id))
+        return tuple(items.values())
+
+    def register_finished_partial_tail(
+        self, request: Request, offers: list[tuple[int, int, int]]
+    ) -> None:
+        if request.status in (
+            RequestStatus.FINISHED_ABORTED,
+            RequestStatus.FINISHED_ERROR,
+        ):
+            return
+        items = self._checkpoint_items(
+            request, offers, request.num_computed_tokens - request.num_in_flight_tokens
+        )
+        if items and (job := self.transfers.transfer(request, "store", items)):
+            self._store_owners[job.id] = request
+            self._saved.setdefault(request.request_id, set()).update(
+                BlockKey(item.block_hash, item.group_id) for item in items
+            )
 
     def update_connector_output(self, output: KVConnectorOutput) -> None:
         for outcome in self.transfers.update_connector_output(output):
@@ -237,8 +317,13 @@ class UMBPRequestPlanner:
                 self.handoff.preempted(request_id)
         if self.handoff is not None:
             self.handoff.build_jobs()
-        for request_id, count in output.num_scheduled_tokens.items():
-            request = self._requests[request_id]
+        block_state = output.kv_connector_block_state
+        offers = block_state.boundary_state_offloads if block_state else {}
+        for request_id in dict.fromkeys((*output.num_scheduled_tokens, *offers)):
+            request = self._requests.get(request_id)
+            if request is None:
+                continue
+            count = output.num_scheduled_tokens.get(request_id, 0)
             if self.handoff is not None and self.handoff.is_sender(request):
                 continue  # Mandatory export is owned by request_finished.
             # Scheduler counters advance after this hook. Speculative decoding
@@ -249,6 +334,8 @@ class UMBPRequestPlanner:
             groups = self.manager.get_blocks(request_id).blocks
             items = []
             for group, size in enumerate(self._sizes):
+                if group in self._checkpoint_groups:
+                    continue
                 hashes = self._hashes(request, group)
                 for index in range(cursors[group], min(end // size, len(hashes))):
                     block = groups[group][index]
@@ -266,6 +353,12 @@ class UMBPRequestPlanner:
                         items.append(
                             BlockTransfer(key.block_hash, group, block.block_id)
                         )
+            # Offers are valid in this scheduling pass. Pin now on admission;
+            # best-effort backpressure drops the offer, not an unowned block ID
+            # deferred to a later pass where its bytes could have changed.
+            items.extend(
+                self._checkpoint_items(request, offers.get(request_id, []), end)
+            )
             if items and (
                 job := self.transfers.transfer(request, "store", tuple(items))
             ):

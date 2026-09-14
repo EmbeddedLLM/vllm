@@ -3,8 +3,8 @@
 """Opt-in UMBP KVConnector wiring, pending native serving validation.
 
 Use the external module-path mechanism during development. Dense full-attention
-and MLA use the offload planner and optional pool-mediated P/D protocol. Hybrid
-boundary state and unvalidated parallel modes remain explicitly rejected.
+and MLA use the offload planner and optional pool-mediated P/D protocol. Aligned
+Mamba checkpoints support ordinary offload; hybrid P/D remains a separate gate.
 """
 
 import hashlib
@@ -56,6 +56,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVQuantMode,
+    MambaSpec,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -163,13 +164,29 @@ class UMBPConnector(KVConnectorBase_V1, SupportsHMA):
                 or group.host_resident
                 or group.is_eagle_group
                 or any(
-                    type(item) not in (FullAttentionSpec, MLAAttentionSpec)
+                    type(item) not in (FullAttentionSpec, MLAAttentionSpec, MambaSpec)
                     or not item.prefix_cacheable
                     for item in specs
                 )
             ):
                 raise ValueError("UMBP hybrid/non-prefix boundary planning is pending")
             for item in specs:
+                if isinstance(item, MambaSpec):
+                    if self._enable_pd:
+                        raise ValueError("UMBP hybrid P/D export planning is pending")
+                    if (
+                        not isinstance(spec, MambaSpec)
+                        or item.mamba_cache_mode != "align"
+                        or item.num_speculative_blocks
+                        or vllm_config.cache_config.mamba_cache_mode != "align"
+                    ):
+                        raise ValueError("UMBP recurrent offload requires Mamba align")
+                    if any(
+                        dtype not in (torch.float16, torch.bfloat16, torch.float32)
+                        for dtype in item.dtypes
+                    ):
+                        raise ValueError("UMBP recurrent state requires floating dtype")
+                    continue
                 assert isinstance(item, FullAttentionSpec)
                 if item.non_causal:
                     raise ValueError("Non-causal KV cannot use dense prefix reuse")
@@ -308,6 +325,17 @@ class UMBPConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self._planner is not None
         return self._planner.request_finished(request)
+
+    def register_finished_partial_tail(
+        self,
+        request: Request,
+        block_ids: tuple[list[int], ...],
+        partial_tail_offloads: list[tuple[int, int, int]],
+    ) -> bool:
+        assert self._planner is not None
+        self._planner.register_finished_partial_tail(request, partial_tail_offloads)
+        # Admitted stores hold independent block references, not the request.
+        return False
 
     def has_pending_push_work(self) -> bool:
         return (

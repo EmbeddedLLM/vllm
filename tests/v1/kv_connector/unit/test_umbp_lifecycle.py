@@ -62,7 +62,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.worker import UMBPTransfe
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import BlockHash, get_request_block_hasher
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVQuantMode
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVQuantMode, MambaSpec
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
@@ -157,12 +157,22 @@ def setup():
         worker.close()
 
 
-def test_store_pins_survive_request_free_until_every_rank_finishes(setup):
+@pytest.mark.parametrize("free_before_admission", [False, True])
+def test_store_pins_survive_request_free_until_every_rank_finishes(
+    setup, free_before_admission
+):
     s = setup()
     req, blocks = s.request()
+    if free_before_admission:
+        s.manager.free(req)
+        with pytest.raises(ValueError, match="cache record"):
+            s.scheduler.transfer(
+                req, "store", (replace(blocks[0], block_hash=b"stale"),)
+            )
     job = s.scheduler.transfer(req, "store", blocks)
     s.dispatch(ready=False)
-    s.manager.free(req)
+    if not free_before_admission:
+        s.manager.free(req)
     pool = s.manager.block_pool
     ids = {block.block_id for block in blocks}
     other = pool.get_new_blocks(pool.get_num_free_blocks())
@@ -549,7 +559,7 @@ def engine(monkeypatch):
         load_failure_policy="recompute",
     ):
         groups = groups or [KVCacheGroupSpec(["a"], attention_spec())]
-        cfg, raw, caches = allocation(groups, capacity=32)
+        cfg, raw, caches = allocation(groups, capacity=32, disjoint_groups=True)
         config = create_vllm_config(
             dtype=dtype,
             block_size=lcm(*(group.kv_cache_spec.block_size for group in groups)),
@@ -588,6 +598,8 @@ def engine(monkeypatch):
             ]
         # Avoid async-scheduler policy defaults in a serialized lifecycle test.
         config.scheduler_config.async_scheduling = False
+        if cfg.has_mamba_layers:
+            config.cache_config.mamba_cache_mode = "align"
         native = NativeStore()
         store = UMBPStore(
             native,
@@ -602,6 +614,13 @@ def engine(monkeypatch):
             config, KVConnectorRole.WORKER, cfg
         )
         worker.register_kv_caches(caches)
+        layout = UMBPLayout(cfg, caches, CacheTopology())
+
+        def pages(group, block_id):
+            obj = layout.block_object("test", group_id=group, block_id=block_id)
+            assert all(part.region.ptr == raw.data_ptr() for part in obj.slices)
+            return tuple(raw.narrow(0, part.offset, part.size) for part in obj.slices)
+
         resources.append((native, worker))
         scheduler = create_scheduler(
             config, num_blocks=32, kv_cache_config=cfg, hash_block_size=4
@@ -613,10 +632,35 @@ def engine(monkeypatch):
         computed: dict[str, int] = {}
         outputs = []
         engine_outputs = []
+        boundary_offers = []
+        build_meta = scheduler.connector.build_connector_meta
+
+        def capture_boundaries(scheduled):
+            state = scheduled.kv_connector_block_state
+            for req_id, entries in (
+                state.boundary_state_offloads if state else {}
+            ).items():
+                ids = scheduler.kv_cache_manager.get_block_ids(req_id)
+                for group, block_id, boundary in entries:
+                    size = groups[group].kv_cache_spec.block_size
+                    boundary_offers.append(
+                        (group, block_id, boundary, ids[group][(boundary - 1) // size])
+                    )
+            return build_meta(scheduled)
+
+        monkeypatch.setattr(
+            scheduler.connector, "build_connector_meta", capture_boundaries
+        )
 
         def step():
             scheduled = scheduler.schedule()
             jobs.extend(scheduled.kv_connector_metadata.jobs)
+            for source, destination in scheduled.kv_cache_block_copies or ():
+                for group in range(len(groups)):
+                    for src, dst in zip(
+                        pages(group, source), pages(group, destination), strict=True
+                    ):
+                        dst.copy_(src)
             req_ids = list(scheduled.num_scheduled_tokens)
             samples = []
             for req_id, count in scheduled.num_scheduled_tokens.items():
@@ -626,6 +670,12 @@ def engine(monkeypatch):
                 block_ids = scheduler.kv_cache_manager.get_block_ids(req_id)
                 for group, spec_group in enumerate(groups):
                     size = spec_group.kv_cache_spec.block_size
+                    if isinstance(spec_group.kv_cache_spec, MambaSpec):
+                        # The fake forward writes the state at its endpoint,
+                        # not every older positional/null entry in the table.
+                        for page in pages(group, block_ids[group][(end - 1) // size]):
+                            page.fill_(end)
+                        continue
                     for index in range((end - count) // size, (end + size - 1) // size):
                         for name in spec_group.layer_names:
                             caches[name][block_ids[group][index]].fill_(index + 7)
@@ -687,6 +737,8 @@ def engine(monkeypatch):
             config=config,
             caches=caches,
             raw=raw,
+            pages=pages,
+            boundary_offers=boundary_offers,
             jobs=jobs,
             computed=computed,
             outputs=outputs,
@@ -743,10 +795,11 @@ def test_full_scheduler_offload_restores_only_the_missing_prefix(
     assert not e.scheduler.connector.has_pending_block_frees()
 
 
+@pytest.mark.parametrize("hybrid", [False, True])
 def test_full_scheduler_failed_receive_recomputes_without_retry_loop(
-    engine, monkeypatch
+    engine, monkeypatch, hybrid
 ):
-    e = engine()
+    e = engine(groups=hybrid_groups() if hybrid else None)
     first = e.request(110)
     e.scheduler.add_request(first)
     e.drain()
@@ -877,6 +930,152 @@ def test_full_scheduler_unequal_group_blocks_share_a_valid_hit_boundary(engine):
     assert e.computed[second.request_id] == 1
 
 
+def hybrid_groups():
+    return [
+        KVCacheGroupSpec(["a"], attention_spec()),
+        KVCacheGroupSpec(
+            ["state"],
+            MambaSpec(
+                block_size=8,
+                shapes=((4, 2), (4, 2)),
+                dtypes=(torch.float32, torch.float16),
+                page_size_padded=64,
+                mamba_cache_mode="align",
+            ),
+        ),
+    ]
+
+
+@pytest.mark.parametrize("local_prefix", [0, 8])
+def test_hybrid_offload_restores_endpoint_despite_missing_earlier_checkpoint(
+    engine, local_prefix
+):
+    e = engine(groups=hybrid_groups())
+    first = e.request(132, tokens=17)
+    e.scheduler.add_request(first)
+    e.drain()
+    # The 16-token prefill stores only its actual endpoint state, not state8.
+    states = [value for value in e.native.data.values() if len(value) == 48]
+    assert states == [bytes([16]) * 48]
+    pool = e.scheduler.kv_cache_manager.block_pool
+    assert pool.reset_prefix_cache()
+    e.raw.fill_(-99)
+    if local_prefix:
+        seed = e.request(133, tokens=local_prefix)
+        manager = e.scheduler.kv_cache_manager
+        manager.allocate_slots(seed, local_prefix)
+        ids = manager.get_block_ids(seed.request_id)
+        for index, block_id in enumerate(ids[0]):
+            e.caches["a"][block_id].fill_(index + 7)
+        for page in e.pages(1, ids[1][-1]):
+            page.fill_(local_prefix)
+        manager.free(seed)
+    e.jobs.clear()
+    second = e.request(134, tokens=17)
+    e.scheduler.add_request(second)
+    e.until(lambda: second.request_id in e.scheduler.finished_recving_kv_req_ids)
+    ids = e.scheduler.kv_cache_manager.get_block_ids(second.request_id)
+    for index in range(4):
+        assert torch.all(e.caches["a"][ids[0][index]] == index + 7)
+    assert all(torch.all(page == 16) for page in e.pages(1, ids[1][1]))
+    loads = [
+        job
+        for job in e.jobs
+        if isinstance(job, TransferJob) and job.operation == "load"
+    ]
+    assert len(loads) == 1
+    assert [block.group_id for block in loads[0].blocks] == [0] * (
+        (16 - local_prefix) // 4
+    ) + [1]
+    e.drain()
+    assert e.computed[second.request_id] == 1
+    assert pool.get_num_free_blocks() == 31
+    assert not e.scheduler.connector.has_pending_block_frees()
+
+
+def test_hybrid_pd_is_rejected_until_checkpoint_export_is_owned(engine):
+    with pytest.raises(ValueError, match="hybrid P/D export"):
+        engine(groups=hybrid_groups(), enable_pd=True)
+
+
+@pytest.mark.parametrize("tokens", [12, 13])
+def test_hybrid_partial_checkpoint_uses_finished_or_cow_source_not_mutable_table(
+    engine, tokens
+):
+    e = engine(groups=hybrid_groups())
+    first = e.request(135, tokens=tokens)
+    e.scheduler.add_request(first)
+    e.drain()
+    assert bytes([12]) * 48 in e.native.data.values()
+    if tokens == 13:
+        assert any(
+            group == 1 and boundary == 12 and source != table
+            for group, source, boundary, table in e.boundary_offers
+        ), "The partial checkpoint must come from its CoW copy"
+    assert e.scheduler.kv_cache_manager.block_pool.reset_prefix_cache()
+    e.raw.fill_(-99)
+    e.jobs.clear()
+    second = e.request(136, tokens=13)
+    e.scheduler.add_request(second)
+    e.until(lambda: second.request_id in e.scheduler.finished_recving_kv_req_ids)
+    ids = e.scheduler.kv_cache_manager.get_block_ids(second.request_id)
+    state_id = ids[1][1]
+    assert all(torch.all(page == 12) for page in e.pages(1, state_id))
+    placement = e.cfg.kv_cache_tensors[1]
+    padding = placement.offset + state_id * placement.block_stride + 48
+    assert torch.all(e.raw[padding : padding + 16] == -99)
+    loads = [
+        job
+        for job in e.jobs
+        if isinstance(job, TransferJob) and job.operation == "load"
+    ]
+    assert len(loads) == 1
+    assert [block.group_id for block in loads[0].blocks] == [0, 0, 0, 1]
+    assert loads[0].blocks[-1].block_hash == bytes(second.block_hashes[2])
+    e.drain()
+    assert e.computed[second.request_id] == 1
+    assert e.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 31
+
+
+@pytest.mark.parametrize("missing", ["state", "attention", "all_states"])
+def test_hybrid_lookup_requires_joint_attention_prefix_and_endpoint_state(
+    engine, missing
+):
+    e = engine(groups=hybrid_groups(), budget=8)
+    first = e.request(137, tokens=17)
+    e.scheduler.add_request(first)
+    e.drain()
+    assert bytes([8]) * 48 in e.native.data.values()
+    assert bytes([16]) * 48 in e.native.data.values()
+    dense_hole = bytes(torch.full((32,), 9, dtype=torch.float16).view(torch.uint8))
+    for key, value in list(e.native.data.items()):
+        if (
+            (missing == "state" and value == bytes([16]) * 48)
+            or (missing == "attention" and value == dense_hole)
+            or (missing == "all_states" and len(value) == 48)
+        ):
+            del e.native.data[key]
+    assert e.scheduler.kv_cache_manager.block_pool.reset_prefix_cache()
+    e.raw.fill_(-99)
+    e.jobs.clear()
+    second = e.request(138, tokens=17)
+    e.scheduler.add_request(second)
+    e.drain()
+    loads = [
+        job
+        for job in e.jobs
+        if isinstance(job, TransferJob) and job.operation == "load"
+    ]
+    if missing == "all_states":
+        assert not loads
+        assert e.computed[second.request_id] == 17
+    else:
+        assert len(loads) == 1
+        assert [block.group_id for block in loads[0].blocks] == [0, 0, 1]
+        assert loads[0].blocks[-1].block_hash == bytes(second.block_hashes[1])
+        assert e.computed[second.request_id] == 9
+
+
 def test_full_scheduler_lookup_timeout_recomputes_while_native_lookup_drains(
     engine, monkeypatch
 ):
@@ -902,10 +1101,11 @@ def test_full_scheduler_lookup_timeout_recomputes_while_native_lookup_drains(
     )
 
 
+@pytest.mark.parametrize("hybrid", [False, True])
 def test_full_scheduler_abort_keeps_receive_owned_until_native_completion(
-    engine, monkeypatch
+    engine, monkeypatch, hybrid
 ):
-    e = engine()
+    e = engine(groups=hybrid_groups() if hybrid else None)
     first = e.request(150)
     e.scheduler.add_request(first)
     e.drain()
@@ -925,7 +1125,12 @@ def test_full_scheduler_abort_keeps_receive_owned_until_native_completion(
         e.until(lambda: request.status == RequestStatus.WAITING_FOR_REMOTE_KVS)
         assert entered.wait(5)
         pool = e.scheduler.kv_cache_manager.block_pool
-        ids = e.scheduler.kv_cache_manager.get_block_ids(request.request_id)[0]
+        ids = [
+            index
+            for group in e.scheduler.kv_cache_manager.get_block_ids(request.request_id)
+            for index in group
+            if not pool.blocks[index].is_null
+        ]
         e.scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         e.step()
         assert all(pool.blocks[index].ref_cnt > 0 for index in ids)

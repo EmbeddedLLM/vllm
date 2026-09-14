@@ -166,7 +166,7 @@ class UMBPTransferScheduler:
             if item.block_id >= len(self._pool.blocks):
                 raise ValueError("Transfer block is outside the GPU pool")
             block = self._pool.blocks[item.block_id]
-            if block.is_null or block.ref_cnt <= 0:
+            if block.is_null or (operation == "load" and block.ref_cnt <= 0):
                 raise ValueError("Transfer requires an allocated non-null block")
             if operation == "store":
                 key = make_block_hash_with_group_id(
@@ -176,6 +176,10 @@ class UMBPTransferScheduler:
                     key, item.block_id
                 ):
                     raise ValueError("Store source does not match a vLLM cache record")
+                # A synchronous scheduler can release a CoW destination to
+                # the cache before offering it here. Its exact record remains
+                # valid; touch below removes it from the free queue before any
+                # further allocation. Never apply this rule to load targets.
             elif not any(
                 candidate is block for candidate in owned[item.group_id]
             ) or not self._pool.is_block_writable(block):
