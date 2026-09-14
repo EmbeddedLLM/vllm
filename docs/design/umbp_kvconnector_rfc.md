@@ -342,14 +342,30 @@ The local prototype starts from `EmbeddedLLM/vllm:umbpkvconnector` at
 
 - `d9692bb0f9ec30a72a5307c338c2199f0c4b74cb`: ranged storage and key identities.
 - `6b71857f514ac5b5b568c1bfeaca9fa7e7de6f35`: page mapping and fenced transfers.
+- `2f891e734513fa26d3c469c62b7dba64b3c2f656`: explicit native storage policy,
+  layout-derived sizing checks and private SSD-path lifetime.
 
-Current evidence: **114 CPU tests passed** (112 UMBP component tests and two
+MoRI remains unchanged at release commit
+`67632e80e2e492184b589904b63225f82d45537c`. The preserved llm-d-router reference
+is `7541552c71642f2756517a7aeb3c0c35720c06d0`; llm-d is
+`d557f83e1e5f1e5a6ed54ef154c554cf6c775e33`. Neither has yet been ported or
+validated against this new connector implementation.
+
+Current evidence: **148 CPU tests passed** (146 UMBP component tests and two
 existing output-aggregation regressions). These cover physical layouts,
-generation/rank receipts and lifetime/failure cases using CPU buffers and a
-native-API fake. They do not establish HIP/RDMA/SSD correctness, actual vLLM
+generation/rank receipts, policy translation, private-path isolation and
+lifetime/failure cases using CPU buffers and a native-API fake. They do not
+establish HIP/RDMA/SSD correctness, actual vLLM
 scheduler ownership, complete P/D serving, model accuracy or performance.
 No UMBPConnector is registered yet. Earlier integration results from other
 branches/releases are not carried over as validation of this prototype.
+
+One native integrity gap needs explicit resolution: the pinned
+[SSD ranged-read interface](https://github.com/ROCm/mori/blob/67632e80e2e492184b589904b63225f82d45537c/src/umbp/include/umbp/local/tiers/ssd_tier.h)
+does not verify whole-record CRCs on ranged reads. Enabling the native CRC
+option alone is therefore insufficient evidence of corruption detection on
+this path. The implementation needs an integrity strategy and fault-injection
+evidence before claiming that corrupted KV reliably triggers recomputation.
 
 See the adjacent `umbp_kvconnector_reimplementation.md` for commands and detailed
 acceptance tracking. Public reproduction artifacts must accompany a future PR;
