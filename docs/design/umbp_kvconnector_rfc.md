@@ -314,29 +314,29 @@ sequenceDiagram
         D->>U: Wait for rank marker and missing-object visibility
     end
     alt Readiness observed before deadline
-        Note over U,H: Alternatives depend on object placement; only missing KV is loaded
-        alt Object on decoder-local SSD; GDS fastpath available
+        Note over U,H: Alternatives depend on object placement, only missing KV is loaded
+        alt Object on decoder-local SSD, GDS fastpath available
             D->>S: MoRI GdsEngine / hipFile read
             S->>H: Direct SSD-to-HBM transfer
             Note over D,H: Optional aligned HBM staging + GPU scatter if required
-        else Object on decoder-local SSD; non-GDS or allowed fallback
+        else Object on decoder-local SSD, non-GDS or allowed fallback
             D->>S: Host-staged SSD read
             S->>B: SSD bytes into host staging
             B->>H: Host-to-device copy
         else Object on another host's SSD
             D->>U: Remote missing-KV GET
             U->>U: Read SSD into peer-side host staging
-            U->>H: Network transfer; destination staging depends on transport
+            U->>H: Network transfer, destination staging depends on transport
             Note over U,H: Not a direct local-file GDS read across hosts
         end
         H-->>D: Per-rank transfer and GPU-scatter outcomes
         alt Every required receive succeeded
             D->>D: Publish loaded KV and admit decode
         else Missing data or failed read
-            D->>D: Invalidate failed receive; recompute or fail by policy
+            D->>D: Invalidate failed receive, recompute or fail by policy
         end
     else Readiness timeout
-        D->>D: No KV GET; retire receive and recompute or fail by policy
+        D->>D: No KV GET, retire receive and recompute or fail by policy
     end
 ```
 
