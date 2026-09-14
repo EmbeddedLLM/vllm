@@ -1154,6 +1154,43 @@ def test_pd_handle_precedes_readiness_and_decode_loads_only_missing_prefix(
     assert all(not output.invalid_block_ids for output in decode.outputs)
 
 
+def test_pd_marker_cannot_authorize_get_before_missing_objects_are_visible(
+    engine, monkeypatch
+):
+    """A local marker can precede a peer's heartbeat-delivered KV routes."""
+    prefill = engine(kv_role="kv_producer")
+    decode = engine(kv_role="kv_consumer")
+    decode.native.data = prefill.native.data
+    first, params, handle = complete_prefill(prefill)
+    visible = threading.Event()
+    exists = decode.native.batch_exists
+
+    def delayed_visibility(keys):
+        results = exists(keys)
+        return [
+            found and (key == handle.ready_key(0) or visible.is_set())
+            for key, found in zip(keys, results, strict=True)
+        ]
+
+    probe = MagicMock(side_effect=delayed_visibility)
+    get = MagicMock(wraps=decode.native.batch_get_ranges_into_ptr)
+    monkeypatch.setattr(decode.native, "batch_exists", probe)
+    monkeypatch.setattr(decode.native, "batch_get_ranges_into_ptr", get)
+    second = decode_request("delayed-visibility", first, params)
+    decode.scheduler.add_request(second)
+    decode.until(lambda: probe.call_count >= 2 or get.call_count > 0)
+    get.assert_not_called()
+    assert second.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert second.request_id not in decode.computed
+    visible.set()
+    decode.drain()
+    get.assert_called_once()
+    assert probe.call_args.args[0] == [handle.ready_key(0), *get.call_args.args[0]]
+    assert decode.computed[second.request_id] == 1
+    assert not any(output.invalid_block_ids for output in decode.outputs)
+    assert decode.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 31
+
+
 def test_pd_failed_export_never_publishes_readiness_and_decode_recomputes(
     engine, monkeypatch
 ):
@@ -1218,14 +1255,22 @@ def test_pd_invalid_handoff_never_authorizes_a_receive(
 
 
 @pytest.mark.parametrize("policy", ["recompute", "fail"])
-def test_pd_eviction_after_readiness_obeys_receive_failure_policy(engine, policy):
+def test_pd_eviction_after_readiness_obeys_receive_failure_policy(
+    engine, monkeypatch, policy
+):
     prefill = engine(kv_role="kv_producer")
     decode = engine(kv_role="kv_consumer", load_failure_policy=policy)
     decode.native.data = prefill.native.data
     first, params, handle = complete_prefill(prefill)
     assert handle.ready_key(0) in prefill.native.data
     victim = next(key for key in prefill.native.data if ":pd-ready:" not in key)
-    del prefill.native.data[victim]
+    get = decode.native.batch_get_ranges_into_ptr
+
+    def evict_after_probe(*args):
+        del prefill.native.data[victim]
+        return get(*args)
+
+    monkeypatch.setattr(decode.native, "batch_get_ranges_into_ptr", evict_after_probe)
     second = decode_request("evicted-handoff", first, params)
     decode.scheduler.add_request(second)
     decode.drain()

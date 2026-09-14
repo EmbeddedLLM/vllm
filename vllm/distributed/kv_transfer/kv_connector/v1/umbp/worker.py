@@ -190,9 +190,16 @@ class UMBPTransferWorker:
         if pending.ready_future is None:
             if time.monotonic() < pending.next_probe:
                 return False
-            pending.ready_future = self._store.lookup((handle.ready_key(self._rank),))
+            # Local marker visibility can precede heartbeat-delivered routes
+            # for KV held by another peer. Gate on the missing objects too.
+            pending.ready_future = self._store.lookup(
+                (handle.ready_key(self._rank),)
+                + tuple(obj.key for obj in pending.objects)
+            )
         if pending.ready_future.done():
-            pending.ready = pending.ready_future.result() == (True,)
+            pending.ready = pending.ready_future.result() == (True,) * (
+                len(pending.objects) + 1
+            )
             pending.ready_future = None
             pending.next_probe = time.monotonic() + 0.01
         return pending.ready
