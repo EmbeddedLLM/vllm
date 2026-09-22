@@ -287,6 +287,7 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             RoutingMethodType.Renormalize,
             RoutingMethodType.RenormalizeNaive,
             RoutingMethodType.DeepseekV4,
+            RoutingMethodType.DeepSeekV3,
         )
 
     @staticmethod
@@ -336,7 +337,32 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             RoutingMethodType.Renormalize,
             RoutingMethodType.RenormalizeNaive,
             RoutingMethodType.DeepseekV4,
+            RoutingMethodType.DeepSeekV3,
         ]
+
+    @staticmethod
+    def is_supported_config(
+        cls: type[mk.FusedMoEExperts],
+        moe_config: FusedMoEConfig,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+        activation_format: mk.FusedMoEActivationFormat,
+    ) -> tuple[bool, str | None]:
+        # An ungrouped sigmoid router is served by aiter's *grouped* top-k over a
+        # single group, which supports at most 256 experts. Refuse larger routers
+        # here (e.g. MiMo-V2.6-Pro's 384 experts) instead of tripping an assert on
+        # the first forward.
+        if (
+            moe_config.routing_method == RoutingMethodType.DeepSeekV3
+            and moe_config.num_experts > 256
+        ):
+            return False, (
+                "kernel does not support ungrouped sigmoid routing with more than "
+                f"256 experts ({moe_config.num_experts})"
+            )
+        return mk.FusedMoEExpertsMonolithic.is_supported_config(
+            cls, moe_config, weight_key, activation_key, activation_format
+        )
 
     @staticmethod
     def _supports_router_logits_dtype(
@@ -370,6 +396,31 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             if self.moe_config.routing_method == RoutingMethodType.DeepseekV4
             else None
         )
+        if score_mode is None and (
+            self.moe_config.routing_method == RoutingMethodType.DeepSeekV3
+        ):
+            # aiter's flat top-k only transforms scores with softmax or
+            # sqrtsoftplus, so an *ungrouped* sigmoid + correction-bias router
+            # (DeepSeekV3 classification with num_expert_group <= 1, e.g.
+            # MiMo-V2.6) goes through the grouped kernel with every group kept:
+            # topk_group == num_expert_group makes the group stage a no-op
+            # (global top-k), and the kernel returns the unbiased sigmoid
+            # scores as routing weights (the "noaux_tc" pattern).
+            assert e_score_correction_bias is not None, (
+                "DeepSeekV3 routing requires e_score_correction_bias"
+            )
+            assert num_expert_group is None or num_expert_group <= 1, (
+                "grouped sigmoid routing is not validated on this backend"
+            )
+            assert global_num_experts % 2 == 0, (
+                "ungrouped sigmoid routing needs an even expert count"
+            )
+            assert global_num_experts <= 256, (
+                "aiter's grouped top-k supports at most 256 experts"
+            )
+            score_mode = "sigmoid"
+            num_expert_group = 2
+            topk_group = 2
         return aiter_triton_kernel_w4a16_moe_forward(
             hidden_states=hidden_states,
             w1=w1,
