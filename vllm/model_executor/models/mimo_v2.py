@@ -297,13 +297,16 @@ class MiMoV2Attention(nn.Module):
 
         sliding_window = sliding_window_size if sliding_window_size > -1 else None
 
-        # Use DiffKV backend when V has a different head dim than K.
+        # Use a backend that can take a different head dim for V than for K.
         # Auto-pick FA-DiffKV when FA3/4 is usable on this device, else fall
-        # back to TRITON_ATTN_DIFFKV.  Users can force a choice via
-        # `--attention-backend <FLASH_ATTN_DIFFKV|TRITON_ATTN_DIFFKV>`.
+        # back to TRITON_ATTN_DIFFKV.  Any explicit `--attention-backend` is
+        # honored instead (e.g. ROCM_AITER_UNIFIED_ATTN, which keeps K and V
+        # packed in the content dim and takes asymmetric head sizes); a chosen
+        # backend that cannot take head_size_v != head_size fails fast on the
+        # set_head_size_v contract below or on its first forward.
         if self.v_head_dim != self.head_dim:
             requested = get_current_vllm_config().attention_config.backend
-            if requested is not None and requested.name.endswith("_DIFFKV"):
+            if requested is not None:
                 backend_enum = requested
             else:
                 fa_backend = AttentionBackendEnum.FLASH_ATTN_DIFFKV.get_class()
@@ -317,8 +320,24 @@ class MiMoV2Attention(nn.Module):
                 else:
                     backend_enum = AttentionBackendEnum.TRITON_ATTN_DIFFKV
             attn_backend = backend_enum.get_class()
-            assert hasattr(attn_backend, "set_head_size_v")
-            attn_backend.set_head_size_v(self.v_head_dim)
+            if hasattr(attn_backend, "set_head_size_v"):
+                # DiffKV family: kernels read V's head size from this class-
+                # level shutter (set once, before instantiation).
+                attn_backend.set_head_size_v(self.v_head_dim)
+            else:
+                # Spec-packed backends (e.g. ROCM_AITER_UNIFIED_ATTN, which
+                # keeps K‖V packed in the content dim and splits at head_size
+                # inside the impl) get V's width from the layer's KV spec,
+                # which Attention() constructs below with head_size_v=. A
+                # backend accepting K/V asymmetry through neither contract
+                # aborts on its own spec preparation (RocmAttentionBackend.
+                # customize_spec asserts it), i.e. still fail-fast.
+                logger.info_once(
+                    "%s: no class-level set_head_size_v; "
+                    "head_size_v=%d flows via the KV spec.",
+                    attn_backend.get_name(),
+                    self.v_head_dim,
+                )
             logger.info_once("Using %s for attention.", attn_backend.get_name())
         else:
             attn_backend = None

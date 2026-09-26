@@ -330,10 +330,11 @@ __global__ void reshape_and_cache_flash_kernel(
     cache_t* __restrict__ value_cache,   // same above
     const int64_t* __restrict__ slot_mapping,  // [num_tokens]
     const int64_t block_stride, const int64_t page_stride,
-    const int64_t head_stride, const int64_t key_stride,
+    const int64_t head_stride, const int64_t v_page_stride,
+    const int64_t v_head_stride, const int64_t key_stride,
     const int64_t value_stride, const int num_heads, const int head_size,
-    const int block_size, const float* k_scale, const float* v_scale,
-    const int kv_scale_stride) {
+    const int v_head_size, const int block_size, const float* k_scale,
+    const float* v_scale, const int kv_scale_stride) {
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
   // NOTE: slot_idx can be -1 if the token is padded
@@ -343,6 +344,7 @@ __global__ void reshape_and_cache_flash_kernel(
   const int64_t block_idx = slot_idx / block_size;
   const int64_t block_offset = slot_idx % block_size;
   const int n_elems = num_heads * head_size;
+  const int v_n_elems = num_heads * v_head_size;
 
   // pointers to the beginning of the source row for this token.
   const scalar_t* __restrict__ key_src = key + token_idx * key_stride;
@@ -352,10 +354,13 @@ __global__ void reshape_and_cache_flash_kernel(
   cache_t* __restrict__ key_dst =
       key_cache + block_idx * block_stride + block_offset * page_stride;
   cache_t* __restrict__ value_dst =
-      value_cache + block_idx * block_stride + block_offset * page_stride;
+      value_cache + block_idx * block_stride + block_offset * v_page_stride;
 
-  // this is true for the NHD layout where `head_stride == head_size`
-  const bool is_contiguous_heads = (head_stride == head_size);
+  // NHD contiguity is judged per side: key and value head widths may differ
+  // (e.g. MiMo qk=192 / v=128 packed views), so each cache's own head stride
+  // must match its own head width before the flat fast path is legal.
+  const bool is_contiguous_heads = (head_stride == head_size) &&
+                                   (v_head_stride == v_head_size);
 
   constexpr int VEC_SIZE = (sizeof(scalar_t) == 2) ? 8 : 4;
 
@@ -370,7 +375,7 @@ __global__ void reshape_and_cache_flash_kernel(
 
     vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems, threadIdx.x,
                                        blockDim.x, k_op);
-    vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, n_elems,
+    vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, v_n_elems,
                                        threadIdx.x, blockDim.x, v_op);
   } else {
     // HND layout OR k/v_scales are [num_heads] (i.e. per-attn-head)
@@ -382,12 +387,12 @@ __global__ void reshape_and_cache_flash_kernel(
 
     for (int head = warp_id; head < num_heads; head += warps_per_block) {
       const scalar_t* __restrict__ k_src_h = key_src + head * head_size;
-      const scalar_t* __restrict__ v_src_h = value_src + head * head_size;
+      const scalar_t* __restrict__ v_src_h = value_src + head * v_head_size;
 
       cache_t* __restrict__ k_dst_h =
           key_dst + static_cast<int64_t>(head) * head_stride;
       cache_t* __restrict__ v_dst_h =
-          value_dst + static_cast<int64_t>(head) * head_stride;
+          value_dst + static_cast<int64_t>(head) * v_head_stride;
 
       float k_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto)
                               ? 0.f
@@ -404,7 +409,7 @@ __global__ void reshape_and_cache_flash_kernel(
       vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size, lane, 32,
                                          k_op);
 
-      vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size, lane, 32,
+      vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, v_head_size, lane, 32,
                                          v_op);
     }
   }
@@ -812,8 +817,9 @@ void reshape_and_cache(
           reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                  \
           reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                \
           slot_mapping.const_data_ptr<int64_t>(), block_stride, page_stride, \
-          head_stride, key_stride, value_stride, num_heads, head_size,       \
-          block_size, reinterpret_cast<const float*>(k_scale.data_ptr()),    \
+          head_stride, v_page_stride, v_head_stride, key_stride,             \
+          value_stride, num_heads, head_size, v_head_size, block_size,       \
+          reinterpret_cast<const float*>(k_scale.data_ptr()),                \
           reinterpret_cast<const float*>(v_scale.data_ptr()),                \
           kv_scale_stride);
 
@@ -841,6 +847,7 @@ void reshape_and_cache_flash(
   int num_tokens = slot_mapping.size(0);
   int num_heads = key.size(1);
   int head_size = key.size(2);
+  int v_head_size = value.size(2);
 
   const torch::stable::accelerator::DeviceGuard device_guard(
       key.get_device_index());
@@ -874,7 +881,14 @@ void reshape_and_cache_flash(
   int64_t block_stride = key_cache.stride(0);
   int64_t page_stride = key_cache.stride(1);
   int64_t head_stride = key_cache.stride(2);
+  int64_t v_page_stride = value_cache.stride(1);
+  int64_t v_head_stride = value_cache.stride(2);
   STD_TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0));
+  STD_TORCH_CHECK(key_cache.size(0) == value_cache.size(0) &&
+                      key_cache.size(1) == value_cache.size(1),
+                  "key_cache and value_cache must share block geometry");
+  STD_TORCH_CHECK(key.size(1) == value.size(1),
+                  "key and value must have the same number of heads");
 
   STD_TORCH_CHECK(k_scale.sizes().equals(v_scale.sizes()),
                   "k_scale and v_scale must have the same shape");
@@ -883,7 +897,7 @@ void reshape_and_cache_flash(
   int kv_scale_stride = (k_scale.numel() > 1) ? 1 : 0;
 
   dim3 grid(num_tokens);
-  dim3 block(std::min(num_heads * head_size, 512));
+  dim3 block(std::min(num_heads * std::max(head_size, v_head_size), 512));
 
   DISPATCH_BY_KV_CACHE_DTYPE(key.scalar_type(), kv_cache_dtype,
                              CALL_RESHAPE_AND_CACHE_FLASH);
