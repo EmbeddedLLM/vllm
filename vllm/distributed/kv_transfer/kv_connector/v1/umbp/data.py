@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -652,6 +653,14 @@ class TransferJobState:
     failed_keys: set[str] = field(default_factory=set)
     error: str | None = None
     plan_bytes: tuple[int, ...] | None = None
+    started_at: float | None = field(default=None, repr=False, compare=False)
+    finished_at: float | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def duration_seconds(self) -> float | None:
+        if self.started_at is None or self.finished_at is None:
+            return None
+        return self.finished_at - self.started_at
 
     @property
     def keys(self) -> Sequence[str]:
@@ -677,6 +686,7 @@ class TransferJobState:
     def start(self) -> None:
         if self.status != TransferJobStatus.PENDING:
             raise RuntimeError(f"cannot start job in state {self.status}")
+        self.started_at = time.perf_counter()
         self.status = TransferJobStatus.RUNNING
 
     def complete(self, keys: Sequence[str] = ()) -> None:
@@ -691,6 +701,7 @@ class TransferJobState:
     def cancel(self, error: str = "cancelled") -> None:
         self.error = error
         self.status = TransferJobStatus.CANCELLED
+        self.finished_at = time.perf_counter()
 
     @property
     def failed_block_ids(self) -> set[int]:
@@ -712,6 +723,8 @@ class TransferJobState:
                 if self.failed_keys
                 else TransferJobStatus.COMPLETED
             )
+            if self.finished_at is None:
+                self.finished_at = time.perf_counter()
 
 
 @dataclass

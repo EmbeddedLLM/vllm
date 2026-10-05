@@ -2293,9 +2293,26 @@ def test_worker_emits_block_removed_for_runtime_eviction(enable_events):
 
 def test_umbp_stats_aggregate_and_reduce():
     first = UMBPStoreConnectorStats()
-    first.record("load", submitted=2, completed=1, failed=1, num_bytes=64)
+    first.record(
+        "load",
+        submitted=2,
+        completed=1,
+        failed=1,
+        num_bytes=64,
+        duration_seconds=0.01,
+    )
+    assert first.data["load"]["duration_seconds"] == [0.01]
+
     second = UMBPStoreConnectorStats(
-        {"load": {"completed": 1, "num_bytes": 32, "unknown": 7}, "store": {}}
+        {
+            "load": {
+                "completed": 1,
+                "num_bytes": 32,
+                "duration_seconds": [0.03],
+                "unknown": 7,
+            },
+            "store": {},
+        }
     )
 
     merged = first.aggregate(second)
@@ -2305,13 +2322,19 @@ def test_umbp_stats_aggregate_and_reduce():
         "load_completed": 2,
         "load_failed": 1,
         "load_num_bytes": 96,
+        "load_duration_avg_ms": 20.0,
         "store_submitted": 0,
         "store_completed": 0,
         "store_failed": 0,
         "store_num_bytes": 0,
     }
     assert first.data["load"]["completed"] == 1
-    assert second.data["load"] == {"completed": 1, "num_bytes": 32, "unknown": 7}
+    assert second.data["load"] == {
+        "completed": 1,
+        "num_bytes": 32,
+        "duration_seconds": [0.03],
+        "unknown": 7,
+    }
 
 
 def test_worker_preserves_scheduler_supplied_ranges():

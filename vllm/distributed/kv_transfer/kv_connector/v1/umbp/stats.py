@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from statistics import fmean
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -30,6 +31,7 @@ class UMBPStoreConnectorStats(KVConnectorStats):
         completed: int = 0,
         failed: int = 0,
         num_bytes: int = 0,
+        duration_seconds: float | None = None,
     ) -> None:
         entry = self.data.setdefault(
             operation,
@@ -38,12 +40,15 @@ class UMBPStoreConnectorStats(KVConnectorStats):
                 "completed": 0,
                 "failed": 0,
                 "num_bytes": 0,
+                "duration_seconds": [],
             },
         )
         entry["submitted"] += submitted
         entry["completed"] += completed
         entry["failed"] += failed
         entry["num_bytes"] += num_bytes
+        if duration_seconds is not None:
+            entry.setdefault("duration_seconds", []).append(duration_seconds)
 
     def reset(self) -> None:
         self.data.clear()
@@ -60,12 +65,21 @@ class UMBPStoreConnectorStats(KVConnectorStats):
                 failed=values.get("failed", 0),
                 num_bytes=values.get("num_bytes", 0),
             )
+            result.data[operation]["duration_seconds"].extend(
+                values.get("duration_seconds", ())
+            )
         return result
 
     def reduce(self) -> dict[str, int | float]:
         result: dict[str, int | float] = {}
         for operation, values in self.data.items():
             for key, value in values.items():
+                if key == "duration_seconds":
+                    if value:
+                        result[f"{operation}_duration_avg_ms"] = round(
+                            fmean(value) * 1e3, 3
+                        )
+                    continue
                 result[f"{operation}_{key}"] = value
         return result
 
@@ -110,6 +124,29 @@ class UMBPStorePromMetrics(KVConnectorPromMetrics):
             documentation="Bytes in successfully completed UMBP transfer ranges.",
             labelnames=labels,
         )
+        self._duration = self._histogram_cls(
+            name="vllm:umbp_transfer_duration_seconds",
+            documentation=(
+                "End-to-end duration of a UMBP transfer job, including queueing."
+            ),
+            buckets=[
+                0.001,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1.0,
+                2.5,
+                5.0,
+                10.0,
+                30.0,
+                60.0,
+            ],
+            labelnames=labels + ["tier"],
+        )
 
     def observe(
         self,
@@ -124,3 +161,7 @@ class UMBPStorePromMetrics(KVConnectorPromMetrics):
             self._completed.labels(*labels).inc(values.get("completed", 0))
             self._failed.labels(*labels).inc(values.get("failed", 0))
             self._bytes.labels(*labels).inc(values.get("num_bytes", 0))
+            duration_labels = labels + ["unknown"]
+            duration_metric = self._duration.labels(*duration_labels)
+            for duration in values.get("duration_seconds", ()):
+                duration_metric.observe(duration)

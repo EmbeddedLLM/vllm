@@ -201,6 +201,7 @@ class UMBPStoreConnectorWorker:
         is_load: bool,
         publish: bool = True,
         record_bytes: bool = True,
+        record_duration: bool = True,
     ) -> bool:
         operation = "load" if is_load else "store"
         self._stats.record(
@@ -208,6 +209,7 @@ class UMBPStoreConnectorWorker:
             completed=len(result.completed_keys),
             failed=len(result.failed_keys),
             num_bytes=result.completed_bytes if record_bytes else 0,
+            duration_seconds=(result.duration_seconds if record_duration else None),
         )
         succeeded = result.status == TransferJobStatus.COMPLETED
         if not succeeded:
@@ -314,6 +316,11 @@ class UMBPStoreConnectorWorker:
                     for item in plan.ranges
                 ),
             )
+            for result in layer_results:
+                self._stats.record(
+                    "store",
+                    duration_seconds=result.duration_seconds,
+                )
         layers_succeeded = all(
             result.status == TransferJobStatus.COMPLETED for result in layer_results
         )
@@ -333,6 +340,7 @@ class UMBPStoreConnectorWorker:
                 is_load=False,
                 publish=False,
                 record_bytes=False,
+                record_duration=False,
             ):
                 self._store_failed_tokens.update(
                     self._completion_token(plan) for plan in aggregate.plans
