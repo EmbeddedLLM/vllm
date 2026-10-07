@@ -6,6 +6,8 @@ daemon via CUDA IPC instead of loading from disk."""
 import dataclasses
 import socket
 import time
+import types
+from collections import deque
 from collections.abc import Callable
 from copy import copy
 from typing import TypeVar
@@ -55,6 +57,15 @@ logger = init_logger(__name__)
 _CONNECT_TIMEOUT_S = 5.0
 _STATE_TIMEOUT_S = 300.0
 _STARTUP_RETRY_INTERVAL_S = 0.5
+
+# Fail-open bound for the stale-reference rebind walk in _apply_entries: the
+# model object graph is expected to stay far below this, so tripping it means
+# the holder graph is bigger than anticipated and the walk logs a warning
+# instead of running unbounded.
+_REBIND_NODE_BOUND = 200_000
+# Registration containers owned by nn.Module; already replaced correctly by
+# _register, so the rebind walk must never rewrite them.
+_MODULE_REGISTRATION_ATTRS = frozenset({"_parameters", "_buffers", "_modules"})
 
 _T = TypeVar("_T")
 
@@ -299,12 +310,24 @@ class IpcModelLoader(BaseModelLoader):
         # would not contain "lm_head" at all.
         modules = dict(model.named_modules(remove_duplicate=False))
         registered: dict[str, torch.Tensor] = {}
+        # id(old registration object) -> object registered in its place.
+        # Non-module holders that captured a tensor by value at model
+        # construction (e.g. GroupedTopKRouter.e_score_correction_bias) keep
+        # the popped object; the rebind sweep below fixes them up afterwards.
+        stale_map: dict[int, torch.Tensor] = {}
+        # Pinned old objects so their ids cannot be recycled before the sweep.
+        retired: list[torch.Tensor] = []
 
         def _register(name: str, tensor: torch.Tensor, is_param: bool) -> None:
             module_name, _, leaf = name.rpartition(".")
             module = modules.get(module_name)
             if module is None:
                 raise RuntimeError(f"Cached tensor {name} has no matching module")
+            # Capture the old object so by-value holders of it can be
+            # rebound once registration is done.
+            old = module._parameters.get(leaf)
+            if old is None:
+                old = module._buffers.get(leaf)
             # Replace via registration rather than param.data assignment,
             # which fails for meta tensors. Entries may also introduce
             # post-quantization tensors absent from the meta model.
@@ -321,6 +344,19 @@ class IpcModelLoader(BaseModelLoader):
                 obj = tensor
                 module.register_buffer(leaf, obj)
             registered[name] = obj
+            if isinstance(old, torch.Tensor) and old is not obj:
+                old_id = id(old)
+                prior = stale_map.get(old_id)
+                if prior is None:
+                    stale_map[old_id] = obj
+                    retired.append(old)
+                elif prior is not obj:
+                    logger.warning(
+                        "Cached tensor %s remaps stale object %#x that was "
+                        "already rebound to a different object",
+                        name,
+                        old_id,
+                    )
 
         for name, entry in state.entries.items():
             tensor = entry.rebuild(device_index)
@@ -341,6 +377,16 @@ class IpcModelLoader(BaseModelLoader):
                 )
                 continue
             _register(alias_name, obj, isinstance(obj, nn.Parameter))
+
+        # One rebind sweep for by-value holders the registration swap cannot
+        # reach (plain attributes of non-module objects, e.g. the MoE router's
+        # e_score_correction_bias which stays meta and crashes profiling).
+        if stale_map:
+            holders = _rebind_stale_references(modules, stale_map)
+            logger.info(
+                "ipc_cache: rebound %d stale plain-attribute tensor references",
+                len(holders),
+            )
 
     def _fetch_entries(self, model_config: ModelConfig) -> WeightCacheState:
         dp_group = get_dp_group()
@@ -474,6 +520,137 @@ class IpcModelLoader(BaseModelLoader):
         return loader.load_model(
             vllm_config=vllm_config, model_config=model_config, prefix=prefix
         )
+
+
+def _may_scan(value: object) -> bool:
+    """Whether the stale-reference walk may descend into value.__dict__.
+
+    Allows plain instances with a real instance __dict__; skips primitives,
+    functions/types/modules, and torch library objects (their state is not
+    model-tensor holders and scanning it is noise at best).
+    """
+    if isinstance(
+        value,
+        (
+            bool,
+            int,
+            float,
+            complex,
+            str,
+            bytes,
+            type,
+            types.FunctionType,
+            types.BuiltinFunctionType,
+            types.MethodType,
+            types.CodeType,
+            types.ModuleType,
+        ),
+    ):
+        return False
+    cls_module = type(value).__module__ or ""
+    if cls_module == "torch" or cls_module.startswith("torch."):
+        return False
+    return isinstance(getattr(value, "__dict__", None), dict)
+
+
+def _rebind_stale_references(
+    modules: dict[str, nn.Module],
+    stale_map: dict[int, torch.Tensor],
+) -> list[str]:
+    """Rebind by-value tensor references that registration could not reach.
+
+    ``IpcModelLoader._apply_entries`` replaces registered parameters/buffers
+    with NEW objects, so any holder that captured the old tensor by value into
+    a plain attribute (e.g. ``GroupedTopKRouter.e_score_correction_bias``, a
+    non-module object built at model construction) keeps the stale object.
+
+    BFS from every module in ``modules``: scan each owner's plain attributes
+    (never ``_parameters``/``_buffers``/``_modules`` — registration already
+    fixed those), rebind ``stale_map`` hits in place, descend into non-module,
+    non-tensor instances, and rebind stale tensors at 1 level inside
+    list/dict/tuple attribute values. Returns the rebound holder paths; the
+    walk is bounded and fails open (warns and stops early) if the bound trips;
+    with nothing stale it is a pure no-op.
+    """
+    if not stale_map:
+        return []
+
+    def _rebound(value: object) -> object | None:
+        if isinstance(value, torch.Tensor):
+            new = stale_map.get(id(value))
+            if new is not None and new is not value:
+                return new
+        return None
+
+    visited: set[int] = set()
+    queue: deque[tuple[object, str]] = deque()
+    for module_path, module in modules.items():
+        if id(module) not in visited:
+            visited.add(id(module))
+            queue.append((module, module_path))
+
+    holders: list[str] = []
+    nodes = 0
+    while queue:
+        nodes += 1
+        if nodes > _REBIND_NODE_BOUND:
+            logger.warning(
+                "ipc_cache: stale-reference rebind walk hit the %d-node "
+                "bound with %d rebind(s) done; continuing (fail-open)",
+                _REBIND_NODE_BOUND,
+                len(holders),
+            )
+            break
+        owner, owner_path = queue.popleft()
+        for key, value in list(owner.__dict__.items()):
+            if key in _MODULE_REGISTRATION_ATTRS:
+                continue
+            holder_path = f"{owner_path}.{key}"
+            new = _rebound(value)
+            if new is not None:
+                # Raw __dict__ write: plain attribute assignment on purpose
+                # (setattr would re-register Parameter values in clone form).
+                owner.__dict__[key] = new
+                holders.append(holder_path)
+            elif isinstance(value, dict):
+                for dkey, dvalue in list(value.items()):
+                    dnew = _rebound(dvalue)
+                    if dnew is not None:
+                        value[dkey] = dnew
+                        holders.append(f"{holder_path}[{dkey}]")
+            elif isinstance(value, list):
+                for i, elem in enumerate(value):
+                    enew = _rebound(elem)
+                    if enew is not None:
+                        value[i] = enew
+                        holders.append(f"{holder_path}[{i}]")
+            elif isinstance(value, tuple):
+                # Tuples are immutable: rebuild only if something is stale.
+                new_elems = [_rebound(elem) for elem in value]
+                stale_idx = [i for i, e in enumerate(new_elems) if e is not None]
+                for i in stale_idx:
+                    holders.append(f"{holder_path}[{i}]")
+                if stale_idx:
+                    stale_set = set(stale_idx)
+                    owner.__dict__[key] = tuple(
+                        new_elems[i] if i in stale_set else elem
+                        for i, elem in enumerate(value)
+                    )
+            elif isinstance(value, nn.Module):
+                # Modules are BFS seeds already; do not descend here.
+                continue
+            elif id(value) not in visited and _may_scan(value):
+                # Non-module, non-tensor instance (this is what reaches the
+                # router): scan its plain attributes on a later turn.
+                visited.add(id(value))
+                queue.append((value, holder_path))
+
+    if holders:
+        logger.debug(
+            "ipc_cache: rebound stale plain-attribute holders: %s",
+            ", ".join(holders),
+        )
+    return holders
 
 
 def _materialize_remaining_meta_tensors(model: nn.Module, device: torch.device) -> None:
