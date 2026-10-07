@@ -1272,6 +1272,19 @@ def fastsafetensors_weights_iterator(
             use_tqdm_on_load=tqdm_enabled,
             device=str(device),
             nogds=nogds,
+            # Unbounded resident cache (accumulate_resident=True default) OOMs
+            # on top of vLLM's gpu-memory pool (HSA_STATUS_ERROR_OUT_OF_RESOURCES,
+            # this benchmark). vLLM copies each tensor exactly once here, so the
+            # cache has zero benefit; upstream direction is
+            # vllm-project/vllm#55985 (fit planner) — revisit then.
+            accumulate_resident=False,
+            # OOM-safe staging cap: fastsafetensors stages a WHOLE SHARD per
+            # rank in device memory before distributing (upstream
+            # vllm-project/vllm#55985) and freed staging stays RESERVED in
+            # torch's caching allocator, starving HSA driver allocs such as
+            # queue creation (vllm-project/vllm#59719). Fixed constant, part
+            # of this benchmark's config-D definition.
+            device_memory_budget=24 * 2**30,
         )
 
     # GDS can fail either at construction or lazily inside the producer
@@ -1281,10 +1294,31 @@ def fastsafetensors_weights_iterator(
     # tensor -- restarting mid-stream would reload earlier shards.
     pl = None
     yielded = False
+
+    def _guarded(
+        loader: ParallelLoader,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        for name, tensor in loader.iterate_weights():
+            yield name, tensor
+            # Config-D-only mitigation (this iterator is used solely by
+            # --load-format fastsafetensors): staging freed by fastsafetensors
+            # stays reserved in the caching allocator (freed blocks are not
+            # returned to the driver), and raw driver allocations such as HSA
+            # queue creation cannot reuse them — production OOMed at ~310 MB
+            # driver free while ~118 GiB was hoarded reserved (upstream
+            # #59719; staging itself is whole-shard, #55985). Empty the cache
+            # whenever the hoard exceeds 16 GiB (gap rule, measured: ~5 GiB
+            # staging per shard).
+            if (
+                torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+                > 16 * 2**30
+            ):
+                torch.cuda.empty_cache()
+
     try:
         try:
             pl = _make_loader(nogds)
-            for name, tensor in pl.iterate_weights():
+            for name, tensor in _guarded(pl):
                 yielded = True
                 yield name, tensor
         except RuntimeError as e:
@@ -1298,7 +1332,7 @@ def fastsafetensors_weights_iterator(
             if pl is not None:
                 pl.close()
             pl = _make_loader(nogds=True)
-            yield from pl.iterate_weights()
+            yield from _guarded(pl)
     finally:
         if pl is not None:
             pl.close()
