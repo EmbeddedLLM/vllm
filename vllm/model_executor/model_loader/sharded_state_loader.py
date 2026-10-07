@@ -68,7 +68,11 @@ class ShardedStateLoader(BaseModelLoader):
                 same_storage_groups[tensor.device, ptr].append((key, tensor))
 
         def get_end_ptr(tensor: torch.Tensor) -> int:
-            return tensor.view(-1)[-1].data_ptr() + tensor.element_size()
+            # Stride-aware: bit-identical to the previous
+            # `tensor.view(-1)[-1].data_ptr() + tensor.element_size()` for
+            # contiguous tensors, but does not raise on non-contiguous ones.
+            span = sum((s - 1) * st for s, st in zip(tensor.shape, tensor.stride()))
+            return tensor.data_ptr() + (span + 1) * tensor.element_size()
 
         result: dict[str, torch.Tensor] = {}
         for group in same_storage_groups.values():
@@ -131,14 +135,40 @@ class ShardedStateLoader(BaseModelLoader):
                 f"Could not find checkpoint files '{pattern}', only "
                 f"pre-sharded checkpoints are currently supported!"
             )
-        state_dict = self._filter_subtensors(model.state_dict())
+        # Look up against the RAW model state dict — no _filter_subtensors on
+        # the load path. Filtering demanded exact key-set equality between the
+        # save-time model and this fresh init, which breaks on GLM5Next
+        # `_active_layers` alias tensors; copy_ through an alias writes the
+        # same storage as its canonical tensor, so raw lookup is safe.
+        from safetensors.torch import safe_open
+
+        raw_state_dict = model.state_dict()
+        checkpoint_keys: set[str] = set()
+        for path in filepaths:
+            with safe_open(path, framework="pt") as f:
+                checkpoint_keys.update(f.keys())
+        missing_from_raw = sorted(checkpoint_keys - raw_state_dict.keys())
+        if missing_from_raw:
+            raise ValueError(
+                f"Checkpoint keys not present in model.state_dict(): "
+                f"{len(missing_from_raw)} keys "
+                f"(checkpoint_n={len(checkpoint_keys)}, "
+                f"raw_n={len(raw_state_dict)}): {missing_from_raw}"
+            )
+        logger.info(
+            "Sharded state load: checkpoint_n=%d raw_n=%d",
+            len(checkpoint_keys),
+            len(raw_state_dict),
+        )
         counter_before_loading_weights = time.perf_counter()
+        loaded_keys: set[str] = set()
         for key, tensor in self.iterate_over_files(filepaths):
             # If loading with LoRA enabled, additional padding may
             # be added to certain parameters. We only load into a
             # narrowed view of the parameter data.
-            param_data = state_dict[key].data
-            param_shape = state_dict[key].shape
+            param = raw_state_dict[key]
+            param_data = param.data
+            param_shape = param.shape
             for dim, size in enumerate(tensor.shape):
                 if size < param_shape[dim]:
                     param_data = param_data.narrow(dim, 0, size)
@@ -150,14 +180,54 @@ class ShardedStateLoader(BaseModelLoader):
                     param_shape,
                 )
             param_data.copy_(tensor)
-            state_dict.pop(key)
+            loaded_keys.add(key)
         counter_after_loading_weights = time.perf_counter()
         logger.info_once(
             "Loading weights took %.2f seconds",
             counter_after_loading_weights - counter_before_loading_weights,
         )
-        if state_dict:
-            raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+
+        def byte_range(tensor: torch.Tensor) -> tuple[int, int]:
+            # Same stride-aware span formula as `_filter_subtensors`.
+            span = sum((s - 1) * st for s, st in zip(tensor.shape, tensor.stride()))
+            start = tensor.data_ptr()
+            return start, start + (span + 1) * tensor.element_size()
+
+        # Coverage gate: every raw key not loaded from the checkpoint must be
+        # byte-covered by a loaded tensor in the same storage group (its
+        # canonical alias was loaded); anything else is missing weight data.
+        loaded_ranges: dict[Any, list[tuple[int, int]]] = collections.defaultdict(list)
+        for key in loaded_keys:
+            tensor = raw_state_dict[key]
+            if tensor.numel():
+                ptr = tensor.untyped_storage().data_ptr()
+                loaded_ranges[tensor.device, ptr].append(byte_range(tensor))
+
+        leftover_covered = 0
+        uncovered = []
+        for key, tensor in raw_state_dict.items():
+            if key in loaded_keys:
+                continue
+            if not tensor.numel():
+                leftover_covered += 1  # zero-byte; no data to lose
+                continue
+            start, end = byte_range(tensor)
+            group = loaded_ranges[(tensor.device, tensor.untyped_storage().data_ptr())]
+            if any(k_start <= start and end <= k_end for k_start, k_end in group):
+                leftover_covered += 1
+            else:
+                uncovered.append(key)
+        if uncovered:
+            raise ValueError(
+                f"Sharded state load: {len(uncovered)} model keys not covered "
+                f"by loaded checkpoint tensors: {uncovered}"
+            )
+        logger.info(
+            "COVERAGE_OK loaded=%d leftover_covered=%d/total_raw=%d",
+            len(loaded_keys),
+            leftover_covered,
+            len(raw_state_dict),
+        )
 
     def iterate_over_files(
         self, paths
@@ -189,7 +259,28 @@ class ShardedStateLoader(BaseModelLoader):
         rank = get_tensor_model_parallel_rank()
         part_idx = 0
         total_size = 0
-        state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+        full_state_dict = model.state_dict()
+        noncontiguous_keys = [
+            key for key, tensor in full_state_dict.items() if not tensor.is_contiguous()
+        ]
+        logger.info(
+            "Sharded state save (rank %d): %d/%d non-contiguous tensors in "
+            "model.state_dict(): %s",
+            rank,
+            len(noncontiguous_keys),
+            len(full_state_dict),
+            noncontiguous_keys,
+        )
+        state_dict = ShardedStateLoader._filter_subtensors(full_state_dict)
+        dropped_keys = [key for key in full_state_dict if key not in state_dict]
+        logger.info(
+            "Sharded state save (rank %d): %d keys dropped by "
+            "_filter_subtensors (normally storage-covered views): %s",
+            rank,
+            len(dropped_keys),
+            dropped_keys,
+        )
+        ShardedStateLoader._verify_byte_coverage(full_state_dict, state_dict, rank)
         state_dict_part: dict[str, torch.Tensor] = {}
         for key, tensor in state_dict.items():
             param_size = tensor.nelement() * tensor.element_size()
@@ -202,7 +293,11 @@ class ShardedStateLoader(BaseModelLoader):
                 part_idx += 1
                 total_size = 0
                 state_dict_part = {}
-            state_dict_part[key] = tensor
+            # safetensors rejects non-contiguous tensors; byte accounting is
+            # unchanged (same numel * element_size).
+            state_dict_part[key] = (
+                tensor if tensor.is_contiguous() else tensor.contiguous()
+            )
             total_size += param_size
         if len(state_dict_part) > 0:
             filename = pattern.format(rank=rank, part=part_idx)
@@ -210,3 +305,49 @@ class ShardedStateLoader(BaseModelLoader):
                 state_dict_part,
                 os.path.join(path, filename),
             )
+
+    @staticmethod
+    def _verify_byte_coverage(
+        state_dict: dict[str, torch.Tensor],
+        kept_state_dict: dict[str, torch.Tensor],
+        rank: int | None = None,
+    ) -> None:
+        """Hard gate: every original tensor's byte range must point into a
+        kept tensor in the same storage group, otherwise filtering would
+        silently drop data that the saved checkpoint never contains.
+        """
+
+        def byte_range(tensor: torch.Tensor) -> tuple[int, int]:
+            # Same stride-aware span formula as `_filter_subtensors`.
+            span = sum((s - 1) * st for s, st in zip(tensor.shape, tensor.stride()))
+            start = tensor.data_ptr()
+            return start, start + (span + 1) * tensor.element_size()
+
+        kept_ranges: dict[Any, list[tuple[int, int]]] = collections.defaultdict(list)
+        for tensor in kept_state_dict.values():
+            if tensor.numel():
+                ptr = tensor.untyped_storage().data_ptr()
+                kept_ranges[tensor.device, ptr].append(byte_range(tensor))
+
+        uncovered = []
+        for key, tensor in state_dict.items():
+            if not tensor.numel():
+                continue  # zero-byte tensor; no data to lose when skipped
+            start, end = byte_range(tensor)
+            group = kept_ranges[(tensor.device, tensor.untyped_storage().data_ptr())]
+            if not any(k_start <= start and end <= k_end for k_start, k_end in group):
+                uncovered.append(key)
+        if uncovered:
+            message = (
+                f"Sharded state save (rank {rank}): COVERAGE_FAIL "
+                f"uncovered={len(uncovered)} "
+                f"keys: {uncovered}"
+            )
+            logger.error("%s", message)
+            raise RuntimeError(message)
+        logger.info(
+            "Sharded state save (rank %d): COVERAGE_OK kept=%d/orig=%d",
+            rank,
+            len(kept_state_dict),
+            len(state_dict),
+        )
