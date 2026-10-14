@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from importlib.util import find_spec
-from typing import Final
+from typing import Final, cast
 
 import torch
 
@@ -18,6 +18,23 @@ _CONCH_SUPPORTED_WEIGHT_TYPES: Final = [
     scalar_types.uint8b128,
 ]
 _CONCH_SUPPORTED_GROUP_SIZES: Final = [-1, 128]
+
+
+def _conch_tile_sizes() -> tuple[int, int]:
+    """Return conch's (block_n, block_k), falling back to (64, 64).
+
+    Read lazily inside a guard because the tuning helper is private and may
+    disappear in newer conch releases; conch must not be imported at module
+    scope. The values must match the source the launcher itself passes to
+    _gemm_kernel (it calls this same helper).
+    """
+    try:
+        from conch.kernels.quantization.gemm import _get_tuning_parameters
+
+        tuning = _get_tuning_parameters()
+        return int(tuning["cxpr_block_size_n"]), int(tuning["cxpr_block_size_k"])
+    except Exception:
+        return 64, 64
 
 
 class ConchLinearKernel(MPLinearKernel):
@@ -48,6 +65,25 @@ class ConchLinearKernel(MPLinearKernel):
                 "conch-triton-kernels is not installed, please "
                 "install it via `pip install conch-triton-kernels` "
                 "and try again!"
+            )
+            return False, error_msg
+
+        # conch loads B and its scales with no bounds mask: the N side can be
+        # padded up to the tile width in process_weights_after_loading, but
+        # the activation-side K range cannot be padded, so K/group violations
+        # are hard rejects.
+        K = c.partition_weight_shape[0]
+        gs = K if c.group_size == -1 else c.group_size
+        block_n, block_k = _conch_tile_sizes()
+        if K % block_k != 0:
+            error_msg = f"K ({K}) must be divisible by conch's block_k ({block_k})"
+            return False, error_msg
+        if K % gs != 0:
+            error_msg = f"K ({K}) must be divisible by the group size ({gs})"
+            return False, error_msg
+        if gs % block_k != 0:
+            error_msg = (
+                f"group size ({gs}) must be divisible by conch's block_k ({block_k})"
             )
             return False, error_msg
 
@@ -116,6 +152,35 @@ class ConchLinearKernel(MPLinearKernel):
         elif self.w_zp_name is not None:
             layer.register_parameter(self.w_zp_name, None)
 
+        # conch's B/scale loads are unmasked, so pad N up to the tile width.
+        # Non-persistent (one tensor-or-None buffer per tensor, never a tuple:
+        # Module._apply passes buffers through fn unconditionally, so a tuple
+        # would break Module.to()): buffers keep the pads out of state_dict
+        # while remaining visible to the weight-reload snapshot/restore path.
+        # The registered parameters keep their original shapes.
+        N = self.config.partition_weight_shape[1]
+        block_n, _ = _conch_tile_sizes()
+        pad = (-N) % block_n
+        if pad == 0:
+            layer.register_buffer("_conch_padded_w_q", None, persistent=False)
+            layer.register_buffer("_conch_padded_w_s", None, persistent=False)
+            layer.register_buffer("_conch_padded_w_zp", None, persistent=False)
+        else:
+            w_q, w_s, w_zp = self._get_weight_params(layer)
+
+            def pad_cols(t: torch.Tensor) -> torch.Tensor:
+                out = t.new_zeros(t.shape[0], N + pad)
+                out[:, :N] = t
+                return out
+
+            layer.register_buffer("_conch_padded_w_q", pad_cols(w_q), persistent=False)
+            layer.register_buffer("_conch_padded_w_s", pad_cols(w_s), persistent=False)
+            layer.register_buffer(
+                "_conch_padded_w_zp",
+                pad_cols(w_zp) if w_zp is not None else None,
+                persistent=False,
+            )
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -125,6 +190,15 @@ class ConchLinearKernel(MPLinearKernel):
         from conch.ops.quantization.gemm import mixed_precision_gemm
 
         w_q, w_s, w_zp = self._get_weight_params(layer)
+        padded_w_q = getattr(layer, "_conch_padded_w_q", None)
+        if padded_w_q is not None:
+            w_q = padded_w_q
+            w_s = cast(torch.Tensor, getattr(layer, "_conch_padded_w_s", None))
+            w_zp = getattr(layer, "_conch_padded_w_zp", None)
+        else:
+            w_q = w_q.data
+            w_s = w_s.data
+            w_zp = w_zp.data if w_zp is not None else None
 
         # Map channelwise group_size=-1 to the actual input dimension K.
         # The conch kernel computes stride_mul = block_k / group_size;
@@ -139,13 +213,17 @@ class ConchLinearKernel(MPLinearKernel):
 
         output = mixed_precision_gemm(
             x=x_2d,
-            w_q_packed=w_q.data,
-            w_s=w_s.data,
-            w_zp=w_zp.data if w_zp is not None else None,
+            w_q_packed=w_q,
+            w_s=w_s,
+            w_zp=w_zp,
             weight_size_bits=self.config.weight_type.size_bits,
             weight_bias=self.config.weight_type.bias,
             group_size=group_size,
         )
+
+        if padded_w_q is not None:
+            # Drop the zero-padded tail columns before bias add and reshape.
+            output = output[:, : self.config.partition_weight_shape[1]]
 
         if bias is not None:
             output.add_(bias)  # In-place add
