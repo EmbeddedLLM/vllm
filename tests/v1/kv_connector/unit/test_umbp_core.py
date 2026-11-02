@@ -33,6 +33,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.connector import (
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.data import (
     BlockIdentityCodec,
     BlockLoadBatch,
+    BlockPrefetchBatch,
     BlockStoreBatch,
     BlockTransferPlan,
     KVLayoutDescriptor,
@@ -697,21 +698,118 @@ def test_scheduler_emits_async_load_without_scheduled_model_tokens():
     assert scheduler._pending_loads == {}
 
 
+def test_scheduler_prefetches_only_after_request_waits_for_allocation():
+    scheduler = UMBPStoreConnectorScheduler(
+        _vllm_config(
+            {
+                "mode": "embedded",
+                "load_async": True,
+                "prefetch_waiting_requests": True,
+            }
+        ),
+        _kv_cache_config(),
+        _SchedulerHandle([True]),
+        BlockIdentityCodec(UMBPNamespace("prefetch")),
+    )
+    request = make_request("prefetch")
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
+    waiting = scheduler.build_connector_meta(make_scheduler_output())
+    batch = waiting.prefetch_requests[request.request_id]
+    assert batch.keys == ["umbp:vllm:v1:prefetch:tp0:pcp0:dcp0:pp0:g0:61"]
+    assert batch.group_ids == [0]
+
+    scheduler.update_state_after_alloc(
+        request,
+        SimpleNamespace(get_block_ids=lambda group_ids: ([7],)),
+        16,
+    )
+    admitted = scheduler.build_connector_meta(make_scheduler_output())
+    assert admitted.consume_prefetch_request_ids == {request.request_id}
+    assert admitted.cancel_prefetch_request_ids == set()
+    assert admitted.prefetch_requests == {}
+    assert admitted.load_requests[request.request_id].block_ids == [7]
+
+
+def test_scheduler_skips_prefetch_when_final_blocks_are_immediately_available():
+    scheduler = UMBPStoreConnectorScheduler(
+        _vllm_config(
+            {
+                "mode": "embedded",
+                "load_async": True,
+                "prefetch_waiting_requests": True,
+            }
+        ),
+        _kv_cache_config(),
+        _SchedulerHandle([True]),
+        BlockIdentityCodec(UMBPNamespace("immediate")),
+    )
+    request = make_request("immediate")
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
+    scheduler.update_state_after_alloc(
+        request,
+        SimpleNamespace(get_block_ids=lambda group_ids: ([7],)),
+        16,
+    )
+    metadata = scheduler.build_connector_meta(make_scheduler_output())
+
+    assert metadata.prefetch_requests == {}
+    assert metadata.consume_prefetch_request_ids == set()
+    assert metadata.cancel_prefetch_request_ids == set()
+    assert metadata.load_requests[request.request_id].block_ids == [7]
+
+
+def test_scheduler_cancels_dispatched_prefetch_for_finished_request():
+    scheduler = UMBPStoreConnectorScheduler(
+        _vllm_config(
+            {
+                "mode": "embedded",
+                "prefetch_waiting_requests": True,
+            }
+        ),
+        _kv_cache_config(),
+        _SchedulerHandle([True]),
+        BlockIdentityCodec(UMBPNamespace("cancel")),
+    )
+    request = make_request("cancel")
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
+    scheduler.build_connector_meta(make_scheduler_output())
+    metadata = scheduler.build_connector_meta(
+        make_scheduler_output(finished=[request.request_id])
+    )
+
+    assert metadata.cancel_prefetch_request_ids == {request.request_id}
+    assert metadata.consume_prefetch_request_ids == set()
+    assert metadata.prefetch_requests == {}
+
+
 def test_load_batch_metadata_roundtrip_preserves_destinations_and_identity():
     batch = BlockLoadBatch(["g1", "g0"], [7, 3], [1, 0], "r")
-    meta = UMBPConnectorMetadata(load_requests={"r": batch})
-    restored = (
-        MsgpackDecoder(UMBPConnectorMetadata)
-        .decode(MsgpackEncoder().encode(meta))
-        .load_requests["r"]
+    prefetch = BlockPrefetchBatch(["g1", "g0"], [1, 0], "r")
+    meta = UMBPConnectorMetadata(
+        load_requests={"r": batch},
+        prefetch_requests={"r": prefetch},
+        consume_prefetch_request_ids={"consume"},
+        cancel_prefetch_request_ids={"cancel"},
     )
+    restored_meta = MsgpackDecoder(UMBPConnectorMetadata).decode(
+        MsgpackEncoder().encode(meta)
+    )
+    restored = restored_meta.load_requests["r"]
     assert list(restored) == [
         BlockTransferPlan("g1", 7, group_id=1, request_id="r"),
         BlockTransferPlan("g0", 3, group_id=0, request_id="r"),
     ]
+    assert restored_meta.prefetch_requests["r"] == prefetch
+    assert restored_meta.consume_prefetch_request_ids == {"consume"}
+    assert restored_meta.cancel_prefetch_request_ids == {"cancel"}
     assert restored[:1] == [restored[0]]
     with pytest.raises(ValueError, match="equal lengths"):
         BlockLoadBatch(["missing-destination"], [], [0], "r")
+    with pytest.raises(ValueError, match="equal lengths"):
+        BlockPrefetchBatch(["missing-group"], [], "r")
 
 
 def test_scheduler_cached_decode_uses_save_watermark_and_new_blocks():
@@ -1450,6 +1548,151 @@ def test_worker_preserves_scheduler_supplied_ranges():
     worker.start_load_kv(None, metadata)
 
     assert handle.loaded_plans == [supplied]
+
+
+def test_worker_prefetches_objects_into_one_contiguous_buffer():
+    handle = _WorkerHandle()
+    planner = KVLayoutPlanner.from_kv_cache_config(_kv_cache_config())
+    object_size = planner.object_size_for_group(0)
+    worker = UMBPStoreConnectorWorker(
+        handle,
+        planner,
+        prefetch_buffer_bytes=2 * object_size,
+    )
+    worker.register_kv_caches(make_kv_caches())
+
+    worker.start_load_kv(
+        None,
+        UMBPConnectorMetadata(
+            prefetch_requests={
+                "req": BlockPrefetchBatch(["first", "second"], [0, 0], "req")
+            }
+        ),
+    )
+
+    buffer = handle.kv_caches["__umbp_prefetch_buffer__"]
+    assert [plan.key for plan in handle.loaded_plans] == ["first", "second"]
+    assert [plan.ranges[0].base_address for plan in handle.loaded_plans] == [
+        buffer.data_ptr(),
+        buffer.data_ptr() + object_size,
+    ]
+    assert [plan.ranges[0].length for plan in handle.loaded_plans] == [
+        object_size,
+        object_size,
+    ]
+    assert all(plan.ranges[0].object_offset == 0 for plan in handle.loaded_plans)
+
+
+def test_worker_scatters_matching_prefetch_instead_of_loading_again(monkeypatch):
+    class _RecordingHandle(_WorkerHandle):
+        def __init__(self):
+            self.load_calls = []
+
+        def load(self, plans):
+            self.load_calls.append(list(plans))
+            return super().load(plans)
+
+    handle = _RecordingHandle()
+    planner = KVLayoutPlanner.from_kv_cache_config(_kv_cache_config())
+    worker = UMBPStoreConnectorWorker(
+        handle,
+        planner,
+        prefetch_buffer_bytes=planner.object_size_for_group(0),
+    )
+    worker.register_kv_caches(make_kv_caches())
+    worker.start_load_kv(
+        None,
+        UMBPConnectorMetadata(
+            prefetch_requests={"req": BlockPrefetchBatch(["key"], [0], "req")}
+        ),
+    )
+    copied = {}
+
+    def record_copy(sources, destinations, sizes):
+        copied["sources"] = sources.tolist()
+        copied["destinations"] = destinations.tolist()
+        copied["sizes"] = sizes.tolist()
+
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.umbp.worker."
+        "ops.swap_blocks_batch",
+        record_copy,
+    )
+    final_plan = BlockTransferPlan("key", 2, request_id="req", group_id=0)
+    worker.start_load_kv(
+        None,
+        UMBPConnectorMetadata(
+            load_requests={"req": [final_plan]},
+            consume_prefetch_request_ids={"req"},
+            async_load=True,
+        ),
+    )
+
+    [staged] = handle.load_calls[0]
+    materialized = planner.materialize(final_plan)
+    assert len(handle.load_calls) == 1
+    assert copied["sources"] == [
+        staged.ranges[0].base_address + item.object_offset
+        for item in materialized.ranges
+    ]
+    assert copied["destinations"] == [item.base_address for item in materialized.ranges]
+    assert copied["sizes"] == [item.length for item in materialized.ranges]
+    assert worker.get_finished(set()) == (None, {"req"})
+
+
+def test_worker_skips_prefetch_that_does_not_fit():
+    handle = _WorkerHandle()
+    planner = KVLayoutPlanner.from_kv_cache_config(_kv_cache_config())
+    worker = UMBPStoreConnectorWorker(
+        handle,
+        planner,
+        prefetch_buffer_bytes=planner.object_size_for_group(0) - 1,
+    )
+    worker.register_kv_caches(make_kv_caches())
+
+    worker.start_load_kv(
+        None,
+        UMBPConnectorMetadata(
+            prefetch_requests={"req": BlockPrefetchBatch(["too-large"], [0], "req")}
+        ),
+    )
+
+    assert not hasattr(handle, "loaded_plans")
+
+
+@pytest.mark.parametrize("command", ["cancel", "consume"])
+def test_worker_releases_inflight_prefetch(command):
+    class _PendingPrefetchHandle(_CancellableWorkerHandle):
+        def load(self, plans):
+            self.loaded_plans = list(plans)
+            job = TransferJobState(tuple(plans))
+            job.start()
+            return job
+
+    handle = _PendingPrefetchHandle()
+    planner = KVLayoutPlanner.from_kv_cache_config(_kv_cache_config())
+    worker = UMBPStoreConnectorWorker(
+        handle,
+        planner,
+        prefetch_buffer_bytes=planner.object_size_for_group(0),
+    )
+    worker.register_kv_caches(make_kv_caches())
+    worker.start_load_kv(
+        None,
+        UMBPConnectorMetadata(
+            prefetch_requests={"req": BlockPrefetchBatch(["key"], [0], "req")}
+        ),
+    )
+
+    worker.start_load_kv(
+        None,
+        UMBPConnectorMetadata(
+            cancel_prefetch_request_ids={"req"} if command == "cancel" else set(),
+            consume_prefetch_request_ids={"req"} if command == "consume" else set(),
+        ),
+    )
+
+    assert len(handle.cancelled) == 1
 
 
 def test_embedded_runtime_register_store_and_load(monkeypatch):

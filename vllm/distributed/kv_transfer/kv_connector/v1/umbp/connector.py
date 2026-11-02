@@ -110,6 +110,19 @@ class UMBPStoreConnector(KVConnectorBase_V1, SupportsHMA):
         runtime_config = UMBPRuntimeConfig.from_vllm(
             vllm_config
         ).resolve_for_rank_count(topology.rank_count)
+        prefetch_buffer_bytes = int(
+            runtime_config.options.get("prefetch_buffer_bytes", 0)
+        )
+        if prefetch_buffer_bytes < 0:
+            raise ValueError("prefetch_buffer_bytes must be non-negative")
+        if (
+            runtime_config.options.get("prefetch_waiting_requests", False)
+            and prefetch_buffer_bytes == 0
+        ):
+            raise ValueError(
+                "prefetch_buffer_bytes must be positive when "
+                "prefetch_waiting_requests is enabled"
+            )
         if topology.pp_size > 1:
             raise NotImplementedError(
                 f"{runtime_config.mode} UMBP does not support pipeline parallelism"
@@ -158,6 +171,7 @@ class UMBPStoreConnector(KVConnectorBase_V1, SupportsHMA):
                     vllm_config.kv_events_config
                     and vllm_config.kv_events_config.enable_kv_cache_events
                 ),
+                prefetch_buffer_bytes=prefetch_buffer_bytes,
             )
 
     def _codec(self, namespace: UMBPNamespace) -> BlockIdentityCodec:

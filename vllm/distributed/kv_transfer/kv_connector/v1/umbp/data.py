@@ -344,6 +344,12 @@ class KVLayoutPlanner:
     def object_size(self) -> int:
         return sum(region.block_bytes for region in self.regions)
 
+    def object_size_for_group(self, group_id: int) -> int:
+        regions = self._regions_by_group.get(group_id)
+        if not regions:
+            raise ValueError(f"KV layout does not contain cache group {group_id}")
+        return sum(region.block_bytes for region in regions)
+
     def describe(
         self,
         topology: RankTopology,
@@ -566,6 +572,19 @@ class BlockLoadBatch(Sequence[BlockTransferPlan]):
 
 
 @dataclass(frozen=True)
+class BlockPrefetchBatch:
+    """Destination-free logical blocks to fetch while a request waits."""
+
+    keys: list[str]
+    group_ids: list[int]
+    request_id: str
+
+    def __post_init__(self) -> None:
+        if len(self.keys) != len(self.group_ids):
+            raise ValueError("prefetch batch columns must have equal lengths")
+
+
+@dataclass(frozen=True)
 class BlockStoreBatch(Sequence[BlockTransferPlan]):
     """Columnar whole-block stores with request metadata shared by the batch."""
 
@@ -764,6 +783,9 @@ class UMBPConnectorMetadata(KVConnectorMetadata):
     load_requests: dict[str, list[BlockTransferPlan] | BlockLoadBatch] = field(
         default_factory=dict
     )
+    prefetch_requests: dict[str, BlockPrefetchBatch] = field(default_factory=dict)
+    consume_prefetch_request_ids: set[str] = field(default_factory=set)
+    cancel_prefetch_request_ids: set[str] = field(default_factory=set)
     store_requests: dict[str, list[BlockTransferPlan] | BlockStoreBatch] = field(
         default_factory=dict
     )

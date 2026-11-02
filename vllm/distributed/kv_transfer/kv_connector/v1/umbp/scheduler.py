@@ -50,6 +50,7 @@ from vllm.v1.request import Request
 from .data import (
     BlockIdentityCodec,
     BlockLoadBatch,
+    BlockPrefetchBatch,
     BlockStoreBatch,
     BlockTransferPlan,
     LoadSpec,
@@ -237,6 +238,9 @@ class UMBPStoreConnectorScheduler:
             self.load_async = True
         self.enable_lookup = bool(extra.get("enable_lookup", True))
         self.lookup_async = bool(extra.get("lookup_async", False))
+        self.prefetch_waiting_requests = bool(
+            extra.get("prefetch_waiting_requests", False)
+        )
         self.save_decode_cache = bool(extra.get("save_decode_cache", False))
         # A kv_consumer only restores from the pool, as with other store
         # connectors; it never offloads its own KV.
@@ -314,6 +318,10 @@ class UMBPStoreConnectorScheduler:
                 manager.block_pool = self._lookup_pool
                 manager._null_block = self._lookup_pool.null_block
         self._pending_loads: dict[str, list[BlockTransferPlan] | BlockLoadBatch] = {}
+        self._pending_prefetches: dict[str, BlockPrefetchBatch] = {}
+        self._dispatched_prefetches: dict[str, BlockPrefetchBatch] = {}
+        self._prefetches_to_consume: set[str] = set()
+        self._prefetches_to_cancel: set[str] = set()
         self._load_specs: dict[str, LoadSpec] = {}
         self._lookup_units = {
             group_id: (
@@ -393,6 +401,7 @@ class UMBPStoreConnectorScheduler:
             ):
                 self._pending_lookups.pop(request.request_id)
                 pending.future.cancel()
+                self._cancel_prefetch(request.request_id)
                 pending = None
         align = (
             self.hash_block_size if self.enable_partial_hash_hits else self.block_size
@@ -409,6 +418,7 @@ class UMBPStoreConnectorScheduler:
         max_external_token = request.num_tokens - 1
         if max_external_token <= num_computed_tokens:
             self._load_specs.pop(request.request_id, None)
+            self._cancel_prefetch(request.request_id)
             return 0, False
         if pending is not None and not pending.future.done():
             return None, False
@@ -497,12 +507,22 @@ class UMBPStoreConnectorScheduler:
             )
         matched_tokens = num_computed_tokens + need_to_load
         if need_to_load <= 0:
+            self._cancel_prefetch(request.request_id)
             return 0, False
-        self._load_specs[request.request_id] = LoadSpec(
+        load_spec = LoadSpec(
             local_tokens=num_computed_tokens,
             external_tokens=matched_tokens,
             block_hashes_by_group=block_hashes_by_group,
         )
+        self._load_specs[request.request_id] = load_spec
+        if self.prefetch_waiting_requests:
+            keys, group_ids, _ = self._load_object_columns(
+                request, load_spec, need_to_load
+            )
+            if keys:
+                self._queue_prefetch(
+                    BlockPrefetchBatch(keys, group_ids, request.request_id)
+                )
         load_async = self.load_async
         if block_hashes_by_group and not any(
             block_hash is not None
@@ -607,6 +627,11 @@ class UMBPStoreConnectorScheduler:
         )
         if not block_groups:
             return
+        self._pending_prefetches.pop(request.request_id, None)
+        if num_external_tokens > 0:
+            self._consume_prefetch(request.request_id)
+        else:
+            self._cancel_prefetch(request.request_id)
         tracker = self._tracker_for_request(request.request_id)
         # Core passes the request's whole table on every admission. A request
         # whose load failed is recomputed into newly allocated blocks.
@@ -644,6 +669,7 @@ class UMBPStoreConnectorScheduler:
             self._load_specs.pop(request_id, None)
             self._request_trackers.pop(request_id, None)
             self._requests.pop(request_id, None)
+            self._cancel_prefetch(request_id)
             pending = self._pending_lookups.pop(request_id, None)
             if pending is not None:
                 pending.future.cancel()
@@ -763,6 +789,7 @@ class UMBPStoreConnectorScheduler:
         for request_id in scheduler_output.preempted_req_ids or set():
             meta.preempted_request_ids.add(request_id)
             self._load_specs.pop(request_id, None)
+            self._cancel_prefetch(request_id)
             if preempted_tracker := self._request_trackers.get(request_id):
                 preempted_tracker.reset()
 
@@ -809,6 +836,7 @@ class UMBPStoreConnectorScheduler:
                         self._gpu_block_pool.blocks[block_id]
                         for block_id in dict.fromkeys(plan.block_id for plan in plans)
                     )
+        self._flush_prefetch_commands(meta)
         return meta
 
     def _add_boundary_state_plans(
@@ -875,6 +903,40 @@ class UMBPStoreConnectorScheduler:
             if plans:
                 meta.store_plans.extend(plans)
 
+    def _queue_prefetch(self, batch: BlockPrefetchBatch) -> None:
+        request_id = batch.request_id
+        if self._pending_prefetches.get(request_id) == batch:
+            return
+        dispatched = self._dispatched_prefetches.get(request_id)
+        if dispatched == batch:
+            return
+        if dispatched is not None:
+            self._dispatched_prefetches.pop(request_id)
+            self._prefetches_to_cancel.add(request_id)
+        self._pending_prefetches[request_id] = batch
+
+    def _consume_prefetch(self, request_id: str) -> None:
+        self._pending_prefetches.pop(request_id, None)
+        if self._dispatched_prefetches.pop(request_id, None) is not None:
+            self._prefetches_to_cancel.discard(request_id)
+            self._prefetches_to_consume.add(request_id)
+
+    def _cancel_prefetch(self, request_id: str) -> None:
+        self._pending_prefetches.pop(request_id, None)
+        self._prefetches_to_consume.discard(request_id)
+        if self._dispatched_prefetches.pop(request_id, None) is not None:
+            self._prefetches_to_cancel.add(request_id)
+
+    def _flush_prefetch_commands(self, meta: UMBPConnectorMetadata) -> None:
+        meta.cancel_prefetch_request_ids.update(self._prefetches_to_cancel)
+        meta.consume_prefetch_request_ids.update(self._prefetches_to_consume)
+        self._prefetches_to_cancel.clear()
+        self._prefetches_to_consume.clear()
+        for request_id, batch in self._pending_prefetches.items():
+            meta.prefetch_requests[request_id] = batch
+            self._dispatched_prefetches[request_id] = batch
+        self._pending_prefetches.clear()
+
     def _tracker_for_request(self, request_id: str) -> RequestTracker:
         return self._request_trackers.setdefault(request_id, RequestTracker())
 
@@ -886,14 +948,40 @@ class UMBPStoreConnectorScheduler:
         num_external_tokens: int,
     ) -> BlockLoadBatch:
         """Batch the logical objects selected by the external hit window."""
+        spec = tracker.load_spec
+        keys, groups, block_indices = self._load_object_columns(
+            request, spec, num_external_tokens
+        )
+        group_ids = self.kv_cache_config.prefix_cacheable_group_ids
+        group_indexes = {group_id: index for index, group_id in enumerate(group_ids)}
+        destinations: list[int] = []
+        for group_id, block_index in zip(groups, block_indices, strict=True):
+            group_blocks = block_groups[group_indexes[group_id]]
+            if (
+                block_index >= len(group_blocks)
+                or group_blocks[block_index] == NULL_BLOCK_ID
+            ):
+                raise RuntimeError(
+                    "UMBP external hit mapped a runtime object to a null or "
+                    f"missing destination block for group {group_id}"
+                )
+            destinations.append(group_blocks[block_index])
+        return BlockLoadBatch(keys, destinations, groups, request.request_id)
+
+    def _load_object_columns(
+        self,
+        request: Any,
+        spec: LoadSpec | None,
+        num_external_tokens: int,
+    ) -> tuple[list[str], list[int], list[int]]:
+        """Return object keys, groups, and request-relative block indices."""
         assert self.codec is not None
         group_ids = self.kv_cache_config.prefix_cacheable_group_ids
-        spec = tracker.load_spec
         local_tokens = spec.local_tokens if spec is not None else 0
         end_tokens = local_tokens + num_external_tokens
         keys: list[str] = []
-        destinations: list[int] = []
         groups: list[int] = []
+        block_indices: list[int] = []
         if spec is not None and spec.block_hashes_by_group:
             for group_index, group_id in enumerate(group_ids):
                 group_block_size = self.group_block_sizes[group_id]
@@ -903,17 +991,11 @@ class UMBPStoreConnectorScheduler:
                 ):
                     if block_index < start_block or block_hash is None:
                         continue
-                    block_id = block_groups[group_index][block_index]
-                    if block_id == NULL_BLOCK_ID:
-                        raise RuntimeError(
-                            "UMBP external hit mapped a runtime object to a null "
-                            f"destination block for group {group_id}"
-                        )
                     keys.append(self.codec.key(block_hash, group_id=group_id))
-                    destinations.append(block_id)
                     groups.append(group_id)
-            return BlockLoadBatch(keys, destinations, groups, request.request_id)
-        for group_index, group_id in enumerate(group_ids):
+                    block_indices.append(block_index)
+            return keys, groups, block_indices
+        for group_id in group_ids:
             group_block_size = self.group_block_sizes[group_id]
             start_block = local_tokens // group_block_size
             num_full_blocks = end_tokens // group_block_size
@@ -925,23 +1007,17 @@ class UMBPStoreConnectorScheduler:
                         group_id=group_id,
                     )
                 )
-                destinations.append(block_groups[group_index][block_index])
                 groups.append(group_id)
+                block_indices.append(block_index)
         partial_tokens = end_tokens % self.block_size
         if partial_tokens and self.enable_partial_hash_hits:
             hash_index = end_tokens // self.hash_block_size - 1
-            for group_index, group_id in enumerate(group_ids):
+            for group_id in group_ids:
                 block_index = end_tokens // self.group_block_sizes[group_id]
-                group_block_ids = block_groups[group_index]
-                if (
-                    block_index >= len(group_block_ids)
-                    or group_block_ids[block_index] == NULL_BLOCK_ID
-                ):
-                    raise RuntimeError("UMBP partial hit has no destination block")
                 keys.append(self.codec.key(request.block_hashes[hash_index], group_id))
-                destinations.append(group_block_ids[block_index])
                 groups.append(group_id)
-        return BlockLoadBatch(keys, destinations, groups, request.request_id)
+                block_indices.append(block_index)
+        return keys, groups, block_indices
 
     def _object_hash_at_token_end(
         self, hashes: Sequence[bytes], token_end: int
@@ -1160,6 +1236,7 @@ class UMBPStoreConnectorScheduler:
         self._pending_loads.pop(request.request_id, None)
         self._load_specs.pop(request.request_id, None)
         self._requests.pop(request.request_id, None)
+        self._cancel_prefetch(request.request_id)
         pending = self._pending_lookups.pop(request.request_id, None)
         if pending is not None:
             pending.future.cancel()
@@ -1444,6 +1521,10 @@ class UMBPStoreConnectorScheduler:
         self._pending_lookups.clear()
         self._load_specs.clear()
         self._pending_loads.clear()
+        self._pending_prefetches.clear()
+        self._dispatched_prefetches.clear()
+        self._prefetches_to_consume.clear()
+        self._prefetches_to_cancel.clear()
         cleared = True if self.runtime is None else self.runtime.clear()
         if cleared:
             self._event_objects.clear()

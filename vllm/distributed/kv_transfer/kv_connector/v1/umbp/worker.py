@@ -9,6 +9,7 @@ from typing import cast
 
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.distributed.kv_events import BlockRemoved, KVCacheEvent
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
@@ -17,9 +18,11 @@ from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
 from .data import (
     BlockIdentityCodec,
     BlockLoadBatch,
+    BlockPrefetchBatch,
     BlockStoreBatch,
     BlockTransferPlan,
     KVLayoutPlanner,
+    KVRange,
     StoreEventResult,
     TransferJobState,
     TransferJobStatus,
@@ -39,6 +42,13 @@ class _StoreBatch:
     failed_objects: set[tuple[int, bytes]] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class _Prefetch:
+    request_id: str
+    plans: list[BlockTransferPlan]
+    job: TransferJobState
+
+
 class UMBPStoreConnectorWorker:
     """Translate shared metadata into runtime load/store jobs."""
 
@@ -50,6 +60,7 @@ class UMBPStoreConnectorWorker:
         codec: BlockIdentityCodec | None = None,
         report_failed_requests: bool = False,
         enable_kv_cache_events: bool = False,
+        prefetch_buffer_bytes: int = 0,
     ) -> None:
         self.runtime = runtime
         self.layout = layout
@@ -68,11 +79,25 @@ class UMBPStoreConnectorWorker:
         self._report_load_completions = False
         self._active_store_event = -1
         self._stats = UMBPStoreConnectorStats()
+        self._prefetch_buffer_bytes = prefetch_buffer_bytes
+        self._prefetch_buffer: torch.Tensor | None = None
+        self._prefetch: _Prefetch | None = None
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if self.layout is not None and self.layout.regions:
             self.layout.register_kv_caches(kv_caches)
-        self.runtime.register_buffers(kv_caches)
+        registered_buffers = dict(kv_caches)
+        if self._prefetch_buffer_bytes:
+            # One reusable landing zone keeps prefetch independent of final
+            # block allocation, which happens only when the request is admitted.
+            device = next(iter(kv_caches.values())).device
+            self._prefetch_buffer = torch.empty(
+                self._prefetch_buffer_bytes,
+                dtype=torch.uint8,
+                device=device,
+            )
+            registered_buffers["__umbp_prefetch_buffer__"] = self._prefetch_buffer
+        self.runtime.register_buffers(registered_buffers)
 
     def _materialize_plans(
         self, plans: list[BlockTransferPlan]
@@ -110,11 +135,135 @@ class UMBPStoreConnectorWorker:
     ) -> None:
         del forward_context
         self._report_load_completions = metadata.async_load
+        restored_from_prefetch = self._apply_prefetch_commands(metadata)
         for request_id, plans in metadata.load_requests.items():
-            if plans:
+            if plans and request_id not in restored_from_prefetch:
                 self._submit_loads(request_id, plans)
         if not metadata.async_load:
             self._drain_load_jobs(wait=True)
+
+    def _apply_prefetch_commands(self, metadata: UMBPConnectorMetadata) -> set[str]:
+        """Consume or release the current slot before admitting another prefetch."""
+        restored: set[str] = set()
+        if (
+            self._prefetch is not None
+            and self._prefetch.request_id in metadata.consume_prefetch_request_ids
+        ):
+            request_id = self._prefetch.request_id
+            plans = metadata.load_requests.get(request_id)
+            if plans and self._restore_prefetched(plans):
+                restored.add(request_id)
+                if self._report_load_completions:
+                    self._finished_recving.add(request_id)
+            else:
+                self._release_prefetch()
+        if (
+            self._prefetch is not None
+            and self._prefetch.request_id in metadata.cancel_prefetch_request_ids
+        ):
+            self._release_prefetch()
+        if self._prefetch is not None:
+            return restored
+        for batch in metadata.prefetch_requests.values():
+            plans = self._prefetch_plans(batch)
+            if plans:
+                self._prefetch = _Prefetch(
+                    batch.request_id, plans, self.runtime.load(plans)
+                )
+                break
+        return restored
+
+    def _restore_prefetched(
+        self, plans: list[BlockTransferPlan] | BlockLoadBatch
+    ) -> bool:
+        assert self._prefetch is not None
+        result = self.runtime.wait(self._prefetch.job)
+        staged = self._prefetch.plans
+        final = self._materialize_plans(list(plans))
+        # A stale or changed allocation must use the ordinary restore path.
+        matches = result.status == TransferJobStatus.COMPLETED and len(staged) == len(
+            final
+        )
+        if matches:
+            matches = all(
+                source.key == destination.key
+                and source.group_id == destination.group_id
+                for source, destination in zip(staged, final, strict=True)
+            )
+        if not matches:
+            self._prefetch = None
+            return False
+
+        sources: list[int] = []
+        destinations: list[int] = []
+        sizes: list[int] = []
+        for source, destination in zip(staged, final, strict=True):
+            source_range = source.ranges[0]
+            for destination_range in destination.ranges:
+                if (
+                    destination_range.object_offset + destination_range.length
+                    > source_range.length
+                ):
+                    self._prefetch = None
+                    return False
+                sources.append(
+                    source_range.base_address + destination_range.object_offset
+                )
+                destinations.append(destination_range.base_address)
+                sizes.append(destination_range.length)
+
+        ops.swap_blocks_batch(
+            torch.tensor(sources, dtype=torch.int64),
+            torch.tensor(destinations, dtype=torch.int64),
+            torch.tensor(sizes, dtype=torch.int64),
+        )
+        assert self._prefetch_buffer is not None
+        if self._prefetch_buffer.device.type == "cuda":
+            # MORI may refill this allocation from a different stream/thread.
+            # Do not release the single slot until its scatter has completed.
+            torch.cuda.current_stream(self._prefetch_buffer.device).synchronize()
+        self._prefetch = None
+        return True
+
+    def _prefetch_plans(self, batch: BlockPrefetchBatch) -> list[BlockTransferPlan]:
+        if self.layout is None or self._prefetch_buffer is None:
+            return []
+        sizes = [
+            self.layout.object_size_for_group(group_id) for group_id in batch.group_ids
+        ]
+        if sum(sizes) > self._prefetch_buffer.numel():
+            return []
+        plans: list[BlockTransferPlan] = []
+        offset = 0
+        base_address = self._prefetch_buffer.data_ptr()
+        for key, group_id, size in zip(batch.keys, batch.group_ids, sizes, strict=True):
+            plans.append(
+                BlockTransferPlan(
+                    key=self._localize_key(key, group_id),
+                    block_id=-1,
+                    ranges=(
+                        KVRange(
+                            layer_name="__umbp_prefetch_buffer__",
+                            group_id=group_id,
+                            block_id=-1,
+                            base_address=base_address + offset,
+                            stride=size,
+                            length=size,
+                            object_offset=0,
+                        ),
+                    ),
+                    request_id=batch.request_id,
+                    group_id=group_id,
+                )
+            )
+            offset += size
+        return plans
+
+    def _release_prefetch(self) -> None:
+        assert self._prefetch is not None
+        if self.runtime.poll(self._prefetch.job) is None:
+            self._cancel_job(self._prefetch.job)
+        self._prefetch = None
 
     def _submit_loads(
         self, request_id: str, plans: list[BlockTransferPlan] | BlockLoadBatch
@@ -382,6 +531,8 @@ class UMBPStoreConnectorWorker:
         return result
 
     def close(self) -> None:
+        if self._prefetch is not None:
+            self._release_prefetch()
         self.wait_for_save()
         self._drain_store_jobs(wait=True)
         self._drain_load_jobs(wait=True)
