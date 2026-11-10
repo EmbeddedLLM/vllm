@@ -1,0 +1,46 @@
+ROCM PORT for vllm/model_executor/layers/mamba/ops/sketchssm_mamba2_build.py
+=====================================================================
+
+--- a/ops/sketchssm_mamba2_build.py
++++ b/ops/sketchssm_mamba2_build.py
+@@ -26,14 +26,23 @@
+ import torch
+ 
+ from vllm.model_executor.layers.mamba.ops.sketchssm_config import get_sketchssm_config
++from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+ 
+ SKETCH_PIVOTS = 4
+ SKETCH_RIDGE = 0.003
+ SKETCH_DTYPES = (torch.bfloat16, torch.bfloat16, torch.float32)
+-# FP32 dots of the rotations and the flush (3xTF32).
+-SKETCH_DOT_PRECISION = "tf32x3"
++# FP32 dots of the rotations and the flush: 3xTF32 on CUDA. HIP has no tf32
++# dot, so take the backend default (ieee); set VLLM_SKETCHSSM_DOT=bf16x3 to
++# trade ~10x fp32 dot rate for a slightly larger error.
++import os
++
++SKETCH_DOT_PRECISION = (
++    None if current_platform.is_rocm() else "tf32x3"
++)
++if os.environ.get("VLLM_SKETCHSSM_DOT"):
++    SKETCH_DOT_PRECISION = os.environ["VLLM_SKETCHSSM_DOT"]
+ 
+ _PIVOTS = tl.constexpr(SKETCH_PIVOTS)
+ _RIDGE = tl.constexpr(SKETCH_RIDGE)
+
+ROCM PORT for tests/kernels/mamba/test_sketchssm_mamba2.py
+==========================================================
+--- a/tests/kernels/mamba/test_sketchssm_mamba2.py
++++ b/tests/kernels/mamba/test_sketchssm_mamba2.py
+@@ -14,7 +14,7 @@
+ from vllm.model_executor.layers.mamba.ops import sketchssm_mamba2_decode as skd
+ from vllm.platforms import current_platform
+ 
+-pytestmark = pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
++pytestmark = pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="Requires a GPU")
+ 
+ H, P, G, N, NULL = 32, 32, 8, 128, 0
+ RANKS = ([0, 1, 2, 3, 4, 5, 9, 20, 38, 64] * H)[:H]  # dense, maps, pivots
+

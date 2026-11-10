@@ -1,0 +1,80 @@
+[
+ {
+  "shape": "Nano-4B  (H=96,  P=80)",
+  "heads": 96,
+  "dim": 80,
+  "batch": 128,
+  "W": 16,
+  "mean_rank": 7.96875,
+  "std_ms": 0.32630722045898436,
+  "sketch_nonflush_ms": 0.4194366455078125,
+  "sketch_mixed_ms": 0.42117622375488284,
+  "speedup_nonflush": 0.7779654542676493,
+  "speedup_mixed": 0.7747522344682245
+ },
+ {
+  "shape": "Nano-4B  (H=96,  P=80)",
+  "heads": 96,
+  "dim": 80,
+  "batch": 256,
+  "W": 16,
+  "mean_rank": 7.96875,
+  "std_ms": 0.6664028930664062,
+  "sketch_nonflush_ms": 0.42634632110595705,
+  "sketch_mixed_ms": 0.4267154312133789,
+  "speedup_nonflush": 1.5630553380588206,
+  "speedup_mixed": 1.5617032905781456
+ },
+ {
+  "shape": "Nano-4B  (H=96,  P=80)",
+  "heads": 96,
+  "dim": 80,
+  "batch": 512,
+  "W": 16,
+  "mean_rank": 7.96875,
+  "std_ms": 1.3439566040039062,
+  "sketch_nonflush_ms": 0.4222690200805664,
+  "sketch_mixed_ms": 0.422909049987793,
+  "speedup_nonflush": 3.1827023534605674,
+  "speedup_mixed": 3.1778856566032307
+ },
+ {
+  "shape": "Nano-9B  (H=128, P=80)",
+  "heads": 128,
+  "dim": 80,
+  "batch": 128,
+  "W": 16,
+  "mean_rank": 7.9765625,
+  "std_ms": 0.41787818908691404,
+  "sketch_nonflush_ms": 0.4215442657470703,
+  "sketch_mixed_ms": 0.4207927322387695,
+  "speedup_nonflush": 0.9913032225603658,
+  "speedup_mixed": 0.9930736846704813
+ },
+ {
+  "shape": "Nano-9B  (H=128, P=80)",
+  "heads": 128,
+  "dim": 80,
+  "batch": 256,
+  "W": 16,
+  "mean_rank": 7.9765625,
+  "std_ms": 0.8304300689697266,
+  "sketch_nonflush_ms": 0.42195030212402346,
+  "sketch_mixed_ms": 0.42198833465576174,
+  "speedup_nonflush": 1.9680755406252537,
+  "speedup_mixed": 1.9678981639318358
+ },
+ {
+  "shape": "Nano-9B  (H=128, P=80)",
+  "heads": 128,
+  "dim": 80,
+  "batch": 512,
+  "W": 16,
+  "mean_rank": 7.9765625,
+  "std_ms": 1.6753118896484376,
+  "sketch_nonflush_ms": 0.4234375,
+  "sketch_mixed_ms": 0.4242663192749023,
+  "speedup_nonflush": 3.9564561231549815,
+  "speedup_mixed": 3.9487270460489308
+ }
+]

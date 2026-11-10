@@ -1,0 +1,20 @@
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -113,6 +113,9 @@
+     or rocm_aiter_ops.are_rdna_gdn_triton_kernels_available()
+ )
+ 
++# Experiment switch: force GDN onto the generic path even with AITER enabled.
++SPIKE_GDN_NO_AITER = os.environ.get("SPIKE_GDN_NO_AITER", "0") == "1"
++
+ if GDN_AITER_TRITON_AVAILABLE:
+     from aiter.ops.triton.causal_conv1d_update_single_token import (
+         fused_reshape_causal_conv1d_update_single_token as gdn_aiter_fused_reshape_causal_conv1d_update_single_token,  # noqa: E501
+@@ -1283,6 +1286,7 @@
+             GDN_AITER_TRITON_AVAILABLE
+             and not self.enable_fused_gdn_spec_decode
+             and not getattr(self, "use_replayssm", False)
++            and not SPIKE_GDN_NO_AITER
+         ):
+             num_tokens = hidden_states.size(0)
+             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)

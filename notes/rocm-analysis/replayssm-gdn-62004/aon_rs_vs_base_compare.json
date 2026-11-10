@@ -1,0 +1,72 @@
+{
+  "token_identical": 8,
+  "total_prompts": 8,
+  "max_abs_dlogp": 0.0,
+  "mean_abs_dlogp": 0.0,
+  "per_prompt": [
+    {
+      "prompt": "The capital of France is",
+      "identical": true,
+      "first_diff_token": null,
+      "max_abs_dlogp": 0.0,
+      "mean_abs_dlogp": 0.0,
+      "n_tokens_compared": 64
+    },
+    {
+      "prompt": "Once upon a time, in a small village,",
+      "identical": true,
+      "first_diff_token": null,
+      "max_abs_dlogp": 0.0,
+      "mean_abs_dlogp": 0.0,
+      "n_tokens_compared": 64
+    },
+    {
+      "prompt": "def fibonacci(n):",
+      "identical": true,
+      "first_diff_token": null,
+      "max_abs_dlogp": 0.0,
+      "mean_abs_dlogp": 0.0,
+      "n_tokens_compared": 64
+    },
+    {
+      "prompt": "Q: What is 17 * 23? A:",
+      "identical": true,
+      "first_diff_token": null,
+      "max_abs_dlogp": 0.0,
+      "mean_abs_dlogp": 0.0,
+      "n_tokens_compared": 64
+    },
+    {
+      "prompt": "The three laws of thermodynamics are:",
+      "identical": true,
+      "first_diff_token": null,
+      "max_abs_dlogp": 0.0,
+      "mean_abs_dlogp": 0.0,
+      "n_tokens_compared": 64
+    },
+    {
+      "prompt": "In the year 2050, the most surprising technology was",
+      "identical": true,
+      "first_diff_token": null,
+      "max_abs_dlogp": 0.0,
+      "mean_abs_dlogp": 0.0,
+      "n_tokens_compared": 64
+    },
+    {
+      "prompt": "Translate 'the cat sat on the mat' into French:",
+      "identical": true,
+      "first_diff_token": null,
+      "max_abs_dlogp": 0.0,
+      "mean_abs_dlogp": 0.0,
+      "n_tokens_compared": 64
+    },
+    {
+      "prompt": "A short poem about the sea at night:",
+      "identical": true,
+      "first_diff_token": null,
+      "max_abs_dlogp": 0.0,
+      "mean_abs_dlogp": 0.0,
+      "n_tokens_compared": 64
+    }
+  ]
+}

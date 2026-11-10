@@ -1,0 +1,72 @@
+{
+  "token_identical": 7,
+  "total_prompts": 8,
+  "max_abs_dlogp": 1.8845410018693656,
+  "mean_abs_dlogp": 0.050822337614566004,
+  "per_prompt": [
+    {
+      "prompt": "The capital of France is",
+      "identical": false,
+      "first_diff_token": 23,
+      "max_abs_dlogp": 1.8845410018693656,
+      "mean_abs_dlogp": 0.35928482123678585,
+      "n_tokens_compared": 64
+    },
+    {
+      "prompt": "Once upon a time, in a small village,",
+      "identical": true,
+      "first_diff_token": null,
+      "max_abs_dlogp": 0.09675586223602295,
+      "mean_abs_dlogp": 0.010033951177653933,
+      "n_tokens_compared": 64
+    },
+    {
+      "prompt": "def fibonacci(n):",
+      "identical": true,
+      "first_diff_token": null,
+      "max_abs_dlogp": 0.04232215881347656,
+      "mean_abs_dlogp": 0.0028187718593244426,
+      "n_tokens_compared": 64
+    },
+    {
+      "prompt": "Q: What is 17 * 23? A:",
+      "identical": true,
+      "first_diff_token": null,
+      "max_abs_dlogp": 0.07275569438934326,
+      "mean_abs_dlogp": 0.004433287639130867,
+      "n_tokens_compared": 64
+    },
+    {
+      "prompt": "The three laws of thermodynamics are:",
+      "identical": true,
+      "first_diff_token": null,
+      "max_abs_dlogp": 0.046055108308792114,
+      "mean_abs_dlogp": 0.0025988521358542016,
+      "n_tokens_compared": 64
+    },
+    {
+      "prompt": "In the year 2050, the most surprising technology was",
+      "identical": true,
+      "first_diff_token": null,
+      "max_abs_dlogp": 0.08366203308105469,
+      "mean_abs_dlogp": 0.010990003338520182,
+      "n_tokens_compared": 64
+    },
+    {
+      "prompt": "Translate 'the cat sat on the mat' into French:",
+      "identical": true,
+      "first_diff_token": null,
+      "max_abs_dlogp": 0.08582949638366699,
+      "mean_abs_dlogp": 0.008304426266505516,
+      "n_tokens_compared": 64
+    },
+    {
+      "prompt": "A short poem about the sea at night:",
+      "identical": true,
+      "first_diff_token": null,
+      "max_abs_dlogp": 0.09270328283309937,
+      "mean_abs_dlogp": 0.008114587262753048,
+      "n_tokens_compared": 64
+    }
+  ]
+}

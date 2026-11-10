@@ -1,0 +1,150 @@
+{
+  "question": "With VLLM_ROCM_USE_AITER=1 but GDN excluded from the AITER path, does ReplaySSM become active, and what does that config cost/win?",
+  "tree": "/app/local/yh/replayssm-gdn-wt",
+  "gate_patch": "bench/gdn_aiter_exclude_gdn.patch (uncommitted, experiment only)",
+  "gpu": "GPU 6 exclusive",
+  "bench_flags": "conc 512, 512-in/128-out, 2048 prompts, --max-model-len 4096 --mamba-ssm-cache-dtype float32 --mamba-cache-mode none --no-enable-prefix-caching --gpu-memory-utilization 0.80",
+  "cells": {
+    "aoff_base": {
+      "aiter": 0,
+      "replayssm": false,
+      "mean_out_tok_s": 12286,
+      "reps": [
+        12287,
+        12317,
+        12260,
+        12278
+      ],
+      "tpot50_ms": 37.34,
+      "kv_tokens": 4855249,
+      "source": "AITER_PATH_ROCM.md (reference, GPU 6)"
+    },
+    "aoff_rs": {
+      "aiter": 0,
+      "replayssm": true,
+      "mean_out_tok_s": 13975,
+      "reps": [
+        14044,
+        13890,
+        13988,
+        13978
+      ],
+      "tpot50_ms": 32.0,
+      "kv_tokens": 4450490,
+      "source": "AITER_PATH_ROCM.md (reference, GPU 6)"
+    },
+    "aon_base": {
+      "aiter": 1,
+      "replayssm": false,
+      "mean_out_tok_s": 12508,
+      "reps": [
+        12288,
+        12650,
+        12542,
+        12514,
+        12545
+      ],
+      "tpot50_ms": 36.73,
+      "kv_tokens": 4855249,
+      "source": "AITER_PATH_ROCM.md (reference, GPU 6)"
+    },
+    "aon_rs": {
+      "aiter": 1,
+      "replayssm": true,
+      "mean_out_tok_s": 12921,
+      "reps": [
+        12937,
+        12924,
+        12951,
+        12936,
+        12857
+      ],
+      "tpot50_ms": 35.7,
+      "kv_tokens": 4449745,
+      "source": "AITER_PATH_ROCM.md (reference, GPU 6)"
+    },
+    "aexg_base": {
+      "aiter": 1,
+      "gdn_excluded": false,
+      "replayssm": false,
+      "mean_out_tok_s": 12628.13,
+      "reps": [
+        12648.59,
+        12607.67
+      ],
+      "tpot50_ms": 36.652,
+      "warmup_out_tok_s": 12595,
+      "kv_tokens": 4854132,
+      "max_concurrency_4096": 1185.09,
+      "source": "this run"
+    },
+    "aexg_rs": {
+      "aiter": 1,
+      "gdn_excluded": true,
+      "replayssm": true,
+      "mean_out_tok_s": 14406.16,
+      "reps": [
+        14390.65,
+        14421.67
+      ],
+      "tpot50_ms": 31.584,
+      "warmup_out_tok_s": 14442,
+      "kv_tokens": 4450490,
+      "max_concurrency_4096": 1086.55,
+      "source": "this run"
+    }
+  },
+  "ratios": {
+    "aoff_rs_over_base": 1.1369,
+    "aon_rs_over_base": 1.033,
+    "aexg_rs_over_aexg_base": 1.1408,
+    "aexg_rs_over_aoff_rs": 1.0309,
+    "aexg_rs_over_aon_rs": 1.1149,
+    "aexg_rs_over_aoff_base": 1.1726,
+    "aexg_rs_over_aon_base": 1.1518,
+    "aexg_base_over_aon_base": 1.0096
+  },
+  "trace": {
+    "aexg_rs": {
+      "replayssm_branch_prints": 840,
+      "aiter_decode_prints": 0,
+      "log": "logs/gdn4b_aexg_rs_trace_server.log"
+    },
+    "aexg_base": {
+      "replayssm_branch_prints": 0,
+      "aiter_decode_prints": 840,
+      "log": "logs/gdn4b_aexg_base_trace_server.log"
+    },
+    "reference_aon_rs": {
+      "replayssm_branch_prints": 0,
+      "aiter_decode_prints": 1,
+      "log": "logs/gdn4b_2x2_aon_rs_trace_server.log"
+    }
+  },
+  "correctness_8x64_greedy": {
+    "aexg_rs_vs_aexg_base": {
+      "identical": 4,
+      "of": 8,
+      "max_abs_dlogp": 2.4740995168691597,
+      "mean_abs_dlogp": 0.1566562798513229
+    },
+    "reference_aon_rs_vs_aon_base": {
+      "identical": 8,
+      "of": 8,
+      "max_abs_dlogp": 0.0,
+      "mean_abs_dlogp": 0.0
+    },
+    "reference_aoff_rs_vs_aoff_base": {
+      "identical": 6,
+      "of": 8,
+      "max_abs_dlogp": 1.7435,
+      "mean_abs_dlogp": 0.0969
+    },
+    "determinism_control_base_run1_vs_run2": {
+      "identical": 8,
+      "of": 8,
+      "max_abs_dlogp": 0.0
+    }
+  },
+  "kv_cost_pct": 8.32
+}

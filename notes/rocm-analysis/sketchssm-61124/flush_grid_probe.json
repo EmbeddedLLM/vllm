@@ -1,0 +1,82 @@
+[
+ {
+  "n_flush": 1,
+  "pad_batch": 64,
+  "flush_path_ms": 0.012318559885025025
+ },
+ {
+  "n_flush": 2,
+  "pad_batch": 64,
+  "flush_path_ms": 0.09802645683288574
+ },
+ {
+  "n_flush": 8,
+  "pad_batch": 64,
+  "flush_path_ms": 0.10239771842956542
+ },
+ {
+  "n_flush": 32,
+  "pad_batch": 64,
+  "flush_path_ms": 0.1973745346069336
+ },
+ {
+  "n_flush": 1,
+  "pad_batch": 128,
+  "flush_path_ms": 0.015771340131759643
+ },
+ {
+  "n_flush": 2,
+  "pad_batch": 128,
+  "flush_path_ms": 0.1712607192993164
+ },
+ {
+  "n_flush": 8,
+  "pad_batch": 128,
+  "flush_path_ms": 0.17464954376220704
+ },
+ {
+  "n_flush": 32,
+  "pad_batch": 128,
+  "flush_path_ms": 0.19200441360473633
+ },
+ {
+  "n_flush": 1,
+  "pad_batch": 256,
+  "flush_path_ms": 0.017154059410095214
+ },
+ {
+  "n_flush": 2,
+  "pad_batch": 256,
+  "flush_path_ms": 0.17323909759521483
+ },
+ {
+  "n_flush": 8,
+  "pad_batch": 256,
+  "flush_path_ms": 0.17670417785644532
+ },
+ {
+  "n_flush": 32,
+  "pad_batch": 256,
+  "flush_path_ms": 0.1927776336669922
+ },
+ {
+  "n_flush": 1,
+  "pad_batch": 512,
+  "flush_path_ms": 0.01965939998626709
+ },
+ {
+  "n_flush": 2,
+  "pad_batch": 512,
+  "flush_path_ms": 0.1753383445739746
+ },
+ {
+  "n_flush": 8,
+  "pad_batch": 512,
+  "flush_path_ms": 0.17882879257202147
+ },
+ {
+  "n_flush": 32,
+  "pad_batch": 512,
+  "flush_path_ms": 0.19510894775390625
+ }
+]

@@ -1,0 +1,86 @@
+[
+ {
+  "part": "rotate_query",
+  "ms": 0.009468079805374145
+ },
+ {
+  "part": "decode_nonflush",
+  "ms": 0.11699297904968262
+ },
+ {
+  "part": "rotate+decode",
+  "ms": 0.1221938419342041
+ },
+ {
+  "part": "step",
+  "n_flush": 1,
+  "full_ms": 0.13875557899475097,
+  "flush_path_ms": 0.01670814037322998,
+  "nonflush_part_ms": 0.1221938419342041,
+  "flush_increment_ms": 0.016561737060546866
+ },
+ {
+  "part": "step",
+  "n_flush": 2,
+  "full_ms": 0.25693498611450194,
+  "flush_path_ms": 0.13387311935424806,
+  "nonflush_part_ms": 0.1221938419342041,
+  "flush_increment_ms": 0.13474114418029784
+ },
+ {
+  "part": "step",
+  "n_flush": 4,
+  "full_ms": 0.2568117904663086,
+  "flush_path_ms": 0.1355259609222412,
+  "nonflush_part_ms": 0.1221938419342041,
+  "flush_increment_ms": 0.1346179485321045
+ },
+ {
+  "part": "step",
+  "n_flush": 8,
+  "full_ms": 0.2580270195007324,
+  "flush_path_ms": 0.13714597702026368,
+  "nonflush_part_ms": 0.1221938419342041,
+  "flush_increment_ms": 0.13583317756652832
+ },
+ {
+  "part": "step",
+  "n_flush": 16,
+  "full_ms": 0.26220067977905276,
+  "flush_path_ms": 0.14200843811035158,
+  "nonflush_part_ms": 0.1221938419342041,
+  "flush_increment_ms": 0.14000683784484866
+ },
+ {
+  "part": "step",
+  "n_flush": 32,
+  "full_ms": 0.2697527503967285,
+  "flush_path_ms": 0.1512605381011963,
+  "nonflush_part_ms": 0.1221938419342041,
+  "flush_increment_ms": 0.14755890846252442
+ },
+ {
+  "part": "step",
+  "n_flush": 64,
+  "full_ms": 0.39070178985595705,
+  "flush_path_ms": 0.2769712257385254,
+  "nonflush_part_ms": 0.1221938419342041,
+  "flush_increment_ms": 0.2685079479217529
+ },
+ {
+  "part": "step",
+  "n_flush": 128,
+  "full_ms": 0.6367759704589844,
+  "flush_path_ms": 0.5465784072875977,
+  "nonflush_part_ms": 0.1221938419342041,
+  "flush_increment_ms": 0.5145821285247802
+ },
+ {
+  "part": "step",
+  "n_flush": 512,
+  "full_ms": 2.181028137207031,
+  "flush_path_ms": 2.1481455993652343,
+  "nonflush_part_ms": 0.1221938419342041,
+  "flush_increment_ms": 2.058834295272827
+ }
+]

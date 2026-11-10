@@ -1,0 +1,3792 @@
+diff --git a/.buildkite/test_areas/engine.yaml b/.buildkite/test_areas/engine.yaml
+index 26485e0a172d..0913a68ad372 100644
+--- a/.buildkite/test_areas/engine.yaml
++++ b/.buildkite/test_areas/engine.yaml
+@@ -181,6 +181,23 @@ steps:
+   commands:
+     - pytest -v -s v1/e2e/test_replayssm_decode.py
+ 
++- label: ":nvidia: (H100) SketchSSM E2E"
++  device: h100
++  key: sketchssm-e2e
++  timeout_in_minutes: 60
++  working_dir: "/vllm-workspace/tests"
++  source_file_dependencies:
++    - tests/v1/e2e/test_sketchssm_decode.py
++    - vllm/config/cache.py
++    - vllm/config/vllm.py
++    - vllm/model_executor/layers/mamba/
++    - vllm/model_executor/models/nemotron_h.py
++    - vllm/model_executor/warmup/mamba_triton_warmup.py
++    - vllm/v1/attention/backends/mamba_attn.py
++    - vllm/v1/worker/gpu/
++  commands:
++    - pytest -v -s v1/e2e/test_sketchssm_decode.py
++
+ - label: ":nvidia: (L4) V1 E2E"
+   key: v1-e2e-2-gpus
+   timeout_in_minutes: 25 # TODO: Fix timeout after we have more confidence in the test stability
+diff --git a/benchmarks/sketchssm/e2e_decode_speedup.py b/benchmarks/sketchssm/e2e_decode_speedup.py
+new file mode 100644
+index 000000000000..a3d929ef9470
+--- /dev/null
++++ b/benchmarks/sketchssm/e2e_decode_speedup.py
+@@ -0,0 +1,148 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""End-to-end decode benchmark: SketchSSM vs ReplaySSM vs the standard SSM decode.
++
++Loads a hybrid Mamba-2 model, replicates one prompt across the batch, and times
++a long greedy decode (CUDA graphs on) with each mode in its own subprocess. All
++modes use an FP32 SSM cache; standard and SketchSSM run on Model Runner V2, which
++SketchSSM requires, and ReplaySSM (Triton) on Model Runner V1, which it requires.
++
++Example:
++    python benchmarks/sketchssm/e2e_decode_speedup.py \\
++        --model-id nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16 \\
++        --sketchssm SketchSSM/Nemotron-3-Nano-4B-BF16 --sketchssm-mean-rank 8
++
++"""
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++import time
++
++DEFAULT_PROMPT = "My cat wrote all this CUDA code for a new language model and"
++MODES = {"standard": "standard", "replayssm": "ReplaySSM", "sketchssm": "SketchSSM"}
++
++
++def parse_args():
++    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    p.add_argument("--model-id", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
++    p.add_argument("--sketchssm", default="SketchSSM/Nemotron-3-Nano-4B-BF16")
++    p.add_argument("--sketchssm-mean-rank", type=float, default=None)
++    p.add_argument("--prompt", default=DEFAULT_PROMPT)
++    p.add_argument("--batch-size", type=int, default=256)
++    p.add_argument("--num-steps", type=int, default=1000)
++    p.add_argument("--warmup-steps", type=int, default=128)
++    p.add_argument("--repeats", type=int, default=1)
++    p.add_argument("--buffer-len", type=int, default=16, help="Window length W.")
++    p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
++    p.add_argument("--modes", nargs="+", choices=list(MODES), default=list(MODES))
++    p.add_argument("--worker", choices=list(MODES), help=argparse.SUPPRESS)
++    return p.parse_args()
++
++
++def run_worker(args) -> None:
++    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0" if args.worker == "replayssm" else "1"
++    import torch
++
++    from vllm import LLM, SamplingParams
++
++    max_model_len = args.num_steps + 256
++    llm_kwargs = dict(
++        model=args.model_id,
++        max_model_len=max_model_len,
++        trust_remote_code=True,
++        enable_prefix_caching=False,
++        enable_chunked_prefill=False,
++        max_num_seqs=args.batch_size,
++        max_num_batched_tokens=max(max_model_len, args.batch_size * 64),
++        disable_log_stats=True,
++        gpu_memory_utilization=args.gpu_memory_utilization,
++        mamba_ssm_cache_dtype="float32",
++    )
++    if args.worker == "replayssm":
++        llm_kwargs.update(use_replayssm=True, replayssm_buffer_len=args.buffer_len)
++    elif args.worker == "sketchssm":
++        llm_kwargs.update(
++            sketchssm=args.sketchssm,
++            sketchssm_mean_rank=args.sketchssm_mean_rank,
++            replayssm_buffer_len=args.buffer_len,
++        )
++    llm = LLM(**llm_kwargs)
++    prompts = [args.prompt] * args.batch_size
++
++    def timed_generate(n_tokens: int) -> float:
++        params = SamplingParams(
++            temperature=0.0, ignore_eos=True, min_tokens=n_tokens, max_tokens=n_tokens
++        )
++        torch.accelerator.synchronize()
++        start = time.perf_counter()
++        outs = llm.generate(prompts, params, use_tqdm=False)
++        torch.accelerator.synchronize()
++        assert min(len(o.outputs[0].token_ids) for o in outs) == n_tokens
++        return time.perf_counter() - start
++
++    timed_generate(args.warmup_steps)
++    elapsed = min(timed_generate(args.num_steps) for _ in range(args.repeats))
++    print(
++        "RESULT_JSON "
++        + json.dumps(
++            dict(
++                mode=args.worker,
++                per_step_ms=elapsed / args.num_steps * 1e3,
++                tok_s=args.batch_size * args.num_steps / elapsed,
++            )
++        ),
++        flush=True,
++    )
++
++
++def run_mode(args, mode: str) -> dict:
++    cmd = [sys.executable, __file__, "--worker", mode]
++    for name in (
++        "model_id",
++        "sketchssm",
++        "sketchssm_mean_rank",
++        "prompt",
++        "batch_size",
++        "num_steps",
++        "warmup_steps",
++        "repeats",
++        "buffer_len",
++        "gpu_memory_utilization",
++    ):
++        value = getattr(args, name)
++        if value is not None:
++            cmd += [f"--{name.replace('_', '-')}", str(value)]
++    proc = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
++    if proc.returncode != 0:
++        raise RuntimeError(f"mode {mode!r} exited with {proc.returncode}")
++    for line in proc.stdout.splitlines():
++        if line.startswith("RESULT_JSON "):
++            return json.loads(line[len("RESULT_JSON ") :])
++    raise RuntimeError(f"mode {mode!r} produced no result")
++
++
++def main() -> None:
++    args = parse_args()
++    if args.worker is not None:
++        run_worker(args)
++        return
++    print(
++        f"model={args.model_id} batch_size={args.batch_size} "
++        f"steps={args.num_steps} W={args.buffer_len} "
++        f"sketchssm={args.sketchssm} mean_rank={args.sketchssm_mean_rank}"
++    )
++    results = [run_mode(args, mode) for mode in args.modes]
++    base = results[0]["per_step_ms"]
++    print(f"{'mode':<12}{'ms/step':>10}{'tok/s':>14}{'speedup':>10}")
++    for r in results:
++        print(
++            f"{MODES[r['mode']]:<12}{r['per_step_ms']:>10.3f}"
++            f"{r['tok_s']:>14,.0f}{base / r['per_step_ms']:>9.2f}x"
++        )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/docs/features/sketchssm.md b/docs/features/sketchssm.md
+new file mode 100644
+index 000000000000..690fb4c78336
+--- /dev/null
++++ b/docs/features/sketchssm.md
+@@ -0,0 +1,27 @@
++# SketchSSM
++
++SketchSSM speeds up the decode of Mamba-2 layers in Mamba-2 based models. Each request decodes in windows of `W` steps (`--replayssm-buffer-len`, 16 by default). The last step of a window flushes the window into the exact FP32 state and rebuilds a compact per-request sketch of it; the other steps read the sketch instead of the full state. Dense heads (rank 0) keep BF16 rows of their full state instead, built with the sketch at the flush and after prefill. During decode the FP32 state stays exact and changes only at flushes.
++
++The per-head sketch ranks and orthogonal frames come from an offline calibration of the model ([SketchSSM](https://github.com/SNU-ARC/SketchSSM)).
++
++!!! warning
++    SketchSSM is experimental.
++
++## Usage
++
++```bash
++vllm serve <model> --sketchssm /path/to/calibration.pt
++```
++
++`--sketchssm` takes a file, a directory, or a Hugging Face repository id that contains `calibration.pt`. The file holds either:
++
++- **Exported frames for one rank budget:** `frames[L, G, K, K]`, `m_table[L, H]` (sketch rank per head, 0 = dense), and optionally `dense_table[L, H]` and `layer_ids`.
++- **A portable calibration:** the per-group basis and rank-score curves. `--sketchssm-mean-rank` sets the mean sketch rank per head (default 8); ranks and frames are allocated at load time for the serving window.
++
++## Constraints
++
++SketchSSM currently supports NemotronH (`NemotronHForCausalLM`) models. It requires a CUDA GPU with compute capability 8.0 or newer, Model Runner V2 (`VLLM_USE_V2_MODEL_RUNNER=1`), `--mamba-backend triton` and `--mamba-ssm-cache-dtype float32`. It replaces `--use-replayssm`; do not pass both.
++
++Mamba prefix caching works in align mode (`--mamba-cache-mode align`), as with the default decode. Tensor parallelism splits the heads, their ranks and the group frames across ranks (the tensor-parallel size must divide the heads, and the groups unless there is a single group). Speculative decoding, stochastic rounding of the SSM state and KV connectors are not supported yet.
++
++Mamba-2 layers need a power-of-two state size of at least 16 and a head dim of at least 16.
+diff --git a/tests/kernels/mamba/test_sketchssm_mamba2.py b/tests/kernels/mamba/test_sketchssm_mamba2.py
+new file mode 100644
+index 000000000000..dfe42470f481
+--- /dev/null
++++ b/tests/kernels/mamba/test_sketchssm_mamba2.py
+@@ -0,0 +1,195 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""SketchSSM Mamba-2 decode (Triton kernel) against FP64 references.
++
++The state lives in random per-group frames; B and C arrive unrotated and the
++references rotate them in FP64.
++"""
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++from vllm.model_executor.layers.mamba.ops import sketchssm_mamba2_build as sk
++from vllm.model_executor.layers.mamba.ops import sketchssm_mamba2_decode as skd
++from vllm.platforms import current_platform
++
++pytestmark = pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
++
++H, P, G, N, NULL = 32, 32, 8, 128, 0
++RANKS = ([0, 1, 2, 3, 4, 5, 9, 20, 38, 64] * H)[:H]  # dense, maps, pivots
++
++
++def flush_row_list(is_flush: torch.Tensor) -> torch.Tensor:
++    """``(batch,)`` int32 indices of the flush rows, then -1 padding."""
++    rows = torch.full_like(is_flush, -1, dtype=torch.int32)
++    idx = torch.nonzero(is_flush).flatten()
++    rows[: idx.numel()] = idx.to(torch.int32)
++    return rows
++
++
++def sketch_read(s: torch.Tensor, q: torch.Tensor, m: int) -> torch.Tensor:
++    """Four-pivot residual-diagonal read of state ``s`` (P, N) with ``q``."""
++    if m == 0:
++        return s @ q
++    norm = s / s.square().sum(0).mean().sqrt()
++    dirs: list[torch.Tensor] = []
++    for u in norm[:, : min(m, sk.SKETCH_PIVOTS)].T:
++        v = u.clone()
++        for d in dirs + dirs:
++            v -= d * (d @ v)
++        keep = v.square().sum() > 1e-12 * u.square().sum()
++        dirs.append(v / v.norm() if keep else torch.zeros_like(v))
++    z = torch.stack(dirs) @ norm
++    residual = (norm.square().sum(0) - z.square().sum(0)).clamp_min(0)
++    residual[: len(dirs)] = 0
++    metric = torch.diag(residual) + z.T @ z
++    ridge = sk.SKETCH_RIDGE * torch.eye(m, dtype=s.dtype, device=s.device)
++    return s[:, :m] @ torch.linalg.solve(metric[:m, :m] + ridge, metric[:m] @ q)
++
++
++def stored_read(sketch: sk.SketchArgs, meta: int, h: int, q: torch.Tensor):
++    """Read of head ``h`` with ``q`` from the stored sketch row ``meta``."""
++    t, m = sketch.tables, RANKS[h]
++    U = sketch.u[meta, int(t.u_offsets[h]) :].double()
++    if m == 0:
++        return U[:N].T @ q
++    w_off, ag_off = int(t.w_offsets[h]), int(t.ag_offsets[h])
++    coeff = sketch.w[meta, w_off : w_off + min(m, sk.SKETCH_PIVOTS)].double() @ q
++    if m > sk.SKETCH_PIVOTS:
++        ag = sketch.ag[meta, :, ag_off : ag_off + m].double()
++        coeff = ag[0] * q[:m] + (ag[1:] * coeff[:, None]).sum(0)
++    return U[:m].T @ coeff
++
++
++class Layer:
++    """One layer's state, rings and sketch; the last row pads the batch."""
++
++    def __init__(self, W: int, batch: int = 5):
++        bf16, S = torch.bfloat16, batch + 1
++        self.W, self.batch = W, batch
++        g = self.g = torch.Generator().manual_seed(0)
++        rand = lambda *s: torch.rand(*s, generator=g).cuda()  # noqa: E731
++        randn = lambda *s: torch.randn(*s, generator=g).cuda() * 0.1  # noqa: E731
++        # Key-major FP32 state; kernels see the (slot, H, dim, dstate) view.
++        self.state = randn(S, H, N, P).transpose(-1, -2)
++        self.x_cache, self.dt_cache = randn(S, H, W, P).to(bf16), rand(S, H, W) * 0.1
++        self.B_cache, self.A = randn(S, G, W, N).to(bf16), -rand(H) - 0.5
++        self.dt_bias, self.D = (rand(H) * 0.1).to(bf16), rand(H).to(bf16)
++        self.slots = torch.tensor([*range(1, batch), NULL], dtype=torch.int32).cuda()
++        self.meta = torch.arange(batch, dtype=torch.int32).flip(0).cuda()
++        ranks = torch.tensor(RANKS, dtype=torch.int32)
++        shapes = zip(sk.sketch_shapes(ranks, P, N), sk.SKETCH_DTYPES)
++        u, w, ag = (torch.zeros(batch, *s, dtype=d).cuda() for s, d in shapes)
++        frames = torch.linalg.qr(torch.randn(G, N, N, generator=g))[0]
++        frames_t = frames.transpose(-1, -2).contiguous().cuda()
++        self.rot = frames_t.double()  # row vectors rotate as v @ frames_t
++        tables = sk.SketchTables(ranks, N).cuda()
++        self.sketch = sk.SketchArgs(u, w, ag, tables, frames_t)
++        # x, B and C are slices of one row buffer, as in the model.
++        self.conv = torch.empty(batch, H * P + 2 * G * N, dtype=bf16).cuda()
++        self.out = torch.empty(batch, H, P, dtype=bf16).cuda()
++        self.bc_pre = torch.empty(batch, G, W).cuda()
++
++    def inputs(self):
++        self.conv.copy_(torch.randn(self.conv.shape, generator=self.g) * 0.3)
++        x, B, C = self.conv.split([H * P, G * N, G * N], 1)
++        dt = (torch.randn(self.batch, H, generator=self.g) * 0.5).cuda().bfloat16()
++        return x.view(-1, H, P), dt, B.view(-1, G, N), C.view(-1, G, N)
++
++    def build(self) -> None:
++        flags = torch.ones(self.batch, dtype=torch.int8).cuda()
++        sk.sketch_build(
++            self.state, self.slots, self.meta, flags, self.sketch, null_block_id=NULL
++        )
++
++    def step(self, x, dt, B, C, pos, flush):
++        common = dict(
++            state=self.state,
++            x=x,
++            dt=dt[..., None].expand(-1, -1, P),
++            A=self.A[:, None, None].expand(-1, P, N),
++            B=B,
++            query=sk.sketch_query(C, self.sketch.frames_t),
++            D=self.D[:, None].expand(-1, P),
++            dt_bias=self.dt_bias[:, None].expand(-1, P),
++            x_cache=self.x_cache,
++            dt_cache=self.dt_cache,
++            B_cache=self.B_cache,
++            write_pos=pos,
++            state_indices=self.slots,
++            sketch_indices=self.meta,
++            out=self.out,
++            sketch=self.sketch,
++            null_block_id=NULL,
++        )
++        skd.sketch_decode(C=C, bc_pre=self.bc_pre, is_flush=flush, **common)
++        skd.sketch_flush(flush_rows=flush_row_list(flush), **common)
++        return self.out
++
++    def checked_step(self, pos: torch.Tensor) -> None:
++        """Decode at ring positions ``pos`` and check against FP64 references."""
++        x, dt, B, C = self.inputs()
++        s0, flush = self.state.double(), (pos == self.W - 1).to(torch.int8).cuda()
++        got = self.step(x, dt, B, C, pos.int().cuda(), flush).double()
++        assert torch.equal(self.state[NULL].double(), s0[NULL])
++        for row, slot in enumerate(self.slots.tolist()[:-1]):
++            p, r = int(pos[row]), H // G
++            dt_cur = F.softplus(dt[row].float() + self.dt_bias.float())[:, None]
++            dts = torch.cat([self.dt_cache[slot, :, :p], dt_cur], 1).double()
++            cs, a = dts.cumsum(1), self.A.double()[:, None]
++            w, decay = dts * torch.exp(a * (cs[:, -1:] - cs)), torch.exp(a * cs[:, -1:])
++            xs = torch.cat([self.x_cache[slot, :, :p], x[row, :, None]], 1).double()
++            ks = torch.cat([self.B_cache[slot, :, :p], B[row, :, None]], 1).double()
++            ks = torch.einsum("gtn,gnk->gtk", ks, self.rot)
++            q = (C[row].double()[:, None] @ self.rot)[:, 0]
++            ks, q = ks.repeat_interleave(r, 0), q.repeat_interleave(r, 0)
++            skip = self.D.double()[:, None] * xs[:, -1]
++            if p == self.W - 1:
++                s = decay[..., None] * s0[slot]
++                s += torch.einsum("htp,ht,htn->hpn", xs, w, ks)
++                got_s = self.state[slot].double()
++                torch.testing.assert_close(got_s, s, rtol=1e-5, atol=1e-6)
++                want, tol = torch.einsum("hpn,hn->hp", s, q) + skip, [1e-2] * H
++            else:
++                ring = torch.einsum("htp,ht,htn,hn->hp", xs, w, ks, q)
++                # The kernel reads its stored sketch (BF16 output rounding) ...
++                meta = int(self.meta[row])
++                read = [stored_read(self.sketch, meta, h, q[h]) for h in range(H)]
++                want = decay * torch.stack(read) + ring + skip
++                err = (got[row] - want).abs().amax(1) / want.abs().amax(1)
++                assert (err < 5e-3).all(), (row, p, err)
++                # ... which holds the four-pivot read up to BF16 storage.
++                read = [sketch_read(s0[slot, h], q[h], m) for h, m in enumerate(RANKS)]
++                want = decay * torch.stack(read) + ring + skip
++                tol = [2e-2 if m == 0 else 5e-2 for m in RANKS]
++                assert torch.equal(self.state[slot].double(), s0[slot])
++            err = (got[row] - want).abs().amax(1) / want.abs().amax(1)
++            assert (err.cpu() < torch.tensor(tol)).all(), (row, p, err)
++
++
++def test_sketchssm_mamba2_decode():
++    """Sketches built from the prefilled states serve rows at mixed window
++    positions for a full window, each row flushing and rebuilding once."""
++    W = 16
++    layer = Layer(W)
++    layer.build()
++    assert not layer.sketch.u[int(layer.meta[-1])].any()  # padding row
++    for t in range(W + 1):
++        layer.checked_step((t + torch.tensor([0, W // 2 + 1, W - 1, 3, 0])) % W)
++
++
++def test_sketchssm_rotate_states():
++    """Prefill states rotate into the cache frame and back."""
++    g = torch.Generator().manual_seed(0)
++    states = torch.randn(3, H, P, N, generator=g).cuda()
++    frames_t = torch.linalg.qr(torch.randn(G, N, N, generator=g))[0].contiguous().cuda()
++    rotated = sk.sketch_rotate_states(states, frames_t)
++    want = states.double().unflatten(1, (G, -1)) @ frames_t.double()[None, :, None]
++    torch.testing.assert_close(
++        rotated, want.flatten(1, 2).float(), rtol=1e-5, atol=1e-5
++    )
++    # The cache's initial states arrive as a key-major (transposed) view.
++    key_major = rotated.transpose(-1, -2).contiguous().transpose(-1, -2)
++    back = sk.sketch_rotate_states(key_major, frames_t, inverse=True)
++    torch.testing.assert_close(back, states, rtol=1e-5, atol=1e-5)
+diff --git a/tests/model_executor/test_sketchssm_calibration.py b/tests/model_executor/test_sketchssm_calibration.py
+new file mode 100644
+index 000000000000..f40fb81b1cd8
+--- /dev/null
++++ b/tests/model_executor/test_sketchssm_calibration.py
+@@ -0,0 +1,154 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Loading and validation of SketchSSM calibrations."""
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.mamba.sketchssm.calibration import (
++    SketchSSMCalibration,
++    load_sketchssm_calibration,
++)
++from vllm.model_executor.layers.mamba.sketchssm.mamba2 import Mamba2SketchSSM
++
++WINDOW = 16
++
++
++@pytest.fixture(autouse=True)
++def _clear_cache():
++    load_sketchssm_calibration.cache_clear()
++    yield
++    load_sketchssm_calibration.cache_clear()
++
++
++def _save(tmp_path, data, name="calibration.pt"):
++    torch.save(data, tmp_path / name)
++    return str(tmp_path / name)
++
++
++def _frames(**overrides):
++    g = torch.Generator().manual_seed(0)
++    ranks = torch.tensor([[0, 1, 5, 3], [2, 0, 0, 0]])
++    frames = torch.linalg.qr(torch.randn(2, 2, 8, 8, generator=g))[0]
++    return dict(frames=frames, m_table=ranks) | overrides
++
++
++def _portable(L=3, groups=2, heads=8, K=16, V=8, max_rank=4):
++    g = torch.Generator().manual_seed(1)
++    omega = torch.linalg.qr(torch.randn(L, groups, K, K, generator=g))[0]
++    omega = omega[..., : max_rank + 2, :].contiguous().float()
++    scale = torch.rand(L, heads, 1, generator=g, dtype=torch.float64) + 0.1
++    error = scale * torch.exp(-0.5 * torch.arange(max_rank + 3)) * 64
++    return dict(
++        format="sketchssm-calibration",
++        schema_version=1,
++        geometry=dict(
++            key_dim=K, value_dim=V, groups=groups, window=WINDOW, erase=False
++        ),
++        max_rank=max_rank,
++        omega=omega,
++        curves=dict(joint_dot_sq_sum=error, joint_nstep=64),
++        layer_ids=[1, 4, 6],
++    )
++
++
++def test_exported_frames(tmp_path):
++    calibration = load_sketchssm_calibration(
++        _save(tmp_path, _frames(layer_ids=torch.tensor([3, 7]))), None, WINDOW
++    )
++    assert calibration.num_layers == 2
++    assert calibration.layer_index(7) == 1
++    with pytest.raises(ValueError, match="no entry for layer 5"):
++        calibration.layer_index(5)
++
++
++@pytest.mark.parametrize(
++    ("data", "mean_rank", "match"),
++    [
++        (_frames(frames=torch.ones(2, 2, 8, 8)), None, "not orthogonal"),
++        (_frames(m_table=torch.full((2, 4), 9)), None, r"lie in \[0, K\]"),
++        (_frames(), 4.0, "already fixed"),
++        (_frames(), None, "layer_ids"),
++    ],
++)
++def test_rejects_bad_files(tmp_path, data, mean_rank, match):
++    with pytest.raises(ValueError, match=match):
++        load_sketchssm_calibration(_save(tmp_path, data), mean_rank, WINDOW)
++
++
++def test_portable_mean_rank_allocation(tmp_path):
++    c, mean_rank = _portable(), 2.5
++    path = _save(tmp_path, c)
++    calibration = load_sketchssm_calibration(path, mean_rank, WINDOW)
++    ranks, frames = calibration.ranks, calibration.frames
++    assert ranks.shape == (3, 8) and frames.shape == (3, 2, 16, 16)
++    assert calibration.layer_ids == (1, 4, 6)
++    rank_cost, dense_cost = 16 + 8, 16 * 8
++    used = (ranks.sum() * rank_cost + (ranks == 0).sum() * dense_cost).item()
++    assert used <= rank_cost * mean_rank * ranks.numel()
++    # Each group frame starts with the basis prefix up to its largest rank.
++    for layer in range(3):
++        for group in range(2):
++            m = int(ranks[layer, group * 4 : (group + 1) * 4].max())
++            prefix = frames[layer, group, :m].double()
++            basis = c["omega"][layer, group, :m].double()
++            torch.testing.assert_close(
++                basis @ prefix.T @ prefix, basis, atol=1e-5, rtol=0
++            )
++
++
++def test_portable_default_mean_rank(tmp_path):
++    path = _save(tmp_path, _portable())
++    default = load_sketchssm_calibration(path, None, WINDOW)
++    explicit = load_sketchssm_calibration(path, 8.0, WINDOW)
++    assert torch.equal(default.ranks, explicit.ranks)
++
++
++@pytest.mark.parametrize(
++    ("head_dim", "state_size", "match"),
++    [
++        (32, 16, None),
++        (32, 24, "power of two"),
++        (32, 8, "at least 16"),
++        (8, 16, "head dim"),
++    ],
++)
++def test_mamba2_sketchssm_dims(head_dim, state_size, match):
++    """Mamba-2 shapes the SketchSSM kernels cannot run are rejected up front."""
++    frames = torch.eye(state_size).expand(1, 2, -1, -1)
++    calibration = SketchSSMCalibration(
++        frames, torch.tensor([[0, 1, 4, 5]], dtype=torch.int32), (0,)
++    )
++    args = (calibration, 0, 4, head_dim, 2, state_size, 3)
++    if match is None:
++        layer = Mamba2SketchSSM(*args)
++        assert layer.u.shape == (3, state_size + 1 + 4 + 5, head_dim)
++        return
++    with pytest.raises(ValueError, match=match):
++        Mamba2SketchSSM(*args)
++
++
++@pytest.mark.parametrize(("n_groups", "tp_rank"), [(2, 0), (2, 1), (1, 1)])
++def test_mamba2_sketchssm_tensor_parallel(n_groups, tp_rank):
++    """A TP rank holds its heads' ranks and its groups' frames (a single group
++    is held by every rank, as MambaMixer2 replicates it)."""
++    state_size = 16
++    frames = torch.randn(1, n_groups, state_size, state_size)
++    ranks = torch.tensor([[0, 1, 4, 5]], dtype=torch.int32)
++    calibration = SketchSSMCalibration(frames, ranks, (0,))
++    layer = Mamba2SketchSSM(
++        calibration, 0, 4, 32, n_groups, state_size, 3, tp_size=2, tp_rank=tp_rank
++    )
++    group = tp_rank if n_groups == 2 else 0
++    torch.testing.assert_close(layer.frames_t[0].T, frames[0, group])
++    assert layer.frames_t.shape[0] == 1
++    local_ranks = ranks[0, 2 * tp_rank : 2 * tp_rank + 2]
++    assert layer.tables.ranks.tolist() == local_ranks.tolist()
++
++
++def test_mamba2_sketchssm_tensor_parallel_uneven():
++    calibration = SketchSSMCalibration(
++        torch.randn(1, 3, 16, 16), torch.zeros(1, 6, dtype=torch.int32), (0,)
++    )
++    with pytest.raises(ValueError, match="tensor-parallel"):
++        Mamba2SketchSSM(calibration, 0, 6, 32, 3, 16, 3, tp_size=2)
+diff --git a/tests/test_config.py b/tests/test_config.py
+index 734253edc9f8..c3349d67c1eb 100644
+--- a/tests/test_config.py
++++ b/tests/test_config.py
+@@ -246,6 +246,7 @@ def test_kda_recoverssm_derivation_is_revalidated():
+             use_kda_recoverssm=False,
+             mamba_cache_mode="none",
+             replayssm_buffer_len=16,
++            sketchssm=None,
+         ),
+         num_speculative_tokens=3,
+         model_config=SimpleNamespace(
+@@ -290,6 +291,73 @@ def test_mamba_cache_mode_all_is_rejected():
+         CacheConfig(mamba_cache_mode="all")
+ 
+ 
++def _sketchssm_config(**overrides):
++    config = SimpleNamespace(
++        model_config=SimpleNamespace(supports_sketchssm=True, architecture="M"),
++        kv_transfer_config=None,
++        mamba_config=SimpleNamespace(
++            backend=MambaBackendEnum.TRITON, enable_stochastic_rounding=False
++        ),
++        cache_config=SimpleNamespace(
++            mamba_cache_mode="none",
++            mamba_ssm_cache_dtype="float32",
++            use_replayssm=False,
++        ),
++        num_speculative_tokens=0,
++        use_v2_model_runner=True,
++        parallel_config=SimpleNamespace(tensor_parallel_size=1),
++    )
++    for path, value in overrides.items():
++        *parents, name = path.split(".")
++        target = config
++        for parent in parents:
++            target = getattr(target, parent)
++        setattr(target, name, value)
++    return config
++
++
++def _sketchssm_gpu(monkeypatch, capability: int = 80):
++    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
++    monkeypatch.setattr(
++        current_platform, "has_device_capability", lambda c: capability >= c
++    )
++
++
++@pytest.mark.parametrize(
++    ("overrides", "match"),
++    [
++        ({}, None),
++        ({"model_config.supports_sketchssm": False}, "not supported for"),
++        ({"mamba_config.backend": MambaBackendEnum.FLASHINFER}, "--mamba-backend"),
++        ({"cache_config.mamba_cache_mode": "align"}, None),
++        ({"cache_config.mamba_cache_mode": "all"}, "other than align mode"),
++        ({"cache_config.use_replayssm": True}, "drop --use-replayssm"),
++        ({"num_speculative_tokens": 2}, "speculative decoding"),
++        ({"use_v2_model_runner": False}, "Model Runner V1"),
++        ({"parallel_config.tensor_parallel_size": 2}, None),
++    ],
++)
++def test_validate_sketchssm(monkeypatch, overrides, match):
++    _sketchssm_gpu(monkeypatch)
++    config = _sketchssm_config(**overrides)
++    if match is None:
++        VllmConfig._validate_sketchssm(config)
++        return
++    with pytest.raises(ValueError, match=match):
++        VllmConfig._validate_sketchssm(config)
++
++
++def test_sketchssm_requires_sm80(monkeypatch):
++    _sketchssm_gpu(monkeypatch, capability=75)
++    with pytest.raises(ValueError, match="compute capability 8.0"):
++        VllmConfig._validate_sketchssm(_sketchssm_config())
++
++
++def test_sketchssm_mean_rank_requires_sketchssm():
++    with pytest.raises(ValueError, match="requires --sketchssm"):
++        CacheConfig(sketchssm_mean_rank=6)
++
++
+ def test_per_request_spec_decode_metrics_requires_spec_decode():
+     # The flag only makes sense with speculative decoding configured; enabling
+     # it without --speculative-config should fail fast rather than silently
+diff --git a/tests/v1/attention/test_sketchssm_metadata_builder.py b/tests/v1/attention/test_sketchssm_metadata_builder.py
+new file mode 100644
+index 000000000000..9d4944913226
+--- /dev/null
++++ b/tests/v1/attention/test_sketchssm_metadata_builder.py
+@@ -0,0 +1,70 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""SketchSSM metadata in BaseMambaAttentionMetadataBuilder: sketch rows,
++flush rows and prompt-completion flags next to the shared window rings."""
++
++import numpy as np
++import torch
++
++from tests.v1.attention.test_replayssm_metadata_builder import _make_mamba_spec
++from tests.v1.attention.utils import (
++    BatchSpec,
++    MockMambaBuilder,
++    create_common_attn_metadata,
++    create_vllm_config,
++)
++from vllm.config.mamba import MambaBackendEnum
++from vllm.v1.attention.backends.mamba_attn import _sketch_decode_rows
++
++BLOCK_SIZE = 16
++DEVICE = torch.device("cpu")
++
++
++def _create_sketchssm_builder(buffer_len: int) -> MockMambaBuilder:
++    vllm_config = create_vllm_config(
++        model_name="Qwen/Qwen3.5-0.8B", block_size=BLOCK_SIZE
++    )
++    # Set the flag after construction to skip the SketchSSM config validation
++    # (it requires a real SupportsSketchSSM model) on the mock model.
++    vllm_config.cache_config.sketchssm = "unused.pt"
++    vllm_config.cache_config.replayssm_buffer_len = buffer_len
++    vllm_config.cache_config.mamba_cache_mode = "none"
++    return MockMambaBuilder(
++        _make_mamba_spec(buffer_len, MambaBackendEnum.TRITON, 0),
++        ["layer0"],
++        vllm_config,
++        DEVICE,
++    )
++
++
++def test_sketchssm_metadata():
++    """--sketchssm alone builds the ring and sketch metadata."""
++    builder = _create_sketchssm_builder(16)
++    assert builder.use_window_rings and not builder.use_replayssm
++    # A flushing decode row, a completing prompt and a chunked prompt.
++    batch = BatchSpec(seq_lens=[116, 100, 60], query_lens=[1, 50, 20])
++    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
++        is_prefilling=torch.tensor([False, True, True]),
++        replayssm_decode_base_cpu=torch.tensor([100, 100, 120], dtype=torch.int32),
++        req_idx=np.array([7, 3, 5]),
++    )
++    meta = builder.build(0, common)
++
++    assert meta.num_decodes == 1 and meta.num_prefills == 2
++    assert meta.write_pos_d.tolist()[:1] == [15]
++    assert meta.is_flush_d.tolist()[:1] == [1]
++    assert meta.sketch_indices_d.tolist()[:1] == [7]
++    assert meta.sketch_flush_rows_d.tolist()[:1] == [0]
++    assert meta.sketch_indices_p.tolist() == [3, 5]
++    assert meta.sketch_build_p.tolist() == [1, 0]
++
++
++def test_sketchssm_decode_rows_pad_past_requests():
++    """Padded decode rows past the real requests read sketch row 0."""
++    batch = BatchSpec(seq_lens=[116, 117, 118], query_lens=[1, 1, 1])
++    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
++        req_idx=np.array([7, 3])
++    )
++    rows, flush_rows = _sketch_decode_rows(common, 3, torch.tensor([0, 1, 0]))
++    assert rows.tolist() == [7, 3, 0]
++    assert flush_rows.tolist() == [1, -1, -1]
+diff --git a/tests/v1/e2e/test_sketchssm_decode.py b/tests/v1/e2e/test_sketchssm_decode.py
+new file mode 100644
+index 000000000000..ab76ae010a8b
+--- /dev/null
++++ b/tests/v1/e2e/test_sketchssm_decode.py
+@@ -0,0 +1,56 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Engine-level check: SketchSSM decode stays close to the default decode."""
++
++import pytest
++
++import vllm.envs as envs
++
++from ...models.utils import check_logprobs_close
++from ...utils import large_gpu_mark
++
++MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"
++CALIBRATION = "SketchSSM/Nemotron-3-Nano-4B-BF16"
++PROMPTS = [
++    "The capital of France is",
++    "Once upon a time, in a small village,",
++]
++
++
++@pytest.fixture(autouse=True)
++def _use_v2_model_runner(monkeypatch):
++    # SketchSSM requires Model Runner V2.
++    with monkeypatch.context() as patch:
++        patch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
++        envs.disable_envs_cache()
++        yield
++    envs.disable_envs_cache()
++
++
++@large_gpu_mark(min_gb=40)
++@pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
++def test_sketchssm_decode_close_to_baseline(vllm_runner, mamba_cache_mode):
++    # 32 tokens cover two W=16 windows, so both flushes and sketch reads run.
++    # Compare logprobs, not greedy ids: the sketch read is approximate and can
++    # flip a near-tie.
++    common = dict(
++        max_model_len=1024,
++        trust_remote_code=True,
++        enable_prefix_caching=mamba_cache_mode != "none",
++        mamba_cache_mode=mamba_cache_mode,
++        enable_chunked_prefill=True,
++        mamba_ssm_cache_dtype="float32",
++    )
++    with vllm_runner(MODEL, **common) as llm:
++        baseline = llm.generate_greedy_logprobs(PROMPTS, max_tokens=32, num_logprobs=5)
++    with vllm_runner(
++        MODEL, sketchssm=CALIBRATION, sketchssm_mean_rank=8, **common
++    ) as llm:
++        sketch = llm.generate_greedy_logprobs(PROMPTS, max_tokens=32, num_logprobs=5)
++
++    check_logprobs_close(
++        outputs_0_lst=baseline,
++        outputs_1_lst=sketch,
++        name_0="baseline",
++        name_1="sketchssm",
++    )
+diff --git a/tests/v1/worker/test_mamba_hybrid_model_state.py b/tests/v1/worker/test_mamba_hybrid_model_state.py
+index 0dcc4725d779..d4867e10a9dd 100644
+--- a/tests/v1/worker/test_mamba_hybrid_model_state.py
++++ b/tests/v1/worker/test_mamba_hybrid_model_state.py
+@@ -14,6 +14,7 @@
+     _create_gdn_builder,
+ )
+ from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
++from vllm.config.cache import CacheConfig
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.platforms import current_platform
+ from vllm.v1.attention.backends.recoverssm_metadata import (
+@@ -29,6 +30,7 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
+     state = object.__new__(MambaHybridModelState)
+     state.vllm_config = SimpleNamespace(num_speculative_tokens=0)
+     state.model_config = SimpleNamespace(max_model_len=8192)
++    state.cache_config = CacheConfig()
+     state._align_mode = False
+     state.recoverssm = None
+ 
+@@ -46,6 +48,7 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
+         seq_lens=torch.tensor([1537], dtype=torch.int32),
+         is_prefilling_np=torch.tensor([False]).numpy(),
+         prefill_runs_as_decode_np=None,
++        idx_mapping_np=torch.tensor([0]).numpy(),
+         dcp_local_seq_lens=None,
+         positions=positions,
+         prompt_lens=torch.tensor([1024], dtype=torch.int32),
+@@ -95,6 +98,7 @@ def test_padded_prompt_tail_builds_as_spec_decode(
+     state = object.__new__(MambaHybridModelState)
+     state.vllm_config = SimpleNamespace(num_speculative_tokens=k)
+     state.model_config = SimpleNamespace(max_model_len=8192)
++    state.cache_config = CacheConfig()
+     state._align_mode = False
+     state.recoverssm = None
+     state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32)
+@@ -111,6 +115,7 @@ def test_padded_prompt_tail_builds_as_spec_decode(
+         num_reqs_after_padding=3,
+         num_tokens_after_padding=12,
+         idx_mapping=torch.arange(3),
++        idx_mapping_np=np.arange(3),
+         query_start_loc_np=query_start_loc,
+         query_start_loc=torch.from_numpy(query_start_loc),
+         num_scheduled_tokens=np.array(query_lens, dtype=np.int32),
+@@ -160,6 +165,7 @@ def _mamba_hybrid_state(num_speculative_tokens: int) -> MambaHybridModelState:
+     state = object.__new__(MambaHybridModelState)
+     state.vllm_config = SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+     state.model_config = SimpleNamespace(max_model_len=8192)
++    state.cache_config = CacheConfig()
+     state._align_mode = False
+     state.recoverssm = None
+     # A request that accepted 3 drafts (plus the bonus token) on the previous
+@@ -196,6 +202,7 @@ def _input_batch(
+         if num_draft_tokens_per_req is None
+         else np.array(num_draft_tokens_per_req, dtype=np.int32),
+         idx_mapping=torch.arange(num_reqs),
++        idx_mapping_np=np.arange(num_reqs),
+         query_start_loc=torch.from_numpy(query_start_loc),
+         seq_lens=seq_lens,
+         dcp_local_seq_lens=None,
+@@ -338,6 +345,53 @@ def test_chunked_prefill_tail_of_two_or_three_tokens_keeps_the_sentinel(
+     assert metadata.num_decode_draft_tokens_cpu.tolist() == [-1, -1]
+ 
+ 
++def test_prepare_attn_forwards_sketchssm_metadata(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """SketchSSM rows get their ring origin and persistent request index."""
++    state = object.__new__(MambaHybridModelState)
++    state.vllm_config = SimpleNamespace(num_speculative_tokens=0)
++    state.model_config = SimpleNamespace(max_model_len=8192)
++    state.cache_config = CacheConfig(sketchssm="unused.pt")
++    state._align_mode = False
++    state.recoverssm = None
++    input_batch = SimpleNamespace(
++        num_reqs=2,
++        num_tokens=2,
++        num_reqs_after_padding=4,
++        num_tokens_after_padding=4,
++        query_start_loc_np=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32).numpy(),
++        query_start_loc=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
++        num_scheduled_tokens=torch.tensor([1, 1], dtype=torch.int32),
++        max_query_len=None,
++        seq_lens_cpu_upper_bound=torch.tensor([40, 77, 0, 0], dtype=torch.int32),
++        seq_lens=torch.tensor([40, 77, 0, 0], dtype=torch.int32),
++        is_prefilling_np=torch.tensor([False, False]).numpy(),
++        prefill_len_np=torch.tensor([30, 70], dtype=torch.int32).numpy(),
++        prefill_runs_as_decode_np=None,
++        idx_mapping_np=torch.tensor([5, 2]).numpy(),
++        dcp_local_seq_lens=None,
++        positions=torch.tensor([39, 76, 0, 0], dtype=torch.int64),
++        prompt_lens=torch.tensor([30, 70], dtype=torch.int32),
++    )
++    build_attn_metadata = Mock(return_value={})
++    monkeypatch.setattr(mamba_hybrid, "build_attn_metadata", build_attn_metadata)
++
++    state.prepare_attn(
++        input_batch=input_batch,
++        cudagraph_mode=CUDAGraphMode.FULL,
++        block_tables=(),
++        slot_mappings=torch.empty(0, dtype=torch.int64),
++        attn_groups=[],
++        kv_cache_config=Mock(),
++    )
++
++    kwargs = build_attn_metadata.call_args.kwargs
++    assert kwargs["req_idx"].tolist() == [5, 2]
++    common = kwargs["model_specific_attn_metadata"].get_extra_common_attn_kwargs(0, 4)
++    assert common["replayssm_decode_base_cpu"].tolist() == [30, 70, 0, 0]
++
++
+ @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+ @pytest.mark.parametrize(("num_sampled", "expected_value"), [(0, 1), (3, 3)])
+ def test_postprocess_state_scalar_with_int32_mapping(
+diff --git a/vllm/config/cache.py b/vllm/config/cache.py
+index 5eb26726c718..c255a0657304 100644
+--- a/vllm/config/cache.py
++++ b/vllm/config/cache.py
+@@ -203,7 +203,8 @@ def device_memory_utilization(self, value: float) -> None:
+     replayssm_buffer_len: int = Field(default=16, gt=0)
+     """ReplaySSM logical history length B for Mamba2. Triton uses B physical
+     rows and FlashInfer uses B+T, where T is the target verification length.
+-    Kimi-K3 speculative decode does not use B. Default 16."""
++    Kimi-K3 speculative decode does not use B. Also the SketchSSM window
++    length. Default 16."""
+     use_replayssm: bool = False
+     """Use the ReplaySSM Mamba2 decode kernel: cache recent SSM inputs and skip
+     the per-step full-state store, writing the checkpoint back only on flush.
+@@ -212,6 +213,12 @@ def device_memory_utilization(self, value: float) -> None:
+     and mamba_cache_mode 'none'. In align mode flushes are most efficient when
+     mamba_block_size is a multiple of replayssm_buffer_len, but this is not
+     required."""
++    sketchssm: str | None = None
++    """SketchSSM calibration file, directory or Hugging Face repo id. Enables
++    SketchSSM decode, which reads a compact per-request sketch of the state."""
++    sketchssm_mean_rank: float | None = Field(default=None, ge=1, allow_inf_nan=False)
++    """Mean sketch rank per head for a portable `sketchssm` calibration
++    (default 8)."""
+     use_kda_recoverssm: bool = field(default=False, init=False)
+     """Whether Kimi-K3 KDA uses RecoverSSM speculative decode."""
+ 
+@@ -324,6 +331,11 @@ def metrics_info(self):
+         # metrics info
+         return {key: str(value) for key, value in self.__dict__.items()}
+ 
++    @property
++    def use_mamba_window_rings(self) -> bool:
++        """Whether the Mamba cache holds ReplaySSM/SketchSSM window rings."""
++        return self.use_replayssm or self.sketchssm is not None
++
+     _block_size_resolved: bool = field(default=False, init=False)
+     """Guard against pydantic re-running _apply_block_size_default."""
+ 
+@@ -347,6 +359,12 @@ def _apply_block_size_default(self) -> "CacheConfig":
+             self.user_specified_block_size = True
+         return self
+ 
++    @model_validator(mode="after")
++    def _validate_sketchssm_mean_rank(self) -> "CacheConfig":
++        if self.sketchssm_mean_rank is not None and self.sketchssm is None:
++            raise ValueError("--sketchssm-mean-rank requires --sketchssm")
++        return self
++
+     @field_validator("cache_dtype", mode="after")
+     @classmethod
+     def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
+diff --git a/vllm/config/model.py b/vllm/config/model.py
+index d4bafad5d6d3..3c19587d5424 100644
+--- a/vllm/config/model.py
++++ b/vllm/config/model.py
+@@ -2042,6 +2042,10 @@ def supports_mamba_prefix_caching(self) -> bool:
+     def supports_replayssm(self) -> bool:
+         return self._model_info.supports_replayssm
+ 
++    @property
++    def supports_sketchssm(self) -> bool:
++        return self._model_info.supports_sketchssm
++
+     @property
+     def use_mla(self) -> bool:
+         if envs.VLLM_MLA_DISABLE:
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index b4298cd145b8..04bfe54f1438 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -3342,6 +3342,8 @@ def validate_mamba_block_size(self) -> "VllmConfig":
+ 
+     @model_validator(mode="after")
+     def validate_mamba_cached_kernel(self) -> "VllmConfig":
++        if self.cache_config.sketchssm is not None:
++            self._validate_sketchssm()
+         if not self.cache_config.use_replayssm:
+             self.cache_config.use_kda_recoverssm = False
+             return self
+@@ -3437,6 +3439,46 @@ def validate_mamba_cached_kernel(self) -> "VllmConfig":
+             )
+         return self
+ 
++    def _validate_sketchssm(self) -> None:
++        from vllm.platforms import current_platform
++
++        if self.cache_config.use_replayssm:
++            raise ValueError(
++                "--sketchssm already applies ReplaySSM-style buffered state "
++                "updates; pass only --sketchssm (drop --use-replayssm)"
++            )
++        if not current_platform.is_cuda() or not (
++            current_platform.has_device_capability(80)
++        ):
++            raise ValueError(
++                "--sketchssm requires a CUDA GPU with compute capability 8.0 or newer"
++            )
++        if self.model_config is not None and not self.model_config.supports_sketchssm:
++            raise ValueError(
++                "--sketchssm is not supported for architecture "
++                f"{self.model_config.architecture!r}"
++            )
++        unsupported = []
++        if (
++            self.kv_transfer_config is not None
++            and self.kv_transfer_config.is_kv_transfer_instance
++        ):
++            unsupported.append("KV connectors")
++        if self.mamba_config.backend != MambaBackendEnum.TRITON:
++            unsupported.append("--mamba-backend other than triton")
++        if self.cache_config.mamba_cache_mode not in ("none", "align"):
++            unsupported.append("Mamba prefix caching other than align mode")
++        if self.num_speculative_tokens > 0:
++            unsupported.append("speculative decoding")
++        if not self.use_v2_model_runner:
++            unsupported.append("Model Runner V1")
++        if self.cache_config.mamba_ssm_cache_dtype != "float32":
++            unsupported.append("a non-float32 --mamba-ssm-cache-dtype")
++        if self.mamba_config.enable_stochastic_rounding:
++            unsupported.append("stochastic rounding of the SSM state")
++        if unsupported:
++            raise ValueError("--sketchssm does not support " + ", ".join(unsupported))
++
+ 
+ _current_vllm_config: VllmConfig | None = None
+ _current_prefix: str | None = None
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 31777e266f8b..205a33f6df90 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -796,6 +796,8 @@ class EngineArgs:
+     )
+     replayssm_buffer_len: int = CacheConfig.replayssm_buffer_len
+     use_replayssm: bool = CacheConfig.use_replayssm
++    sketchssm: str | None = CacheConfig.sketchssm
++    sketchssm_mean_rank: float | None = CacheConfig.sketchssm_mean_rank
+ 
+     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
+     mamba_ssu_algorithm: MambaSSUAlgorithm | None = None
+@@ -1401,6 +1403,10 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
+             "--replayssm-buffer-len", **cache_kwargs["replayssm_buffer_len"]
+         )
+         cache_group.add_argument("--use-replayssm", **cache_kwargs["use_replayssm"])
++        cache_group.add_argument("--sketchssm", **cache_kwargs["sketchssm"])
++        cache_group.add_argument(
++            "--sketchssm-mean-rank", **cache_kwargs["sketchssm_mean_rank"]
++        )
+         cache_group.add_argument(
+             "--kv-offloading-size", **cache_kwargs["kv_offloading_size"]
+         )
+@@ -2274,6 +2280,8 @@ def create_engine_config(
+             ),
+             replayssm_buffer_len=self.replayssm_buffer_len,
+             use_replayssm=self.use_replayssm,
++            sketchssm=self.sketchssm,
++            sketchssm_mean_rank=self.sketchssm_mean_rank,
+             kv_offloading_size=self.kv_offloading_size,
+             kv_offloading_backend=self.kv_offloading_backend,
+         )
+diff --git a/vllm/model_executor/layers/mamba/mamba_mixer2.py b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+index bfa1103bb368..0c1dfad8d5af 100644
+--- a/vllm/model_executor/layers/mamba/mamba_mixer2.py
++++ b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+@@ -51,12 +51,17 @@
+     selective_state_update,
+     selective_state_update_replayssm_flashinfer,
+ )
++from vllm.model_executor.layers.mamba.sketchssm.mamba2 import (
++    Mamba2SketchSSM,
++    mamba2_sketchssm_state_shapes,
++)
+ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.model_loader.weight_utils import (
+     LoaderFunction,
+     composed_weight_loader,
+     sharded_weight_loader,
+ )
++from vllm.model_executor.models.utils import extract_layer_index
+ from vllm.model_executor.parameter import BasevLLMParameter
+ from vllm.model_executor.utils import set_weight_attrs
+ from vllm.platforms import current_platform
+@@ -532,9 +537,13 @@ def __init__(
+         self.use_replayssm = (
+             cache_config.use_replayssm if cache_config is not None else False
+         )
++        # The x/dt/B window rings of ReplaySSM, also used by SketchSSM.
++        self.use_window_rings = (
++            cache_config.use_mamba_window_rings if cache_config is not None else False
++        )
+         self.replayssm_buffer_len = (
+             cache_config.replayssm_buffer_len
+-            if cache_config is not None and cache_config.use_replayssm
++            if cache_config is not None and self.use_window_rings
+             else None
+         )
+         self.mamba_config = vllm_config.mamba_config
+@@ -542,8 +551,21 @@ def __init__(
+             raise ValueError(
+                 "--use-replayssm requires tensor-parallel heads to divide evenly"
+             )
+-        # ReplaySSM appends x/dt/B rings to (conv_state, ssm_state).
+-        _n_state = 5 if self.use_replayssm else 2
++        self.sketchssm: Mamba2SketchSSM | None = None
++        if cache_config is not None and cache_config.sketchssm is not None:
++            self.sketchssm = Mamba2SketchSSM.from_config(
++                cache_config,
++                extract_layer_index(prefix),
++                num_heads,
++                head_dim,
++                n_groups,
++                ssm_state_size,
++                vllm_config.scheduler_config.max_num_seqs,
++                self.tp_size,
++                tp_rank,
++            )
++        # ReplaySSM and SketchSSM append x/dt/B rings to (conv_state, ssm_state).
++        _n_state = 5 if self.use_window_rings else 2
+         self.kv_cache = tuple(torch.tensor([]) for _ in range(_n_state))
+         self._replayssm_ring_start = torch.empty(0, dtype=torch.int32)
+         self._replayssm_prev_num_accepted = torch.empty(0, dtype=torch.int32)
+@@ -747,7 +769,10 @@ def conv_ssm_forward(
+                 else self.kv_cache[0].transpose(-1, -2)
+             )
+             ssm_state = self.kv_cache[1]
+-            if self.use_replayssm:
++            if self.sketchssm is not None:
++                # SketchSSM keeps the state key-major, (heads, dstate, dim).
++                ssm_state = ssm_state.transpose(-1, -2)
++            if self.use_window_rings:
+                 x_cache, dt_cache, B_cache = self.kv_cache[2:5]
+                 if self.mamba_config.backend == MambaBackendEnum.FLASHINFER:
+                     ring_start = self._replayssm_ring_start
+@@ -844,6 +869,11 @@ def conv_ssm_forward(
+                     ssm_state[state_indices_tensor_p],
+                     0,
+                 )
++                if self.sketchssm is not None:
++                    # The cache holds rotated states; the scan runs unrotated.
++                    initial_states = self.sketchssm.rotate_states(
++                        initial_states, inverse=True
++                    )
+ 
+             # NOTE: final output is an in-place update of out tensor
+             assert preallocated_ssm_out_p is not None
+@@ -876,6 +906,8 @@ def conv_ssm_forward(
+             # - varlen state is a (num_prefills, nheads, headdim, dstate)
+             #   tensor
+             assert state_indices_tensor_p is not None
++            if self.sketchssm is not None:
++                varlen_states = self.sketchssm.rotate_states(varlen_states)
+             final_states = (
+                 varlen_states[last_chunk_indices_p]
+                 if has_checkpoints
+@@ -889,11 +921,18 @@ def conv_ssm_forward(
+                     checkpoint_chunk_idx,
+                     x,
+                     conv_state,
+-                    varlen_states,
++                    # The checkpoint copy is flat; match the key-major cache.
++                    varlen_states
++                    if self.sketchssm is None
++                    else varlen_states.transpose(-1, -2).contiguous(),
+                     ssm_state,
+                     query_start_loc_p,
+                 )
+             ssm_state[state_indices_tensor_p] = final_states
++            if self.sketchssm is not None:
++                self.sketchssm.prefilled(
++                    ssm_state, state_indices_tensor_p, attn_metadata
++                )
+             if ring_start is not None and self._updates_replayssm_trackers:
+                 assert prev_num_accepted is not None
+                 reset_replayssm_ring_trackers(
+@@ -981,9 +1020,26 @@ def conv_ssm_forward(
+             preallocated_ssm_out_d = preallocated_ssm_out_d.view(
+                 num_decode_tokens, -1, self.head_dim
+             )
+-            if self.use_replayssm:
++            if self.use_window_rings:
+                 assert self.replayssm_buffer_len is not None
+-                if self.mamba_config.backend == MambaBackendEnum.FLASHINFER:
++                if self.sketchssm is not None:
++                    self.sketchssm.decode(
++                        ssm_state,
++                        hidden_states_d,
++                        dt_d,
++                        A_d,
++                        B_d,
++                        C_d,
++                        D_d,
++                        dt_bias,
++                        x_cache=x_cache,
++                        dt_cache=dt_cache,
++                        B_cache=B_cache,
++                        state_indices=state_indices_tensor_d,
++                        attn_metadata=attn_metadata,
++                        out=preallocated_ssm_out_d,
++                    )
++                elif self.mamba_config.backend == MambaBackendEnum.FLASHINFER:
+                     assert ring_start is not None
+                     assert prev_num_accepted is not None
+                     assert prev_query_len is not None
+@@ -1114,7 +1170,7 @@ def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+             self.cache_config.mamba_cache_dtype,
+             self.cache_config.mamba_ssm_cache_dtype,
+         )
+-        if self.use_replayssm:
++        if self.use_window_rings:
+             return MambaStateDtypeCalculator.append_replayssm_ring(
+                 base_dtype, self.model_config.dtype
+             )
+@@ -1132,9 +1188,9 @@ def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
+             conv_kernel=self.conv_kernel_size,
+             num_spec=self.num_spec,
+         )
+-        if self.use_replayssm:
++        if self.use_window_rings:
+             assert self.replayssm_buffer_len is not None
+-            return MambaStateShapeCalculator.append_replayssm_ring(
++            shapes = MambaStateShapeCalculator.append_replayssm_ring(
+                 base_shapes=base_shape,
+                 n_groups=self.n_groups,
+                 tp_world_size=tp_world_size,
+@@ -1142,6 +1198,9 @@ def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
+                 backend=self.mamba_config.backend,
+                 num_speculative_tokens=self.num_spec,
+             )
++            if self.sketchssm is not None:
++                return mamba2_sketchssm_state_shapes(shapes)
++            return shapes
+         return base_shape
+ 
+     @property
+diff --git a/vllm/model_executor/layers/mamba/ops/sketchssm_config.py b/vllm/model_executor/layers/mamba/ops/sketchssm_config.py
+new file mode 100644
+index 000000000000..faa6e924d69e
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/ops/sketchssm_config.py
+@@ -0,0 +1,34 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Launch configs of the SketchSSM Mamba-2 Triton kernels.
++
++Mirrors ``replayssm_config.py``: a hard-coded config per kernel, plus
++``_overrides`` for benchmarks and config sweeps. The configs were chosen on an
++RTX PRO 6000 Blackwell (sm_120); architectures that tune differently get their
++own branch here.
++"""
++
++# Per-kernel overrides keyed by the kernel name passed to get_sketchssm_config.
++_overrides: dict[str, tuple] = {}
++
++
++def get_sketchssm_config(kernel: str) -> tuple:
++    """Return the launch config for ``kernel`` (override > default).
++
++    Args:
++        kernel: ``"mamba2_decode"``: ``(BLOCK_M, BLOCK_J, num_warps)`` of the
++            non-flush decode; ``"mamba2_flush"``: ``(BLOCK_M, num_warps, rows
++            per program, BLOCK_V)`` of the flush with its sketch rebuild;
++            ``"mamba2_build"``: ``(BLOCK_V, num_warps)`` of the sketch build
++            after a prefill.
++
++    """
++    if kernel in _overrides:
++        return _overrides[kernel]
++    if kernel == "mamba2_decode":
++        return 128, 16, 1
++    if kernel == "mamba2_flush":
++        return 16, 4, 4, 32
++    if kernel == "mamba2_build":
++        return 32, 2
++    raise ValueError(f"unknown SketchSSM kernel config key: {kernel}")
+diff --git a/vllm/model_executor/layers/mamba/ops/sketchssm_mamba2_build.py b/vllm/model_executor/layers/mamba/ops/sketchssm_mamba2_build.py
+new file mode 100644
+index 000000000000..f672552015ce
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/ops/sketchssm_mamba2_build.py
+@@ -0,0 +1,654 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""SketchSSM for Mamba-2: sketch layout, B/C rotations and the sketch build.
++
++The state ``S`` is kept key-major, ``(slot, head, dstate, dim)``, in
++coordinates rotated by a calibrated orthogonal frame ``R`` per group. Prefill
++runs the unrotated chunk scan and rotates its states (``sketch_rotate_states``);
++decode rotates only the query ``R C`` (``sketch_query``) and, at a flush, the
++window keys.
++
++A head of rank ``m`` (0 = dense) keeps ``U``, the leading ``m`` rows of ``S``
++(all rows if dense), and reads ``S^T q`` as ``U^T c`` with the ridge solution
++
++    c = (diag(r) + Z^T Z + λI)^-1 (diag(r) + Z^T Z)[:m] q,
++
++where ``Z`` holds the first ``min(m, 4)`` pivot rows of the normalized state
++orthonormalized over ``dim`` and ``r`` the row energy they leave. It is
++stored as ``c_j = a_j q_j + Σ_p g_pj (w_p · q)``: the ``w`` rows in BF16, and
++``a`` and ``g`` in FP32 ``ag`` for ``m > 4`` (for ``m <= 4``, ``a = 0`` and
++``g`` folds into ``w``). Sketch buffers are indexed by the persistent request
++index.
++"""
++
++from dataclasses import dataclass
++
++import torch
++
++from vllm.model_executor.layers.mamba.ops.sketchssm_config import get_sketchssm_config
++from vllm.triton_utils import tl, triton
++from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
++
++SKETCH_PIVOTS = 4
++SKETCH_RIDGE = 0.003
++SKETCH_DTYPES = (torch.bfloat16, torch.bfloat16, torch.float32)
++# FP32 dots of the rotations and the flush (3xTF32).
++SKETCH_DOT_PRECISION = "tf32x3"
++
++_PIVOTS = tl.constexpr(SKETCH_PIVOTS)
++_RIDGE = tl.constexpr(SKETCH_RIDGE)
++
++
++def sketch_shapes(
++    ranks: torch.Tensor, head_dim: int, state_size: int
++) -> tuple[tuple[int, ...], ...]:
++    """Per-request ``(u, w, ag)`` shapes of one layer."""
++    ranks = ranks.long()
++    u_rows = int(torch.where(ranks == 0, state_size, ranks).sum())
++    w_rows = int(ranks.clamp(max=SKETCH_PIVOTS).sum())
++    ag_cols = int(ranks.sum())
++    return (
++        (max(u_rows, 1), head_dim),
++        (max(w_rows, 1), state_size),
++        (SKETCH_PIVOTS + 1, max(ag_cols, 1)),
++    )
++
++
++class SketchTables(torch.nn.Module):
++    """Per-head ranks and offsets into one layer's packed sketch."""
++
++    def __init__(self, ranks: torch.Tensor, state_size: int):
++        super().__init__()
++        ranks = ranks.to(torch.int32).cpu()
++        u_rows = torch.where(ranks == 0, state_size, ranks)
++        pivots = ranks.clamp(max=SKETCH_PIVOTS)
++        tables = {
++            "ranks": ranks,
++            "u_offsets": u_rows.cumsum(0) - u_rows,
++            "w_offsets": pivots.cumsum(0) - pivots,
++            "ag_offsets": ranks.cumsum(0) - ranks,
++        }
++        device = torch.get_default_device()
++        for name, value in tables.items():
++            self.register_buffer(
++                name, value.to(torch.int32).to(device), persistent=False
++            )
++
++
++@dataclass
++class SketchArgs:
++    """One layer's sketch buffers, tables and frames."""
++
++    u: torch.Tensor  # (num_reqs, u_rows, head_dim) bf16
++    w: torch.Tensor  # (num_reqs, w_rows, state_size) bf16
++    ag: torch.Tensor  # (num_reqs, 5, ag_cols) fp32
++    tables: SketchTables
++    frames_t: torch.Tensor  # (groups, state_size, state_size) fp32, R^T
++
++
++@triton.jit(do_not_specialize=["num_tokens"])
++def _rotate_groups_kernel(
++    x_ptr,
++    y_ptr,
++    frames_t_ptr,
++    num_tokens,
++    stride_x_token,
++    stride_x_elem,
++    stride_y_token,
++    stride_y_elem,
++    N: tl.constexpr,
++    BLOCK_T: tl.constexpr,
++    BLOCK_C: tl.constexpr,
++    DOT_PRECISION: tl.constexpr,
++):
++    # y[t, g, cols] = x[t, g] @ R_g^T[:, cols] for BLOCK_C output columns.
++    pid_t = tl.program_id(0)
++    pid_g = tl.program_id(1)
++    offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
++    offs_n = tl.arange(0, N)
++    offs_c = tl.program_id(2) * BLOCK_C + tl.arange(0, BLOCK_C)
++    mask = offs_t[:, None] < num_tokens
++    x = tl.load(
++        x_ptr
++        + offs_t[:, None] * stride_x_token
++        + (pid_g * N + offs_n[None, :]) * stride_x_elem,
++        mask=mask,
++        other=0.0,
++    )
++    r = tl.load(frames_t_ptr + pid_g * N * N + offs_n[:, None] * N + offs_c[None, :])
++    y = tl.dot(x.to(tl.float32), r, input_precision=DOT_PRECISION)
++    tl.store(
++        y_ptr
++        + offs_t[:, None] * stride_y_token
++        + (pid_g * N + offs_c[None, :]) * stride_y_elem,
++        y.to(y_ptr.dtype.element_ty),
++        mask=mask,
++    )
++
++
++def _rotate_groups(
++    x: torch.Tensor, frames_t: torch.Tensor, out: torch.Tensor, block_t: int
++) -> None:
++    # x and out are (tokens, groups * N) with any element stride.
++    num_tokens = x.shape[0]
++    groups, n, _ = frames_t.shape
++    if num_tokens == 0:
++        return
++    block_c = min(n, 64)
++    grid = (triton.cdiv(num_tokens, block_t), groups, n // block_c)
++    _rotate_groups_kernel[grid](
++        x,
++        out,
++        frames_t,
++        num_tokens,
++        x.stride(0),
++        x.stride(-1),
++        out.stride(0),
++        out.stride(-1),
++        N=n,
++        BLOCK_T=block_t,
++        BLOCK_C=block_c,
++        DOT_PRECISION=SKETCH_DOT_PRECISION,
++        num_warps=4,
++    )
++
++
++@triton.jit
++def _rotate_states_kernel(
++    x_ptr,
++    y_ptr,
++    frames_t_ptr,
++    heads,
++    heads_per_group,
++    stride_x_item,
++    stride_x_head,
++    stride_x_dim,
++    stride_x_dstate,
++    stride_y_item,
++    stride_y_head,
++    stride_y_dim,
++    DIM: tl.constexpr,
++    N: tl.constexpr,
++    BLOCK_P: tl.constexpr,
++    BLOCK_C: tl.constexpr,
++    INVERSE: tl.constexpr,
++    DOT_PRECISION: tl.constexpr,
++):
++    # y[i, h, p, cols] = x[i, h, p] @ R_g^T[:, cols] (R_g[:, cols] if INVERSE).
++    item = tl.program_id(0) // heads
++    head = tl.program_id(0) % heads
++    group = head // heads_per_group
++    offs_p = tl.program_id(1) * BLOCK_P + tl.arange(0, BLOCK_P)
++    offs_n = tl.arange(0, N)
++    offs_c = tl.program_id(2) * BLOCK_C + tl.arange(0, BLOCK_C)
++    mask = offs_p[:, None] < DIM
++    x = tl.load(
++        x_ptr
++        + item * stride_x_item
++        + head * stride_x_head
++        + offs_p[:, None] * stride_x_dim
++        + offs_n[None, :] * stride_x_dstate,
++        mask=mask,
++        other=0.0,
++    )
++    frame = frames_t_ptr + group * N * N
++    if INVERSE:
++        r = tl.load(frame + offs_c[None, :] * N + offs_n[:, None])
++    else:
++        r = tl.load(frame + offs_n[:, None] * N + offs_c[None, :])
++    y = tl.dot(x, r, input_precision=DOT_PRECISION)
++    tl.store(
++        y_ptr
++        + item * stride_y_item
++        + head * stride_y_head
++        + offs_p[:, None] * stride_y_dim
++        + offs_c[None, :],
++        y,
++        mask=mask,
++    )
++
++
++def sketch_rotate_states(
++    states: torch.Tensor, frames_t: torch.Tensor, inverse: bool = False
++) -> torch.Tensor:
++    """States ``(items, heads, dim, N)`` FP32 in the rotated frame, ``S R^T``
++    (``S R`` back to the model frame if ``inverse``).
++
++    Prefill runs the unrotated chunk scan; its states enter the cache rotated.
++    """
++    items, heads, dim, n = states.shape
++    assert states.dtype == torch.float32
++    assert frames_t.is_contiguous()
++    out = torch.empty(states.shape, dtype=torch.float32, device=states.device)
++    if items == 0:
++        return out
++    block_p, block_c = 32, min(n, 64)
++    grid = (items * heads, triton.cdiv(dim, block_p), n // block_c)
++    _rotate_states_kernel[grid](
++        states,
++        out,
++        frames_t,
++        heads,
++        heads // frames_t.shape[0],
++        *states.stride(),
++        *out.stride()[:3],
++        DIM=dim,
++        N=n,
++        BLOCK_P=block_p,
++        BLOCK_C=block_c,
++        INVERSE=inverse,
++        DOT_PRECISION=SKETCH_DOT_PRECISION,
++        num_warps=4,
++    )
++    return out
++
++
++def sketch_query(C: torch.Tensor, frames_t: torch.Tensor) -> torch.Tensor:
++    """FP32 rotated query ``R C`` ``(batch, groups, N)`` of the decode C."""
++    batch, groups, n = C.shape
++    assert C.stride(1) == n * C.stride(2)
++    query = torch.empty(batch, groups, n, dtype=torch.float32, device=C.device)
++    _rotate_groups(C.flatten(1), frames_t, query.view(batch, -1), block_t=32)
++    return query
++
++
++@triton.jit
++def _inv_norm(w, u):
++    # 1 / |w|, or 0 when w keeps almost nothing of u.
++    e = tl.sum(w * w)
++    keep = e > 1.0e-12 * tl.sum(u * u)
++    return tl.where(keep, 1.0 / tl.sqrt(tl.where(e > 0.0, e, 1.0)), 0.0)
++
++
++@triton.jit
++def _pivot_scalars(u0, u1, u2, u3, m):
++    # Gram-Schmidt (twice) coefficients of the pivot rows u0..u3.
++    z = tl.sum(u0 * 0.0)
++    e0 = tl.sum(u0 * u0)
++    n0 = 1.0 / tl.sqrt(tl.where(e0 > 0.0, e0, 1.0))
++    p10, p11, n1 = z, z, z
++    p20, p21, p22, p23, n2 = z, z, z, z, z
++    p30, p31, p32, p33, p34, p35, n3 = z, z, z, z, z, z, z
++    v0 = u0 * n0
++    v1 = u0 * 0.0
++    v2 = u0 * 0.0
++    if m > 1:
++        p10 = tl.sum(v0 * u1)
++        w1 = u1 - v0 * p10
++        p11 = tl.sum(v0 * w1)
++        w1 = w1 - v0 * p11
++        n1 = _inv_norm(w1, u1)
++        v1 = w1 * n1
++    if m > 2:
++        p20 = tl.sum(v0 * u2)
++        w2 = u2 - v0 * p20
++        p21 = tl.sum(v1 * w2)
++        w2 = w2 - v1 * p21
++        p22 = tl.sum(v0 * w2)
++        w2 = w2 - v0 * p22
++        p23 = tl.sum(v1 * w2)
++        w2 = w2 - v1 * p23
++        n2 = _inv_norm(w2, u2)
++        v2 = w2 * n2
++    if m > 3:
++        p30 = tl.sum(v0 * u3)
++        w3 = u3 - v0 * p30
++        p31 = tl.sum(v1 * w3)
++        w3 = w3 - v1 * p31
++        p32 = tl.sum(v2 * w3)
++        w3 = w3 - v2 * p32
++        p33 = tl.sum(v0 * w3)
++        w3 = w3 - v0 * p33
++        p34 = tl.sum(v1 * w3)
++        w3 = w3 - v1 * p34
++        p35 = tl.sum(v2 * w3)
++        w3 = w3 - v2 * p35
++        n3 = _inv_norm(w3, u3)
++    return n0, p10, p11, n1, p20, p21, p22, p23, n2, p30, p31, p32, p33, p34, p35, n3
++
++
++@triton.jit
++def _pivot_directions(
++    u0,
++    u1,
++    u2,
++    u3,
++    n0,
++    p10,
++    p11,
++    n1,
++    p20,
++    p21,
++    p22,
++    p23,
++    n2,
++    p30,
++    p31,
++    p32,
++    p33,
++    p34,
++    p35,
++    n3,
++):
++    # Orthonormal pivot directions v1..v3 from the _pivot_scalars coefficients.
++    v0 = u0 * n0
++    v1 = (u1 - v0 * p10 - v0 * p11) * n1
++    v2 = (u2 - v0 * p20 - v1 * p21 - v0 * p22 - v1 * p23) * n2
++    v3 = (u3 - v0 * p30 - v1 * p31 - v2 * p32 - v0 * p33 - v1 * p34 - v2 * p35) * n3
++    return v1, v2, v3
++
++
++@triton.jit
++def _sketch_head(
++    state_ptr,
++    sketch_index,
++    head,
++    u_ptr,
++    w_ptr,
++    ag_ptr,
++    ranks_ptr,
++    u_offsets_ptr,
++    w_offsets_ptr,
++    ag_offsets_ptr,
++    stride_state_dim,
++    stride_state_dstate,
++    DIM: tl.constexpr,
++    DSTATE: tl.constexpr,
++    U_ROWS,
++    W_ROWS,
++    AG_COLS,
++    BLOCK_V: tl.constexpr,
++):
++    # Sketch of one head from its state at state_ptr, streamed in dim chunks.
++    j = tl.arange(0, DSTATE)
++    m = tl.load(ranks_ptr + head).to(tl.int32)
++    u_rows = u_ptr + (
++        (
++            sketch_index.to(tl.int64) * U_ROWS
++            + tl.load(u_offsets_ptr + head)
++            + j[None, :]
++        )
++        * DIM
++    )
++    if m == 0:
++        for c in tl.static_range(0, DIM, BLOCK_V):
++            vc = c + tl.arange(0, BLOCK_V)
++            mask = vc[:, None] < DIM
++            s = tl.load(
++                state_ptr
++                + vc[:, None] * stride_state_dim
++                + j[None, :] * stride_state_dstate,
++                mask=mask,
++                other=0.0,
++            )
++            tl.store(u_rows + vc[:, None], s.to(u_ptr.dtype.element_ty), mask=mask)
++    else:
++        pv = tl.arange(0, triton.next_power_of_2(DIM))
++        pivot = state_ptr + pv * stride_state_dim
++        u0 = tl.load(pivot, mask=pv < DIM, other=0.0).to(tl.float32)
++        u1 = tl.load(pivot + stride_state_dstate, mask=pv < DIM, other=0.0)
++        u2 = tl.load(pivot + 2 * stride_state_dstate, mask=pv < DIM, other=0.0)
++        u3 = tl.load(pivot + 3 * stride_state_dstate, mask=pv < DIM, other=0.0)
++        n0, p10, p11, n1, p20, p21, p22, p23, n2, p30, p31, p32, p33, p34, p35, n3 = (
++            _pivot_scalars(
++                u0, u1.to(tl.float32), u2.to(tl.float32), u3.to(tl.float32), m
++            )
++        )
++        energy = tl.full((DSTATE,), 0.0, tl.float32)
++        cross = tl.full((DSTATE,), 0.0, tl.float32)
++        z1 = tl.full((DSTATE,), 0.0, tl.float32)
++        z2 = tl.full((DSTATE,), 0.0, tl.float32)
++        z3 = tl.full((DSTATE,), 0.0, tl.float32)
++        for c in tl.static_range(0, DIM, BLOCK_V):
++            vc = c + tl.arange(0, BLOCK_V)
++            vmask = vc < DIM
++            chunk = state_ptr + vc * stride_state_dim
++            s = tl.load(
++                chunk[:, None] + j[None, :] * stride_state_dstate,
++                mask=vmask[:, None],
++                other=0.0,
++            ).to(tl.float32)
++            tl.store(
++                u_rows + vc[:, None],
++                s.to(u_ptr.dtype.element_ty),
++                mask=vmask[:, None] & (j[None, :] < m),
++            )
++            c0 = tl.load(chunk, mask=vmask, other=0.0).to(tl.float32)
++            energy += tl.sum(s * s, axis=0)
++            cross += tl.sum(c0[:, None] * s, axis=0)
++            if m > 1:
++                c1 = tl.load(chunk + stride_state_dstate, mask=vmask, other=0.0)
++                c2 = tl.load(chunk + 2 * stride_state_dstate, mask=vmask, other=0.0)
++                c3 = tl.load(chunk + 3 * stride_state_dstate, mask=vmask, other=0.0)
++                v1, v2, v3 = _pivot_directions(
++                    c0,
++                    c1.to(tl.float32),
++                    c2.to(tl.float32),
++                    c3.to(tl.float32),
++                    n0,
++                    p10,
++                    p11,
++                    n1,
++                    p20,
++                    p21,
++                    p22,
++                    p23,
++                    n2,
++                    p30,
++                    p31,
++                    p32,
++                    p33,
++                    p34,
++                    p35,
++                    n3,
++                )
++                z1 += tl.sum(v1[:, None] * s, axis=0)
++                if m > 2:
++                    z2 += tl.sum(v2[:, None] * s, axis=0)
++                if m > 3:
++                    z3 += tl.sum(v3[:, None] * s, axis=0)
++        # Normalize by the mean row energy; z0..z3 are the rows of Z.
++        mean = tl.sum(energy) / DSTATE
++        safe_mean = tl.where(mean > 0.0, mean, 1.0)
++        pivot_energy = tl.sum(tl.where(j == 0, energy, 0.0))
++        e = energy / safe_mean
++        z0 = (
++            cross
++            / tl.sqrt(tl.where(pivot_energy > 0.0, pivot_energy, 1.0))
++            / tl.sqrt(safe_mean)
++        )
++        z0 = tl.where(pivot_energy > 0.0, z0, 0.0)
++        z1 = z1 / tl.sqrt(safe_mean)
++        z2 = z2 / tl.sqrt(safe_mean)
++        z3 = z3 / tl.sqrt(safe_mean)
++        residual = tl.maximum(e - z0 * z0 - z1 * z1 - z2 * z2 - z3 * z3, 0.0)
++        residual = tl.where(j < tl.minimum(m, _PIVOTS), 0.0, residual)
++        denominator = residual + _RIDGE
++        a = residual / denominator
++        # g = (I + Z_m D^-1 Z_m^T)^-1 Z_m D^-1 by a Cholesky solve, rows g0..g3.
++        b0 = tl.where(j < m, z0 / denominator, 0.0)
++        g0 = b0 / (1.0 + tl.sum(z0 * b0))
++        g1 = tl.full((DSTATE,), 0.0, tl.float32)
++        g2 = tl.full((DSTATE,), 0.0, tl.float32)
++        g3 = tl.full((DSTATE,), 0.0, tl.float32)
++        if m > 1:
++            b1 = tl.where(j < m, z1 / denominator, 0.0)
++            l0_0 = tl.sqrt(1.0 + tl.sum(z0 * b0))
++            l1_0 = tl.sum(z1 * b0) / l0_0
++            l1_1 = tl.sqrt(1.0 + tl.sum(z1 * b1) - l1_0 * l1_0)
++            y0 = b0 / l0_0
++            y1 = (b1 - l1_0 * y0) / l1_1
++            g1 = y1 / l1_1
++            g0 = (y0 - l1_0 * g1) / l0_0
++            if m > 2:
++                b2 = tl.where(j < m, z2 / denominator, 0.0)
++                l2_0 = tl.sum(z2 * b0) / l0_0
++                l2_1 = (tl.sum(z2 * b1) - l2_0 * l1_0) / l1_1
++                l2_2 = tl.sqrt(1.0 + tl.sum(z2 * b2) - l2_0 * l2_0 - l2_1 * l2_1)
++                y2 = (b2 - l2_0 * y0 - l2_1 * y1) / l2_2
++                g2 = y2 / l2_2
++                g1 = (y1 - l2_1 * g2) / l1_1
++                g0 = (y0 - l1_0 * g1 - l2_0 * g2) / l0_0
++                if m > 3:
++                    b3 = tl.where(j < m, z3 / denominator, 0.0)
++                    l3_0 = tl.sum(z3 * b0) / l0_0
++                    l3_1 = (tl.sum(z3 * b1) - l3_0 * l1_0) / l1_1
++                    l3_2 = (tl.sum(z3 * b2) - l3_0 * l2_0 - l3_1 * l2_1) / l2_2
++                    l3_3 = tl.sqrt(
++                        1.0 + tl.sum(z3 * b3) - l3_0 * l3_0 - l3_1 * l3_1 - l3_2 * l3_2
++                    )
++                    y3 = (b3 - l3_0 * y0 - l3_1 * y1 - l3_2 * y2) / l3_3
++                    g3 = y3 / l3_3
++                    g2 = (y2 - l3_2 * g3) / l2_2
++                    g1 = (y1 - l2_1 * g2 - l3_1 * g3) / l1_1
++                    g0 = (y0 - l1_0 * g1 - l2_0 * g2 - l3_0 * g3) / l0_0
++        # w_p = Z_p scaled by λ / (r + λ) on the kept rows.
++        factor = tl.where(j < m, _RIDGE / denominator, 1.0)
++        w_rows = w_ptr + (
++            (sketch_index.to(tl.int64) * W_ROWS + tl.load(w_offsets_ptr + head))
++            * DSTATE
++            + j
++        )
++        ag_cols = (
++            ag_ptr
++            + sketch_index.to(tl.int64) * ((_PIVOTS + 1) * AG_COLS)
++            + tl.load(ag_offsets_ptr + head)
++            + j
++        )
++        if m <= _PIVOTS:
++            # a = 0: fold g into the w rows, c = W q.
++            for n in range(m):
++                f0 = tl.sum(tl.where(j == n, g0, 0.0))
++                f1 = tl.sum(tl.where(j == n, g1, 0.0))
++                f2 = tl.sum(tl.where(j == n, g2, 0.0))
++                f3 = tl.sum(tl.where(j == n, g3, 0.0))
++                merged = (f0 * z0 + f1 * z1 + f2 * z2 + f3 * z3) * factor
++                tl.store(w_rows + n * DSTATE, merged.to(w_ptr.dtype.element_ty))
++        else:
++            tl.store(w_rows, (z0 * factor).to(w_ptr.dtype.element_ty))
++            tl.store(ag_cols, a, mask=j < m)
++            tl.store(ag_cols + AG_COLS, g0, mask=j < m)
++            if m > 1:
++                tl.store(w_rows + DSTATE, (z1 * factor).to(w_ptr.dtype.element_ty))
++                tl.store(ag_cols + 2 * AG_COLS, g1, mask=j < m)
++            if m > 2:
++                tl.store(w_rows + 2 * DSTATE, (z2 * factor).to(w_ptr.dtype.element_ty))
++                tl.store(ag_cols + 3 * AG_COLS, g2, mask=j < m)
++            if m > 3:
++                tl.store(w_rows + 3 * DSTATE, (z3 * factor).to(w_ptr.dtype.element_ty))
++                tl.store(ag_cols + 4 * AG_COLS, g3, mask=j < m)
++
++
++# The prefill row pointers are slices at any offset: no alignment
++# specialization, so one compile (the warmup's) serves every batch.
++@triton.jit(
++    do_not_specialize=[
++        "state_indices_ptr",
++        "sketch_indices_ptr",
++        "flags_ptr",
++        "U_ROWS",
++        "W_ROWS",
++        "AG_COLS",
++    ]
++)
++def _sketch_build_kernel(
++    state_ptr,
++    u_ptr,
++    w_ptr,
++    ag_ptr,
++    ranks_ptr,
++    u_offsets_ptr,
++    w_offsets_ptr,
++    ag_offsets_ptr,
++    state_indices_ptr,
++    sketch_indices_ptr,
++    flags_ptr,
++    null_block_id,
++    stride_state_slot,
++    stride_state_head,
++    stride_state_dim,
++    stride_state_dstate,
++    DIM: tl.constexpr,
++    DSTATE: tl.constexpr,
++    U_ROWS,
++    W_ROWS,
++    AG_COLS,
++    BLOCK_V: tl.constexpr,
++):
++    row = tl.program_id(0)
++    head = tl.program_id(1)
++    if tl.load(flags_ptr + row) != 0:
++        slot = tl.load(state_indices_ptr + row).to(tl.int64)
++        if slot != null_block_id:
++            _sketch_head(
++                state_ptr + slot * stride_state_slot + head * stride_state_head,
++                tl.load(sketch_indices_ptr + row),
++                head,
++                u_ptr,
++                w_ptr,
++                ag_ptr,
++                ranks_ptr,
++                u_offsets_ptr,
++                w_offsets_ptr,
++                ag_offsets_ptr,
++                stride_state_dim,
++                stride_state_dstate,
++                DIM,
++                DSTATE,
++                U_ROWS,
++                W_ROWS,
++                AG_COLS,
++                BLOCK_V,
++            )
++
++
++def sketch_build(
++    state: torch.Tensor,
++    state_indices: torch.Tensor,
++    sketch_indices: torch.Tensor,
++    flags: torch.Tensor,
++    sketch: SketchArgs,
++    null_block_id: int = NULL_BLOCK_ID,
++) -> None:
++    """Build the sketches of the flagged rows from their states.
++
++    Args:
++        state: ``(slots, heads, dim, dstate)`` view of the key-major state.
++        state_indices: ``(batch,)`` state slot of each row.
++        sketch_indices: ``(batch,)`` sketch buffer row of each row.
++        flags: ``(batch,)`` nonzero for the rows to build.
++        sketch: The layer's sketch.
++        null_block_id: State slot of padding rows, which are skipped.
++
++    """
++    batch = state_indices.shape[0]
++    if batch == 0:
++        return
++    t = sketch.tables
++    _, heads, head_dim, state_size = state.shape
++    assert t.ranks.shape == (heads,)
++    assert sketch_indices.shape == flags.shape == (batch,)
++    assert state_indices.stride(0) == 1
++    block_v, num_warps = get_sketchssm_config("mamba2_build")
++    _sketch_build_kernel[(batch, heads)](
++        state,
++        sketch.u,
++        sketch.w,
++        sketch.ag,
++        t.ranks,
++        t.u_offsets,
++        t.w_offsets,
++        t.ag_offsets,
++        state_indices,
++        sketch_indices,
++        flags,
++        null_block_id,
++        *state.stride(),
++        DIM=head_dim,
++        DSTATE=state_size,
++        U_ROWS=sketch.u.shape[1],
++        W_ROWS=sketch.w.shape[1],
++        AG_COLS=sketch.ag.shape[2],
++        BLOCK_V=block_v,
++        num_warps=num_warps,
++    )
+diff --git a/vllm/model_executor/layers/mamba/ops/sketchssm_mamba2_decode.py b/vllm/model_executor/layers/mamba/ops/sketchssm_mamba2_decode.py
+new file mode 100644
+index 000000000000..9a4ea326df2c
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/ops/sketchssm_mamba2_decode.py
+@@ -0,0 +1,824 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""SketchSSM Mamba-2 decode kernels.
++
++A decode step splits the rows by ReplaySSM's flush flag. Non-flush rows
++(``sketch_decode``) read their sketch plus the window ring:
++
++    y = decay · U^T c(R C) + Σ_t s_t (B_t · C) x_t + D x.
++
++Flush rows (``sketch_flush``) fold the window into the rotated state as
++ReplaySSM does, with the FP32 rotated keys ``R B_t``, read it, and rebuild
++their sketches. The two touch disjoint rows, slots and sketches, so they may
++run concurrently. B and C arrive unrotated; the ring keeps the BF16 B and
++``bc_pre`` holds the rotation-invariant ``B_t · C``.
++"""
++
++import torch
++
++from vllm.model_executor.layers.mamba.ops.mamba_ssm import softplus
++from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_output_only import (  # noqa: E501
++    _replayssm_output_only_precompute_kernel,
++)
++from vllm.model_executor.layers.mamba.ops.sketchssm_config import get_sketchssm_config
++from vllm.model_executor.layers.mamba.ops.sketchssm_mamba2_build import (
++    SKETCH_DOT_PRECISION,
++    SKETCH_PIVOTS,
++    SketchArgs,
++    _sketch_head,
++)
++from vllm.triton_utils import tl, triton
++from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
++
++_PIVOTS = tl.constexpr(SKETCH_PIVOTS)
++_DOT_PRECISION = tl.constexpr(SKETCH_DOT_PRECISION)
++
++
++@triton.jit
++def _window(
++    dt_cache_ptr,
++    x_cache_ptr,
++    dt_cur,
++    x_cur,
++    A,
++    wp,
++    offs_m,
++    dim,
++    stride_dt_cache_pos,
++    stride_x_cache_pos,
++    stride_x_cache_dim,
++    BLOCK_K: tl.constexpr,
++):
++    # Window weights s_t = dt_t exp(A (sum dt - cumsum dt)_t) and values x_t.
++    offs_k = tl.arange(0, BLOCK_K)
++    dt_all = tl.load(
++        dt_cache_ptr + offs_k * stride_dt_cache_pos, mask=offs_k < wp, other=0.0
++    ).to(tl.float32)
++    dt_all = tl.where(offs_k == wp, dt_cur, dt_all)
++    total = A * tl.sum(dt_all, axis=0)
++    scale = dt_all * tl.exp(total - A * tl.cumsum(dt_all, axis=0))
++    scale = tl.where(offs_k <= wp, scale, 0.0)
++    x_all = tl.load(
++        x_cache_ptr
++        + offs_m[:, None] * stride_x_cache_dim
++        + offs_k[None, :] * stride_x_cache_pos,
++        mask=(offs_m[:, None] < dim) & (offs_k[None, :] < wp),
++        other=0.0,
++    )
++    x_all = tl.where(offs_k[None, :] == wp, x_cur[:, None], x_all).to(tl.float32)
++    return tl.exp(total), scale, x_all
++
++
++@triton.jit(do_not_specialize=["U_ROWS", "W_ROWS", "AG_COLS"])
++def _sketch_decode_kernel(
++    x_ptr,
++    dt_ptr,
++    dt_bias_ptr,
++    A_ptr,
++    B_ptr,
++    query_ptr,
++    D_ptr,
++    out_ptr,
++    x_cache_ptr,
++    dt_cache_ptr,
++    B_cache_ptr,
++    bc_pre_ptr,
++    write_pos_ptr,
++    is_flush_ptr,
++    state_indices_ptr,
++    sketch_indices_ptr,
++    u_ptr,
++    w_ptr,
++    ag_ptr,
++    ranks_ptr,
++    u_offsets_ptr,
++    w_offsets_ptr,
++    ag_offsets_ptr,
++    null_block_id,
++    dim,
++    dstate,
++    heads_per_group,
++    stride_x_batch,
++    stride_x_head,
++    stride_x_dim,
++    stride_dt_batch,
++    stride_dt_head,
++    stride_dt_bias_head,
++    stride_A_head,
++    stride_B_batch,
++    stride_B_group,
++    stride_B_dstate,
++    stride_query_batch,
++    stride_query_group,
++    stride_query_dstate,
++    stride_D_head,
++    stride_out_batch,
++    stride_out_head,
++    stride_out_dim,
++    stride_x_cache_slot,
++    stride_x_cache_head,
++    stride_x_cache_pos,
++    stride_x_cache_dim,
++    stride_dt_cache_slot,
++    stride_dt_cache_head,
++    stride_dt_cache_pos,
++    stride_B_cache_slot,
++    stride_B_cache_group,
++    stride_B_cache_pos,
++    stride_B_cache_dstate,
++    stride_bc_pre_batch,
++    stride_bc_pre_group,
++    stride_bc_pre_pos,
++    U_ROWS,
++    W_ROWS,
++    AG_COLS,
++    HAS_D: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    BLOCK_J: tl.constexpr,
++):
++    pid_m = tl.program_id(0)
++    pid_b = tl.program_id(1)
++    pid_h = tl.program_id(2)
++    slot = tl.load(state_indices_ptr + pid_b).to(tl.int64)
++    if slot == null_block_id:
++        return
++    if tl.load(is_flush_ptr + pid_b) != 0:
++        return
++    group = pid_h // heads_per_group
++    wp = tl.load(write_pos_ptr + pid_b).to(tl.int32)
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_n = tl.arange(0, BLOCK_N)
++    mmask = offs_m < dim
++    nmask = offs_n < dstate
++
++    x_ptr += pid_b * stride_x_batch + pid_h * stride_x_head
++    B_ptr += pid_b * stride_B_batch + group * stride_B_group
++    query_ptr += pid_b * stride_query_batch + group * stride_query_group
++    x_cache_ptr += slot * stride_x_cache_slot + pid_h * stride_x_cache_head
++    dt_cache_ptr += slot * stride_dt_cache_slot + pid_h * stride_dt_cache_head
++    B_cache_ptr += slot * stride_B_cache_slot + group * stride_B_cache_group
++
++    dt_cur = tl.load(dt_ptr + pid_b * stride_dt_batch + pid_h * stride_dt_head)
++    dt_cur = dt_cur.to(tl.float32)
++    dt_cur += tl.load(dt_bias_ptr + pid_h * stride_dt_bias_head).to(tl.float32)
++    dt_cur = tl.where(dt_cur <= 20.0, softplus(dt_cur), dt_cur)
++    A = tl.load(A_ptr + pid_h * stride_A_head).to(tl.float32)
++    x_cur = tl.load(x_ptr + offs_m * stride_x_dim, mask=mmask, other=0.0)
++    query = tl.load(query_ptr + offs_n * stride_query_dstate, mask=nmask, other=0.0)
++    decay, scale, x_all = _window(
++        dt_cache_ptr,
++        x_cache_ptr,
++        dt_cur,
++        x_cur,
++        A,
++        wp,
++        offs_m,
++        dim,
++        stride_dt_cache_pos,
++        stride_x_cache_pos,
++        stride_x_cache_dim,
++        BLOCK_K,
++    )
++
++    offs_k = tl.arange(0, BLOCK_K)
++    bc = tl.load(
++        bc_pre_ptr
++        + pid_b * stride_bc_pre_batch
++        + group * stride_bc_pre_group
++        + offs_k * stride_bc_pre_pos,
++        mask=offs_k <= wp,
++        other=0.0,
++    )
++    y = tl.sum(x_all * (scale * bc)[None, :], axis=1)
++
++    # Sketch read U^T c with c_j = a_j q_j + Σ_p g_pj (w_p · q); dense: c = q.
++    sketch_index = tl.load(sketch_indices_ptr + pid_b).to(tl.int64)
++    m = tl.load(ranks_ptr + pid_h)
++    u_rows = tl.where(m == 0, dstate, m)
++    u_base = u_ptr + (sketch_index * U_ROWS + tl.load(u_offsets_ptr + pid_h)) * dim
++    w_base = w_ptr + (sketch_index * W_ROWS + tl.load(w_offsets_ptr + pid_h)) * dstate
++    ag_base = ag_ptr + sketch_index * (_PIVOTS + 1) * AG_COLS
++    ag_base += tl.load(ag_offsets_ptr + pid_h)
++    offs_p = tl.arange(0, _PIVOTS)
++    w_rows = tl.load(
++        w_base + offs_p[:, None] * dstate + offs_n[None, :],
++        mask=(offs_p[:, None] < tl.minimum(m, _PIVOTS)) & nmask[None, :],
++        other=0.0,
++    )
++    dots = tl.sum(w_rows.to(tl.float32) * query[None, :], axis=1)
++    read = tl.zeros([BLOCK_M], dtype=tl.float32)
++    for j0 in range(0, u_rows, BLOCK_J):
++        offs_j = j0 + tl.arange(0, BLOCK_J)
++        jmask = offs_j < u_rows
++        q_j = tl.load(query_ptr + offs_j * stride_query_dstate, mask=jmask, other=0.0)
++        if m == 0:
++            coef = q_j
++        elif m <= _PIVOTS:
++            coef = tl.sum(
++                tl.where(offs_p[None, :] == offs_j[:, None], dots[None, :], 0.0),
++                axis=1,
++            )
++        else:
++            a_j = tl.load(ag_base + offs_j, mask=jmask, other=0.0)
++            g_j = tl.load(
++                ag_base + (1 + offs_p[None, :]) * AG_COLS + offs_j[:, None],
++                mask=jmask[:, None],
++                other=0.0,
++            )
++            coef = a_j * q_j + tl.sum(g_j * dots[None, :], axis=1)
++        u_tile = tl.load(
++            u_base + offs_j[:, None] * dim + offs_m[None, :],
++            mask=jmask[:, None] & mmask[None, :],
++            other=0.0,
++        )
++        read += tl.sum(u_tile.to(tl.float32) * coef[:, None], axis=0)
++    y += decay * read
++
++    if HAS_D:
++        D = tl.load(D_ptr + pid_h * stride_D_head).to(tl.float32)
++        y += x_cur.to(tl.float32) * D
++    out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
++    tl.store(out_ptr + offs_m * stride_out_dim, y, mask=mmask)
++    # Append the current token to the ring.
++    tl.store(
++        x_cache_ptr + wp * stride_x_cache_pos + offs_m * stride_x_cache_dim,
++        x_cur,
++        mask=mmask,
++    )
++    if pid_m == 0:
++        tl.store(dt_cache_ptr + wp * stride_dt_cache_pos, dt_cur)
++        if pid_h % heads_per_group == 0:
++            B_cur = tl.load(B_ptr + offs_n * stride_B_dstate, mask=nmask)
++            tl.store(
++                B_cache_ptr + wp * stride_B_cache_pos + offs_n * stride_B_cache_dstate,
++                B_cur,
++                mask=nmask,
++            )
++
++
++@triton.jit(do_not_specialize=["batch"])
++def _window_keys_kernel(
++    B_ptr,
++    B_cache_ptr,
++    frames_t_ptr,
++    keys_ptr,
++    write_pos_ptr,
++    flush_rows_ptr,
++    state_indices_ptr,
++    null_block_id,
++    batch,
++    stride_B_batch,
++    stride_B_group,
++    stride_B_cache_slot,
++    stride_B_cache_group,
++    stride_B_cache_pos,
++    stride_keys_batch,
++    stride_keys_group,
++    stride_keys_pos,
++    W: tl.constexpr,
++    N: tl.constexpr,
++    BLOCK_T: tl.constexpr,
++    BLOCK_C: tl.constexpr,
++):
++    # keys[row, g, t, cols] = B_t @ R_g^T[:, cols] for t <= write_pos (ring
++    # rows, then the current B) of each flush row.
++    pid_g = tl.program_id(1)
++    offs_n = tl.arange(0, N)
++    offs_c = tl.program_id(2) * BLOCK_C + tl.arange(0, BLOCK_C)
++    r = tl.load(frames_t_ptr + pid_g * N * N + offs_n[:, None] * N + offs_c[None, :])
++    it = tl.program_id(0)
++    row = tl.load(flush_rows_ptr + it, mask=it < batch, other=-1)
++    while row >= 0:
++        slot = tl.load(state_indices_ptr + row).to(tl.int64)
++        if slot != null_block_id:
++            wp = tl.load(write_pos_ptr + row).to(tl.int32)
++            ring = B_cache_ptr + slot * stride_B_cache_slot
++            ring += pid_g * stride_B_cache_group
++            keys = keys_ptr + row.to(tl.int64) * stride_keys_batch
++            keys += pid_g * stride_keys_group
++            B_row = B_ptr + row.to(tl.int64) * stride_B_batch
++            B_cur = tl.load(B_row + pid_g * stride_B_group + offs_n)
++            for t0 in tl.static_range(0, W, BLOCK_T):
++                if t0 <= wp:
++                    offs_t = t0 + tl.arange(0, BLOCK_T)
++                    B_all = tl.load(
++                        ring + offs_t[:, None] * stride_B_cache_pos + offs_n[None, :],
++                        mask=offs_t[:, None] < wp,
++                        other=0.0,
++                    )
++                    B_all = tl.where(offs_t[:, None] == wp, B_cur[None, :], B_all)
++                    y = tl.dot(B_all.to(tl.float32), r, input_precision=_DOT_PRECISION)
++                    tl.store(
++                        keys + offs_t[:, None] * stride_keys_pos + offs_c[None, :],
++                        y,
++                        mask=offs_t[:, None] <= wp,
++                    )
++        it += tl.num_programs(0)
++        row = tl.load(flush_rows_ptr + it, mask=it < batch, other=-1)
++
++
++@triton.jit(do_not_specialize=["batch", "U_ROWS", "W_ROWS", "AG_COLS"])
++def _sketch_flush_kernel(
++    state_ptr,
++    x_ptr,
++    dt_ptr,
++    dt_bias_ptr,
++    A_ptr,
++    B_ptr,
++    query_ptr,
++    D_ptr,
++    out_ptr,
++    x_cache_ptr,
++    dt_cache_ptr,
++    B_cache_ptr,
++    keys_ptr,
++    write_pos_ptr,
++    flush_rows_ptr,
++    state_indices_ptr,
++    sketch_indices_ptr,
++    u_ptr,
++    w_ptr,
++    ag_ptr,
++    ranks_ptr,
++    u_offsets_ptr,
++    w_offsets_ptr,
++    ag_offsets_ptr,
++    null_block_id,
++    batch,
++    heads_per_group,
++    stride_keys_batch,
++    stride_keys_group,
++    stride_keys_pos,
++    stride_state_slot,
++    stride_state_head,
++    stride_state_dim,
++    stride_state_dstate,
++    stride_x_batch,
++    stride_x_head,
++    stride_x_dim,
++    stride_dt_batch,
++    stride_dt_head,
++    stride_dt_bias_head,
++    stride_A_head,
++    stride_B_batch,
++    stride_B_group,
++    stride_B_dstate,
++    stride_query_batch,
++    stride_query_group,
++    stride_query_dstate,
++    stride_D_head,
++    stride_out_batch,
++    stride_out_head,
++    stride_out_dim,
++    stride_x_cache_slot,
++    stride_x_cache_head,
++    stride_x_cache_pos,
++    stride_x_cache_dim,
++    stride_dt_cache_slot,
++    stride_dt_cache_head,
++    stride_dt_cache_pos,
++    stride_B_cache_slot,
++    stride_B_cache_group,
++    stride_B_cache_pos,
++    stride_B_cache_dstate,
++    DIM: tl.constexpr,
++    DSTATE: tl.constexpr,
++    U_ROWS,
++    W_ROWS,
++    AG_COLS,
++    HAS_D: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    BLOCK_V: tl.constexpr,
++):
++    # For each -1 padded flush row, one program per head folds the window into
++    # the state, S = decay S_0 + Σ_t s_t x_t (R B_t)^T with R B_t from
++    # keys_ptr, reads y = S (R C) + D x, and rebuilds the head's sketch from
++    # the new state while it is still in L2.
++    pid_h = tl.program_id(1)
++    group = pid_h // heads_per_group
++    offs_n = tl.arange(0, DSTATE)
++    offs_k = tl.arange(0, BLOCK_K)
++    it = tl.program_id(0)
++    row = tl.load(flush_rows_ptr + it, mask=it < batch, other=-1)
++    while row >= 0:
++        slot = tl.load(state_indices_ptr + row).to(tl.int64)
++        if slot != null_block_id:
++            wp = tl.load(write_pos_ptr + row).to(tl.int32)
++            x_ring = x_cache_ptr + slot * stride_x_cache_slot
++            x_ring += pid_h * stride_x_cache_head
++            dt_ring = dt_cache_ptr + slot * stride_dt_cache_slot
++            dt_ring += pid_h * stride_dt_cache_head
++            dt_cur = tl.load(dt_ptr + row * stride_dt_batch + pid_h * stride_dt_head)
++            dt_cur = dt_cur.to(tl.float32)
++            dt_cur += tl.load(dt_bias_ptr + pid_h * stride_dt_bias_head).to(tl.float32)
++            dt_cur = tl.where(dt_cur <= 20.0, softplus(dt_cur), dt_cur)
++            A = tl.load(A_ptr + pid_h * stride_A_head).to(tl.float32)
++            query_row = query_ptr + row * stride_query_batch
++            query_row += group * stride_query_group
++            query = tl.load(query_row + offs_n * stride_query_dstate)
++            keys = tl.load(
++                keys_ptr
++                + row.to(tl.int64) * stride_keys_batch
++                + group * stride_keys_group
++                + offs_k[:, None] * stride_keys_pos
++                + offs_n[None, :],
++                mask=offs_k[:, None] <= wp,
++                other=0.0,
++            )
++            head_state = state_ptr + slot * stride_state_slot
++            head_state += pid_h * stride_state_head
++            x_row = x_ptr + row * stride_x_batch + pid_h * stride_x_head
++            out_row = out_ptr + row * stride_out_batch + pid_h * stride_out_head
++            for m0 in tl.static_range(0, DIM, BLOCK_M):
++                offs_m = m0 + tl.arange(0, BLOCK_M)
++                mmask = offs_m < DIM
++                x_cur = tl.load(x_row + offs_m * stride_x_dim, mask=mmask, other=0.0)
++                decay, scale, x_all = _window(
++                    dt_ring,
++                    x_ring,
++                    dt_cur,
++                    x_cur,
++                    A,
++                    wp,
++                    offs_m,
++                    DIM,
++                    stride_dt_cache_pos,
++                    stride_x_cache_pos,
++                    stride_x_cache_dim,
++                    BLOCK_K,
++                )
++                s_ptrs = (
++                    head_state
++                    + offs_m[:, None] * stride_state_dim
++                    + offs_n[None, :] * stride_state_dstate
++                )
++                # Bypass L1 so the sketch build below reads the new state.
++                s = tl.load(
++                    s_ptrs, mask=mmask[:, None], other=0.0, cache_modifier=".cg"
++                )
++                s = s * decay + tl.dot(
++                    x_all * scale[None, :], keys, input_precision=_DOT_PRECISION
++                )
++                tl.store(s_ptrs, s, mask=mmask[:, None])
++                y = tl.sum(s * query[None, :], axis=1)
++                if HAS_D:
++                    D = tl.load(D_ptr + pid_h * stride_D_head).to(tl.float32)
++                    y += x_cur.to(tl.float32) * D
++                tl.store(out_row + offs_m * stride_out_dim, y, mask=mmask)
++                # Append the current token to the ring.
++                tl.store(
++                    x_ring + wp * stride_x_cache_pos + offs_m * stride_x_cache_dim,
++                    x_cur,
++                    mask=mmask,
++                )
++            tl.store(dt_ring + wp * stride_dt_cache_pos, dt_cur)
++            if pid_h % heads_per_group == 0:
++                B_row = B_ptr + row * stride_B_batch + group * stride_B_group
++                B_ring = B_cache_ptr + slot * stride_B_cache_slot
++                B_ring += group * stride_B_cache_group
++                tl.store(
++                    B_ring + wp * stride_B_cache_pos + offs_n * stride_B_cache_dstate,
++                    tl.load(B_row + offs_n * stride_B_dstate),
++                )
++            tl.debug_barrier()
++            _sketch_head(
++                head_state,
++                tl.load(sketch_indices_ptr + row),
++                pid_h,
++                u_ptr,
++                w_ptr,
++                ag_ptr,
++                ranks_ptr,
++                u_offsets_ptr,
++                w_offsets_ptr,
++                ag_offsets_ptr,
++                stride_state_dim,
++                stride_state_dstate,
++                DIM,
++                DSTATE,
++                U_ROWS,
++                W_ROWS,
++                AG_COLS,
++                BLOCK_V,
++            )
++        it += tl.num_programs(0)
++        row = tl.load(flush_rows_ptr + it, mask=it < batch, other=-1)
++
++
++def _check_inputs(
++    state: torch.Tensor,
++    x: torch.Tensor,
++    dt: torch.Tensor,
++    A: torch.Tensor,
++    B: torch.Tensor,
++    query: torch.Tensor,
++    D: torch.Tensor | None,
++    dt_bias: torch.Tensor,
++    x_cache: torch.Tensor,
++    dt_cache: torch.Tensor,
++    B_cache: torch.Tensor,
++    write_pos: torch.Tensor,
++    state_indices: torch.Tensor,
++    out: torch.Tensor,
++) -> None:
++    _, heads, dim, dstate = state.shape
++    batch, groups = x.shape[0], B.shape[1]
++    window = x_cache.shape[2]
++    assert x.shape == out.shape == (batch, heads, dim)
++    assert heads % groups == 0
++    assert B.shape == (batch, groups, dstate) and B.stride(2) == 1
++    assert query.shape == B.shape and query.dtype == torch.float32
++    # dt, A, D and dt_bias are scalars per head broadcast over (dim, dstate).
++    assert dt.shape == x.shape and dt.stride(2) == 0
++    assert A.shape == (heads, dim, dstate) and A.stride(1) == A.stride(2) == 0
++    assert dt_bias.shape == (heads, dim) and dt_bias.stride(1) == 0
++    assert D is None or (D.shape == (heads, dim) and D.stride(1) == 0)
++    assert x_cache.shape[1:] == (heads, window, dim)
++    assert dt_cache.shape[1:] == (heads, window)
++    assert B_cache.shape[1:] == (groups, window, dstate) and B_cache.stride(3) == 1
++    assert write_pos.shape[0] >= batch and write_pos.dtype == torch.int32
++    assert state_indices.shape == (batch,) and state_indices.stride(0) == 1
++
++
++def _common_strides(x, dt, dt_bias, A, B, query, D, out, x_cache, dt_cache, B_cache):
++    return (
++        *x.stride(),
++        dt.stride(0),
++        dt.stride(1),
++        dt_bias.stride(0),
++        A.stride(0),
++        *B.stride(),
++        *query.stride(),
++        D.stride(0) if D is not None else 0,
++        *out.stride(),
++        *x_cache.stride(),
++        *dt_cache.stride(),
++        *B_cache.stride(),
++    )
++
++
++def sketch_bc_pre(
++    B: torch.Tensor,
++    C: torch.Tensor,
++    B_cache: torch.Tensor,
++    write_pos: torch.Tensor,
++    is_flush: torch.Tensor,
++    bc_pre: torch.Tensor,
++    state_indices: torch.Tensor,
++    null_block_id: int = NULL_BLOCK_ID,
++) -> None:
++    """``bc_pre[row, group, t] = B_t · C`` over each non-flush row's window."""
++    batch, groups, dstate = B.shape
++    window = B_cache.shape[2]
++    _replayssm_output_only_precompute_kernel[(batch, groups)](
++        B,
++        C,
++        B_cache,
++        write_pos,
++        is_flush,
++        bc_pre,
++        state_indices,
++        null_block_id,
++        batch,
++        groups,
++        dstate,
++        *B.stride(),
++        *C.stride(),
++        *B_cache.stride(),
++        *bc_pre.stride(),
++        state_indices.stride(0),
++        0,
++        window,
++        triton.next_power_of_2(window),
++        num_warps=2,
++    )
++
++
++def sketch_decode(
++    state: torch.Tensor,
++    x: torch.Tensor,
++    dt: torch.Tensor,
++    A: torch.Tensor,
++    B: torch.Tensor,
++    C: torch.Tensor,
++    query: torch.Tensor,
++    D: torch.Tensor | None,
++    dt_bias: torch.Tensor,
++    x_cache: torch.Tensor,
++    dt_cache: torch.Tensor,
++    B_cache: torch.Tensor,
++    bc_pre: torch.Tensor,
++    write_pos: torch.Tensor,
++    is_flush: torch.Tensor,
++    state_indices: torch.Tensor,
++    sketch_indices: torch.Tensor,
++    out: torch.Tensor,
++    sketch: SketchArgs,
++    null_block_id: int = NULL_BLOCK_ID,
++) -> None:
++    """Decode the non-flush rows from their sketches and the window ring.
++
++    Arguments follow ``selective_state_update_replayssm_output_only`` with
++    softplus on ``dt``; ``state`` is the ``(slots, heads, dim, dstate)`` view
++    of the key-major state, ``query`` is ``sketch_query(C)`` and
++    ``sketch_indices`` the sketch row of each batch row.
++    """
++    batch = x.shape[0]
++    if batch == 0:
++        return
++    _check_inputs(
++        state,
++        x,
++        dt,
++        A,
++        B,
++        query,
++        D,
++        dt_bias,
++        x_cache,
++        dt_cache,
++        B_cache,
++        write_pos,
++        state_indices,
++        out,
++    )
++    _, heads, dim, dstate = state.shape
++    groups, window = B.shape[1], x_cache.shape[2]
++    assert bc_pre.shape[0] >= batch and bc_pre.shape[1:] == (groups, window)
++    assert is_flush.shape[0] >= batch and sketch_indices.shape == (batch,)
++    sketch_bc_pre(
++        B, C, B_cache, write_pos, is_flush, bc_pre, state_indices, null_block_id
++    )
++    t = sketch.tables
++    block_m, block_j, num_warps = get_sketchssm_config("mamba2_decode")
++    block_m = min(block_m, triton.next_power_of_2(dim))
++    _sketch_decode_kernel[(triton.cdiv(dim, block_m), batch, heads)](
++        x,
++        dt,
++        dt_bias,
++        A,
++        B,
++        query,
++        D,
++        out,
++        x_cache,
++        dt_cache,
++        B_cache,
++        bc_pre,
++        write_pos,
++        is_flush,
++        state_indices,
++        sketch_indices,
++        sketch.u,
++        sketch.w,
++        sketch.ag,
++        t.ranks,
++        t.u_offsets,
++        t.w_offsets,
++        t.ag_offsets,
++        null_block_id,
++        dim,
++        dstate,
++        heads // groups,
++        *_common_strides(
++            x, dt, dt_bias, A, B, query, D, out, x_cache, dt_cache, B_cache
++        ),
++        *bc_pre.stride(),
++        U_ROWS=sketch.u.shape[1],
++        W_ROWS=sketch.w.shape[1],
++        AG_COLS=sketch.ag.shape[2],
++        HAS_D=D is not None,
++        BLOCK_M=block_m,
++        BLOCK_N=triton.next_power_of_2(dstate),
++        BLOCK_K=max(16, triton.next_power_of_2(window)),
++        BLOCK_J=block_j,
++        num_warps=num_warps,
++    )
++
++
++def sketch_flush(
++    state: torch.Tensor,
++    x: torch.Tensor,
++    dt: torch.Tensor,
++    A: torch.Tensor,
++    B: torch.Tensor,
++    query: torch.Tensor,
++    D: torch.Tensor | None,
++    dt_bias: torch.Tensor,
++    x_cache: torch.Tensor,
++    dt_cache: torch.Tensor,
++    B_cache: torch.Tensor,
++    write_pos: torch.Tensor,
++    flush_rows: torch.Tensor,
++    state_indices: torch.Tensor,
++    sketch_indices: torch.Tensor,
++    out: torch.Tensor,
++    sketch: SketchArgs,
++    null_block_id: int = NULL_BLOCK_ID,
++) -> None:
++    """Flush the window of the flush rows into their states, decode them and
++    rebuild their sketches.
++
++    Arguments are those of ``sketch_decode``; ``flush_rows`` lists the flush
++    rows followed by -1 padding.
++    """
++    batch = x.shape[0]
++    if batch == 0:
++        return
++    _check_inputs(
++        state,
++        x,
++        dt,
++        A,
++        B,
++        query,
++        D,
++        dt_bias,
++        x_cache,
++        dt_cache,
++        B_cache,
++        write_pos,
++        state_indices,
++        out,
++    )
++    assert flush_rows.shape == (batch,) and flush_rows.dtype == torch.int32
++    _, heads, dim, dstate = state.shape
++    groups, window = B.shape[1], x_cache.shape[2]
++    # Programs walk the -1 padded flush row list.
++    block_m, num_warps, rows_per_program, block_v = get_sketchssm_config("mamba2_flush")
++    programs = triton.cdiv(batch, rows_per_program)
++
++    # FP32 rotated window keys R B_t of the flush rows.
++    keys = torch.empty(
++        batch, groups, window, dstate, dtype=torch.float32, device=x.device
++    )
++    block_c = min(dstate, 64)
++    _window_keys_kernel[(programs, groups, dstate // block_c)](
++        B,
++        B_cache,
++        sketch.frames_t,
++        keys,
++        write_pos,
++        flush_rows,
++        state_indices,
++        null_block_id,
++        batch,
++        B.stride(0),
++        B.stride(1),
++        *B_cache.stride()[:3],
++        *keys.stride()[:3],
++        W=window,
++        N=dstate,
++        BLOCK_T=16,
++        BLOCK_C=block_c,
++        num_warps=4,
++    )
++
++    t = sketch.tables
++    _sketch_flush_kernel[(programs, heads)](
++        state,
++        x,
++        dt,
++        dt_bias,
++        A,
++        B,
++        query,
++        D,
++        out,
++        x_cache,
++        dt_cache,
++        B_cache,
++        keys,
++        write_pos,
++        flush_rows,
++        state_indices,
++        sketch_indices,
++        sketch.u,
++        sketch.w,
++        sketch.ag,
++        t.ranks,
++        t.u_offsets,
++        t.w_offsets,
++        t.ag_offsets,
++        null_block_id,
++        batch,
++        heads // groups,
++        *keys.stride()[:3],
++        *state.stride(),
++        *_common_strides(
++            x, dt, dt_bias, A, B, query, D, out, x_cache, dt_cache, B_cache
++        ),
++        DIM=dim,
++        DSTATE=dstate,
++        U_ROWS=sketch.u.shape[1],
++        W_ROWS=sketch.w.shape[1],
++        AG_COLS=sketch.ag.shape[2],
++        HAS_D=D is not None,
++        BLOCK_M=block_m,
++        BLOCK_K=max(16, triton.next_power_of_2(window)),
++        BLOCK_V=block_v,
++        num_warps=num_warps,
++    )
+diff --git a/vllm/model_executor/layers/mamba/sketchssm/__init__.py b/vllm/model_executor/layers/mamba/sketchssm/__init__.py
+new file mode 100644
+index 000000000000..e69de29bb2d1
+diff --git a/vllm/model_executor/layers/mamba/sketchssm/calibration.py b/vllm/model_executor/layers/mamba/sketchssm/calibration.py
+new file mode 100644
+index 000000000000..8abc5f165332
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/sketchssm/calibration.py
+@@ -0,0 +1,110 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Loading of SketchSSM calibrations (``--sketchssm``)."""
++
++from dataclasses import dataclass
++from functools import cache
++from pathlib import Path
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.model_executor.layers.mamba.sketchssm import rank_allocation
++
++logger = init_logger(__name__)
++
++SKETCHSSM_CALIBRATION_FILE = "calibration.pt"
++DEFAULT_SKETCHSSM_MEAN_RANK = 8.0
++
++
++@dataclass(frozen=True)
++class SketchSSMCalibration:
++    frames: torch.Tensor  # (num_layers, ngroups, K, K) float32
++    ranks: torch.Tensor  # (num_layers, nheads) int32
++    layer_ids: tuple[int, ...]  # model layer index of each calibration row
++
++    @property
++    def num_layers(self) -> int:
++        return self.ranks.shape[0]
++
++    def layer_index(self, model_layer_idx: int) -> int:
++        """Calibration row of a model layer."""
++        if model_layer_idx not in self.layer_ids:
++            raise ValueError(
++                f"SketchSSM calibration has no entry for layer {model_layer_idx}"
++            )
++        return self.layer_ids.index(model_layer_idx)
++
++
++def resolve_sketchssm_path(path_or_repo: str) -> str:
++    """Local path of ``--sketchssm``: a file, a directory or an HF repo id."""
++    path = Path(path_or_repo).expanduser()
++    if path.is_dir():
++        path = path / SKETCHSSM_CALIBRATION_FILE
++    if path.is_file():
++        return str(path)
++    if path_or_repo.endswith(".pt") or path_or_repo.startswith(("/", ".", "~")):
++        raise FileNotFoundError(f"SketchSSM calibration {str(path)!r} not found")
++    from vllm.transformers_utils.repo_utils import hf_api
++
++    try:
++        return hf_api().hf_hub_download(path_or_repo, SKETCHSSM_CALIBRATION_FILE)
++    except Exception as e:
++        raise ValueError(
++            f"--sketchssm {path_or_repo!r} is neither a local file nor a "
++            f"Hugging Face repo with {SKETCHSSM_CALIBRATION_FILE}: {e}"
++        ) from e
++
++
++@cache
++def load_sketchssm_calibration(
++    path_or_repo: str, mean_rank: float | None, window: int
++) -> SketchSSMCalibration:
++    """Load the ``--sketchssm`` calibration, shared by all layers (cached)."""
++    path = resolve_sketchssm_path(path_or_repo)
++    data = torch.load(path, map_location="cpu", weights_only=True)
++    if rank_allocation.is_portable_calibration(data):
++        if mean_rank is None:
++            mean_rank = DEFAULT_SKETCHSSM_MEAN_RANK
++        frames, ranks = rank_allocation.frames_for_mean_rank(data, mean_rank, window)
++        logger.info(
++            "SketchSSM calibration %s: mean rank %g at window %d, %d sketch and %d "
++            "dense heads",
++            path_or_repo,
++            mean_rank,
++            window,
++            int((ranks > 0).sum()),
++            int((ranks == 0).sum()),
++        )
++    else:
++        if mean_rank is not None:
++            raise ValueError(
++                f"SketchSSM calibration {path_or_repo!r} holds exported frames whose "
++                "ranks are already fixed; --sketchssm-mean-rank applies only to a "
++                "portable calibration file"
++            )
++        frames = data["frames"].to(torch.float32)
++        ranks = data["m_table"].to(torch.int32)
++        if frames.dim() != 4 or frames.shape[-1] != frames.shape[-2]:
++            raise ValueError("SketchSSM frames must be (layers, groups, K, K)")
++        if ranks.dim() != 2 or ranks.shape[0] != frames.shape[0]:
++            raise ValueError("SketchSSM m_table must be (layers, heads)")
++        if ranks.shape[1] % frames.shape[1] != 0:
++            raise ValueError("SketchSSM heads must divide evenly into groups")
++        if (ranks < 0).any() or (ranks > frames.shape[-1]).any():
++            raise ValueError("SketchSSM ranks must lie in [0, K]")
++        eye = torch.eye(frames.shape[-1], dtype=torch.float64)
++        frames64 = frames.double()
++        if (frames64 @ frames64.mT - eye).abs().amax() > 1e-4:
++            raise ValueError("SketchSSM frames are not orthogonal")
++    layer_ids = data.get("layer_ids")
++    if layer_ids is None or len(layer_ids) != ranks.shape[0]:
++        raise ValueError(
++            f"SketchSSM calibration {path_or_repo!r} must list the model layer of "
++            "each of its rows in layer_ids"
++        )
++    return SketchSSMCalibration(
++        frames=frames.contiguous(),
++        ranks=ranks.contiguous(),
++        layer_ids=tuple(int(i) for i in layer_ids),
++    )
+diff --git a/vllm/model_executor/layers/mamba/sketchssm/mamba2.py b/vllm/model_executor/layers/mamba/sketchssm/mamba2.py
+new file mode 100644
+index 000000000000..0f72cc2130e7
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/sketchssm/mamba2.py
+@@ -0,0 +1,268 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""SketchSSM of Mamba-2 layers (``MambaMixer2``)."""
++
++import math
++from typing import TYPE_CHECKING
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.model_executor.layers.mamba.ops.sketchssm_mamba2_build import (
++    SKETCH_DTYPES,
++    SketchArgs,
++    SketchTables,
++    sketch_build,
++    sketch_query,
++    sketch_rotate_states,
++    sketch_shapes,
++)
++from vllm.model_executor.layers.mamba.ops.sketchssm_mamba2_decode import (
++    sketch_decode,
++    sketch_flush,
++)
++from vllm.model_executor.layers.mamba.sketchssm.calibration import (
++    SketchSSMCalibration,
++    load_sketchssm_calibration,
++)
++from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
++from vllm.utils.torch_utils import aux_stream
++
++if TYPE_CHECKING:
++    from vllm.config import CacheConfig
++    from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
++
++logger = init_logger(__name__)
++
++
++RingStateShapes = tuple[
++    tuple[int, int],
++    tuple[int, int, int],
++    tuple[int, int, int],
++    tuple[int, int],
++    tuple[int, int, int],
++]
++
++
++def mamba2_sketchssm_state_shapes(shapes: RingStateShapes) -> RingStateShapes:
++    """Ring state shapes with a key-major temporal state for SketchSSM."""
++    conv, (heads, head_dim, state_size), x, dt, B = shapes
++    return conv, (heads, state_size, head_dim), x, dt, B
++
++
++class Mamba2SketchSSM(torch.nn.Module):
++    """SketchSSM frames, sketch and decode kernels of one Mamba-2 layer."""
++
++    def __init__(
++        self,
++        calibration: SketchSSMCalibration,
++        layer: int,
++        num_heads: int,
++        head_dim: int,
++        n_groups: int,
++        state_size: int,
++        max_num_reqs: int,
++        tp_size: int = 1,
++        tp_rank: int = 0,
++    ):
++        super().__init__()
++        # The kernels take state_size as a power-of-two block and use it and
++        # head_dim as tl.dot dimensions, which must be at least 16.
++        if state_size < 16 or state_size & (state_size - 1):
++            raise ValueError(
++                "SketchSSM requires a Mamba-2 state size that is a power of two "
++                f"and at least 16, got {state_size}"
++            )
++        if head_dim < 16:
++            raise ValueError(
++                f"SketchSSM requires a Mamba-2 head dim of at least 16, got {head_dim}"
++            )
++        frames = calibration.frames[layer]
++        ranks = calibration.ranks[layer]
++        if frames.shape != (n_groups, state_size, state_size):
++            raise ValueError(
++                f"SketchSSM frames {tuple(frames.shape)} do not match "
++                f"{n_groups} groups of state size {state_size}"
++            )
++        if ranks.shape != (num_heads,):
++            raise ValueError(
++                f"SketchSSM ranks cover {ranks.numel()} of {num_heads} heads"
++            )
++        frames, ranks = _tp_shard(frames, ranks, tp_size, tp_rank)
++        self.register_buffer(
++            "frames_t",
++            frames.transpose(-1, -2)
++            .contiguous()
++            .to(torch.get_default_device(), torch.float32),
++            persistent=False,
++        )
++        self.tables = SketchTables(ranks, state_size)
++        # One sketch per concurrent request, indexed by its persistent index.
++        shapes = sketch_shapes(ranks, head_dim, state_size)
++        for name, shape, dtype in zip(("u", "w", "ag"), shapes, SKETCH_DTYPES):
++            self.register_buffer(
++                name, torch.zeros(max_num_reqs, *shape, dtype=dtype), persistent=False
++            )
++        # Flush rows run on the aux stream, concurrently with the others.
++        self._flush_stream = aux_stream()
++        self._flush_events = (torch.cuda.Event(), torch.cuda.Event())
++
++    @property
++    def sketch(self) -> SketchArgs:
++        return SketchArgs(self.u, self.w, self.ag, self.tables, self.frames_t)
++
++    def rotate_states(
++        self, states: torch.Tensor, inverse: bool = False
++    ) -> torch.Tensor:
++        """Prefill states ``(items, heads, head_dim, state_size)`` FP32 into the
++        rotated frame of the cache (back to the model frame if ``inverse``)."""
++        return sketch_rotate_states(states, self.frames_t, inverse)
++
++    def decode(
++        self,
++        state: torch.Tensor,
++        x: torch.Tensor,
++        dt: torch.Tensor,
++        A: torch.Tensor,
++        B: torch.Tensor,
++        C: torch.Tensor,
++        D: torch.Tensor,
++        dt_bias: torch.Tensor,
++        x_cache: torch.Tensor,
++        dt_cache: torch.Tensor,
++        B_cache: torch.Tensor,
++        state_indices: torch.Tensor,
++        attn_metadata: "Mamba2AttentionMetadata",
++        out: torch.Tensor,
++    ) -> None:
++        """One decode step with unrotated B and C; arguments as for
++        ``selective_state_update_replayssm_output_only``."""
++        if state_indices.dim() == 2:
++            state_indices = state_indices[:, 0]
++        # The kernels index rows contiguously; a column slice is strided.
++        state_indices = state_indices.contiguous()
++        common = dict(
++            state=state,
++            x=x,
++            dt=dt,
++            A=A,
++            B=B,
++            query=sketch_query(C, self.frames_t),
++            D=D,
++            dt_bias=dt_bias,
++            x_cache=x_cache,
++            dt_cache=dt_cache,
++            B_cache=B_cache,
++            write_pos=attn_metadata.write_pos_d,
++            state_indices=state_indices,
++            sketch_indices=attn_metadata.sketch_indices_d,
++            out=out,
++            sketch=self.sketch,
++        )
++        maybe_execute_in_parallel(
++            lambda: sketch_decode(
++                C=C,
++                bc_pre=attn_metadata.bc_pre_scratch,
++                is_flush=attn_metadata.is_flush_d,
++                **common,
++            ),
++            lambda: sketch_flush(
++                flush_rows=attn_metadata.sketch_flush_rows_d, **common
++            ),
++            *self._flush_events,
++            self._flush_stream,
++        )
++
++    def prefilled(
++        self,
++        state: torch.Tensor,
++        state_indices: torch.Tensor,
++        attn_metadata: "Mamba2AttentionMetadata",
++    ) -> None:
++        """Build the sketch of each prefill row that completes its prompt."""
++        sketch_build(
++            state,
++            state_indices.contiguous(),
++            attn_metadata.sketch_indices_p,
++            attn_metadata.sketch_build_p,
++            self.sketch,
++        )
++
++    def warmup(self, state: torch.Tensor) -> None:
++        """Compile the sketch build, which first runs when a prompt completes.
++
++        ``state`` is the layer's SSM state cache; no row is built.
++        """
++        rows = torch.zeros(1, dtype=torch.int32, device=state.device)
++        sketch_build(
++            state.transpose(-1, -2), rows, rows, rows.to(torch.int8), self.sketch
++        )
++
++    @classmethod
++    def from_config(
++        cls,
++        cache_config: "CacheConfig",
++        model_layer_idx: int,
++        num_heads: int,
++        head_dim: int,
++        n_groups: int,
++        state_size: int,
++        max_num_reqs: int,
++        tp_size: int = 1,
++        tp_rank: int = 0,
++    ) -> "Mamba2SketchSSM":
++        """The SketchSSM of the model layer ``model_layer_idx``, holding the
++        heads and groups of tensor-parallel rank ``tp_rank``."""
++        assert cache_config.sketchssm is not None
++        calibration = load_sketchssm_calibration(
++            cache_config.sketchssm,
++            cache_config.sketchssm_mean_rank,
++            cache_config.replayssm_buffer_len,
++        )
++        # Per request over the whole calibration: independent of which layers
++        # this rank holds (pipeline parallelism splits them across ranks).
++        request_bytes = sum(
++            math.prod(shape) * dtype.itemsize
++            for ranks in calibration.ranks
++            for shape, dtype in zip(
++                sketch_shapes(ranks.chunk(tp_size)[tp_rank], head_dim, state_size),
++                SKETCH_DTYPES,
++            )
++        )
++        logger.info_once(
++            "SketchSSM sketch buffers: %.1f KiB per request over all %d "
++            "calibrated layers; each layer holds them for %d requests",
++            request_bytes / 2**10,
++            calibration.num_layers,
++            max_num_reqs,
++        )
++        return cls(
++            calibration,
++            calibration.layer_index(model_layer_idx),
++            num_heads,
++            head_dim,
++            n_groups,
++            state_size,
++            max_num_reqs,
++            tp_size,
++            tp_rank,
++        )
++
++
++def _tp_shard(
++    frames: torch.Tensor, ranks: torch.Tensor, tp_size: int, tp_rank: int
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """The frames and head ranks of tensor-parallel rank ``tp_rank``.
++
++    Heads are split evenly; groups are split when ``tp_size`` divides them,
++    else (a single group) every rank holds it, as in ``MambaMixer2``.
++    """
++    num_heads, n_groups = ranks.numel(), frames.shape[0]
++    if num_heads % tp_size or (n_groups % tp_size and n_groups != 1):
++        raise ValueError(
++            f"SketchSSM cannot split {num_heads} heads in {n_groups} groups over "
++            f"{tp_size} tensor-parallel ranks"
++        )
++    if n_groups % tp_size == 0:
++        frames = frames.chunk(tp_size)[tp_rank]
++    return frames, ranks.chunk(tp_size)[tp_rank]
+diff --git a/vllm/model_executor/layers/mamba/sketchssm/rank_allocation.py b/vllm/model_executor/layers/mamba/sketchssm/rank_allocation.py
+new file mode 100644
+index 000000000000..2877a41b03b3
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/sketchssm/rank_allocation.py
+@@ -0,0 +1,189 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-head rank allocation and frames of a portable SketchSSM calibration."""
++
++from typing import Any
++
++import numpy as np
++import torch
++
++from vllm.utils.torch_utils import set_default_torch_num_threads
++
++FORMAT = "sketchssm-calibration"
++SCHEMA_VERSION = 1
++# LAPACK QR results depend on the CPU thread count.
++EXPORT_THREADS = 2
++# Bisection steps on the Lagrange multiplier of the rank budget.
++LAGRANGIAN_STEPS = 160
++
++
++def is_portable_calibration(data: dict[str, Any]) -> bool:
++    return data.get("format") == FORMAT
++
++
++def validate(c: dict[str, Any]) -> None:
++    if c.get("format") != FORMAT:
++        raise ValueError(f"Not a {FORMAT} file")
++    if c.get("schema_version") != SCHEMA_VERSION:
++        raise ValueError(f"Unsupported calibration schema: {c.get('schema_version')}")
++    g, omega = c["geometry"], c["omega"]
++    if (
++        omega.ndim != 4
++        or omega.shape[1] != g["groups"]
++        or omega.shape[-1] != g["key_dim"]
++    ):
++        raise ValueError("Basis shape differs from the declared geometry")
++    error = c["curves"]["joint_dot_sq_sum"]
++    if (
++        error.ndim != 3
++        or error.shape[0] != omega.shape[0]
++        or error.shape[1] % g["groups"]
++    ):
++        raise ValueError("Score curve shape differs from the basis")
++
++
++def _solve(objective: np.ndarray, cost: np.ndarray, budget: float) -> np.ndarray:
++    """Pick one option per head (the last is dense) under a cost budget.
++
++    A multiple-choice knapsack: Lagrangian relaxation with bisection on the
++    multiplier, then a greedy fill of the remaining budget.
++    """
++    heads, nchoice = objective.shape
++    rows = np.arange(heads)
++    scaled = objective / max(float(np.mean(np.abs(objective))), 1e-30)
++
++    def lagrangian(lam):
++        penalized = scaled + lam * cost[None, :]
++        chosen = penalized.argmin(axis=1)
++        dual = float(penalized[rows, chosen].sum() - lam * budget)
++        return (
++            dual,
++            float(cost[chosen].sum()),
++            float(scaled[rows, chosen].sum()),
++            chosen,
++        )
++
++    uniform = int(min(nchoice - 1, max(1, np.floor(budget / (heads * cost[0])))))
++    best_choice = np.full(heads, uniform - 1, dtype=np.int64)
++    best = float(scaled[rows, best_choice].sum())
++
++    lo, hi = 0.0, 1.0
++    while lagrangian(hi)[1] > budget:
++        hi *= 2.0
++    best_dual, best_lam = -np.inf, hi
++
++    def visit(lam):
++        nonlocal best_dual, best_lam, best_choice, best
++        dual, used, primal, chosen = lagrangian(lam)
++        if dual > best_dual:
++            best_dual, best_lam = dual, lam
++        if used <= budget and primal < best:
++            best_choice, best = chosen.copy(), primal
++        return used
++
++    for _ in range(LAGRANGIAN_STEPS):
++        lam = (lo + hi) / 2.0
++        if visit(lam) > budget:
++            lo = lam
++        else:
++            hi = lam
++    for lam in (lo, hi, best_lam):
++        visit(lam)
++
++    # Greedily spend the remaining budget on the best single-head upgrade.
++    choice = best_choice.copy()
++    used = float(cost[choice].sum())
++    while True:
++        delta = cost[None, :] - cost[choice][:, None]
++        gain = scaled[rows, choice][:, None] - scaled
++        ok = (delta > 0) & (delta <= budget - used + 1e-9) & (gain > 0)
++        if not np.any(ok):
++            return choice
++        head, option = np.unravel_index(
++            np.argmax(np.where(ok, gain, -np.inf)), gain.shape
++        )
++        used += float(delta[head, option])
++        choice[head] = option
++
++
++def crossover(geometry: dict[str, Any], window: int) -> int:
++    """Dense crossover rank (the default rank cap) of a geometry at a window."""
++    K, V = geometry["key_dim"], geometry["value_dim"]
++    return min(K, K * V // (K + V + (window if geometry["erase"] else 0)))
++
++
++def max_rank_at(c: dict[str, Any], window: int) -> int:
++    """Rank cap at a serving window."""
++    g = c["geometry"]
++    if window == g["window"]:
++        return c["max_rank"]
++    cap = crossover(g, window)
++    if c["max_rank"] < crossover(g, g["window"]):
++        cap = min(cap, c["max_rank"])
++    available = c["curves"]["joint_dot_sq_sum"].shape[-1] - 1
++    return min(cap, c["omega"].shape[-2], available)
++
++
++def allocate(c: dict[str, Any], mean_rank: float, window: int) -> torch.Tensor:
++    """Per-head sketch ranks (0 = dense) for a mean rank at a serving window."""
++    g = c["geometry"]
++    K, V, erase = g["key_dim"], g["value_dim"], g["erase"]
++    W = window
++    max_rank = max_rank_at(c, W)
++    curves = c["curves"]
++    error = torch.as_tensor(curves["joint_dot_sq_sum"]).cpu().double()
++    error = error / int(curves["joint_nstep"])
++    L, H, available = error.shape
++    rank_cost = K + V + (W if erase else 0)
++    dense_cost = K * V
++    if not 1 <= max_rank <= crossover(g, W):
++        raise ValueError("SketchSSM max_rank must lie within the dense crossover")
++    if max_rank >= available or max_rank > c["omega"].shape[-2]:
++        raise ValueError("Requested rank cap exceeds the calibrated curves or basis")
++    total_budget = rank_cost * mean_rank * L * H
++    ranks = np.arange(1, max_rank + 1, dtype=np.int64)
++    costs = np.r_[ranks * rank_cost, dense_cost].astype(np.float64)
++    objective = torch.cat(
++        [
++            error[:, :, 1 : max_rank + 1].reshape(-1, max_rank),
++            torch.zeros(L * H, 1, dtype=torch.float64),
++        ],
++        1,
++    ).numpy()
++    choice = _solve(objective, costs, total_budget)
++    dense = choice == max_rank
++    m = np.zeros(L * H, dtype=np.int64)
++    m[~dense] = ranks[choice[~dense]]
++    return torch.from_numpy(m).reshape(L, H).to(torch.int32)
++
++
++def complete_frame(rows: torch.Tensor) -> torch.Tensor:
++    """Complete ordered prefix rows to an orthogonal state rotation."""
++    state_dim = rows.shape[1]
++    augmented = torch.cat(
++        [rows.T.double(), torch.eye(state_dim, dtype=torch.float64)], dim=1
++    )
++    return torch.linalg.qr(augmented)[0].T.contiguous()
++
++
++def export_frames(omega: torch.Tensor, m_table: torch.Tensor) -> torch.Tensor:
++    """Orthogonal frames ``(layers, groups, K, K)`` from the basis prefixes."""
++    omega = omega.double()
++    L, groups, _, K = omega.shape
++    m = m_table.long().reshape(L, groups, -1).amax(-1)
++    frames = torch.empty(L, groups, K, K, dtype=torch.float32)
++    for layer in range(L):
++        for group in range(groups):
++            rows = omega[layer, group, : int(m[layer, group])]
++            frames[layer, group] = complete_frame(rows).float()
++    return frames
++
++
++def frames_for_mean_rank(
++    c: dict[str, Any], mean_rank: float, window: int
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Frames and per-head ranks of a portable calibration for one mean rank."""
++    with torch.device("cpu"), set_default_torch_num_threads(EXPORT_THREADS):
++        validate(c)
++        ranks = allocate(c, float(mean_rank), window)
++        return export_frames(c["omega"], ranks), ranks
+diff --git a/vllm/model_executor/models/interfaces.py b/vllm/model_executor/models/interfaces.py
+index 272b78da50a4..779b76bab626 100644
+--- a/vllm/model_executor/models/interfaces.py
++++ b/vllm/model_executor/models/interfaces.py
+@@ -1178,6 +1178,27 @@ def supports_replayssm(
+     return getattr(model, "supports_replayssm", False)
+ 
+ 
++@runtime_checkable
++class SupportsSketchSSM(Protocol):
++    """The interface for models that support SketchSSM decode (experimental)."""
++
++    supports_sketchssm: ClassVar[Literal[True]] = True
++
++
++@overload
++def supports_sketchssm(model: type[object]) -> TypeIs[type[SupportsSketchSSM]]: ...
++
++
++@overload
++def supports_sketchssm(model: object) -> TypeIs[SupportsSketchSSM]: ...
++
++
++def supports_sketchssm(
++    model: type[object] | object,
++) -> TypeIs[type[SupportsSketchSSM]] | TypeIs[SupportsSketchSSM]:
++    return getattr(model, "supports_sketchssm", False)
++
++
+ @runtime_checkable
+ class SupportsCrossEncoding(Protocol):
+     """The interface required for all models that support cross encoding."""
+diff --git a/vllm/model_executor/models/nemotron_h.py b/vllm/model_executor/models/nemotron_h.py
+index ae653950ac48..61c328660ebc 100644
+--- a/vllm/model_executor/models/nemotron_h.py
++++ b/vllm/model_executor/models/nemotron_h.py
+@@ -60,6 +60,9 @@
+     MambaStateDtypeCalculator,
+     MambaStateShapeCalculator,
+ )
++from vllm.model_executor.layers.mamba.sketchssm.mamba2 import (
++    mamba2_sketchssm_state_shapes,
++)
+ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     ParallelLMHead,
+@@ -78,6 +81,7 @@
+     SupportsPP,
+     SupportsQuant,
+     SupportsReplaySSM,
++    SupportsSketchSSM,
+ )
+ from vllm.model_executor.models.utils import (
+     AutoWeightsLoader,
+@@ -727,6 +731,7 @@ class NemotronHForCausalLM(
+     MixtureOfExperts,
+     SupportsMambaPrefixCaching,
+     SupportsReplaySSM,
++    SupportsSketchSSM,
+ ):
+     # Relevant only if self.has_moe is True
+     is_non_gated_moe = True
+@@ -769,7 +774,7 @@ def get_mamba_state_dtype_from_config(
+             cache_config.mamba_cache_dtype,
+             cache_config.mamba_ssm_cache_dtype,
+         )
+-        if cache_config.use_replayssm:
++        if cache_config.use_mamba_window_rings:
+             return MambaStateDtypeCalculator.append_replayssm_ring(
+                 base_dtype,
+                 vllm_config.model_config.dtype,
+@@ -790,7 +795,7 @@ def get_mamba_state_shape_from_config(
+             Tuple containing:
+             - conv_state_shape: Shape for convolutional state cache
+             - temporal_state_shape: Shape for state space model cache
+-            - x_cache/dt_cache/B_cache ring-buffer shapes (use_replayssm only)
++            - x_cache/dt_cache/B_cache ring-buffer shapes (ReplaySSM/SketchSSM)
+ 
+         """
+         parallel_config = vllm_config.parallel_config
+@@ -808,8 +813,8 @@ def get_mamba_state_shape_from_config(
+             conv_kernel=hf_config.conv_kernel,
+             num_spec=vllm_config.num_speculative_tokens,
+         )
+-        if cache_config.use_replayssm:
+-            return MambaStateShapeCalculator.append_replayssm_ring(
++        if cache_config.use_mamba_window_rings:
++            shapes = MambaStateShapeCalculator.append_replayssm_ring(
+                 base_shapes=base_shape,
+                 n_groups=hf_config.n_groups,
+                 tp_world_size=parallel_config.tensor_parallel_size,
+@@ -817,6 +822,9 @@ def get_mamba_state_shape_from_config(
+                 backend=vllm_config.mamba_config.backend,
+                 num_speculative_tokens=vllm_config.num_speculative_tokens,
+             )
++            if cache_config.sketchssm is not None:
++                return mamba2_sketchssm_state_shapes(shapes)
++            return shapes
+         return base_shape
+ 
+     @classmethod
+diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
+index fa2924441314..b19688b13d3e 100644
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -55,6 +55,7 @@
+     supports_multimodal_raw_input_only,
+     supports_pp,
+     supports_replayssm,
++    supports_sketchssm,
+     supports_transcription,
+ )
+ from .interfaces_base import (
+@@ -879,6 +880,7 @@ class _ModelInfo:
+     has_noops: bool
+     supports_mamba_prefix_caching: bool
+     supports_replayssm: bool
++    supports_sketchssm: bool
+     supports_transcription: bool
+     supports_transcription_only: bool
+     supported_video_pruning_methods: tuple[str, ...]
+@@ -908,6 +910,7 @@ def from_model_cls(model: type[nn.Module]) -> "_ModelInfo":
+             is_hybrid=is_hybrid(model),
+             supports_mamba_prefix_caching=supports_mamba_prefix_caching(model),
+             supports_replayssm=supports_replayssm(model),
++            supports_sketchssm=supports_sketchssm(model),
+             supports_transcription=supports_transcription(model),
+             supports_transcription_only=(
+                 supports_transcription(model) and model.supports_transcription_only
+diff --git a/vllm/model_executor/warmup/mamba_triton_warmup.py b/vllm/model_executor/warmup/mamba_triton_warmup.py
+index a002dcbfa80b..d7acaf88f19c 100644
+--- a/vllm/model_executor/warmup/mamba_triton_warmup.py
++++ b/vllm/model_executor/warmup/mamba_triton_warmup.py
+@@ -42,12 +42,24 @@ def _warm_batch_memcpy_kernel(device: torch.device) -> None:
+     logger.info("Warmed Mamba batch_memcpy_kernel.")
+ 
+ 
++def _warm_sketchssm(runner: "GPUModelRunner") -> None:
++    """Warm the SketchSSM sketch build, which first runs after a prefill."""
++    from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
++
++    for module in runner.get_model().modules():
++        if isinstance(module, MambaMixer2) and module.sketchssm is not None:
++            module.sketchssm.warmup(module.kv_cache[1])
++
++
+ @torch.inference_mode()
+ def mamba_triton_warmup(runner: "GPUModelRunner") -> None:
+-    """Warm prefix-cache memcpy for every Mamba-style KV cache group."""
++    """Warm prefix-cache memcpy for every Mamba-style KV cache group, and the
++    SketchSSM sketch build."""
+     device = runner.device
+     if device.type != "cuda":
+         return
+     if not _has_mamba_style_cache(runner):
+         return
+     _warm_batch_memcpy_kernel(device)
++    if runner.vllm_config.cache_config.sketchssm is not None:
++        _warm_sketchssm(runner)
+diff --git a/vllm/v1/attention/backends/mamba_attn.py b/vllm/v1/attention/backends/mamba_attn.py
+index 3e7ae905a30d..b978e738c667 100644
+--- a/vllm/v1/attention/backends/mamba_attn.py
++++ b/vllm/v1/attention/backends/mamba_attn.py
+@@ -73,6 +73,12 @@ class BaseMambaAttentionMetadata:
+     # the FlashInfer ReplaySSM backend is selected.
+     write_pos_d: torch.Tensor | None = None
+     is_flush_d: torch.Tensor | None = None
++    # SketchSSM: sketch rows (persistent request indices) and -1 padded
++    # flush rows.
++    sketch_indices_d: torch.Tensor | None = None
++    sketch_flush_rows_d: torch.Tensor | None = None
++    sketch_indices_p: torch.Tensor | None = None
++    sketch_build_p: torch.Tensor | None = None
+     bc_pre_scratch: torch.Tensor | None = None
+     # ReplaySSM — FlashInfer checkpointing_ssu two-kernel scratch.
+     replayssm_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+@@ -105,6 +111,8 @@ def __init__(
+         self.num_spec_tokens: int = vllm_config.num_speculative_tokens
+         self.use_spec_decode = self.num_spec_tokens > 0
+         self.use_replayssm = vllm_config.cache_config.use_replayssm
++        self.use_sketchssm = vllm_config.cache_config.sketchssm is not None
++        self.use_window_rings = vllm_config.cache_config.use_mamba_window_rings
+         self.replayssm_buffer_len = vllm_config.cache_config.replayssm_buffer_len
+         self.use_flashinfer_replayssm = (
+             self.use_replayssm
+@@ -139,7 +147,7 @@ def __init__(
+         ) = None
+         self.decode_replayssm_state_indices_d: torch.Tensor | None = None
+         # ReplaySSM CUDA-graph buffers for the selected backend.
+-        if self.use_replayssm and not self.use_flashinfer_replayssm:
++        if self.use_window_rings and not self.use_flashinfer_replayssm:
+             self.decode_write_pos_d: torch.Tensor = torch.empty(
+                 (self.decode_cudagraph_max_bs,),
+                 dtype=torch.int32,
+@@ -150,6 +158,17 @@ def __init__(
+                 dtype=torch.int8,
+                 device=device,
+             )
++            if self.use_sketchssm:
++                self.decode_sketch_flush_rows_d: torch.Tensor = torch.empty(
++                    (self.decode_cudagraph_max_bs,),
++                    dtype=torch.int32,
++                    device=device,
++                )
++                self.decode_sketch_indices_d: torch.Tensor = torch.empty(
++                    (self.decode_cudagraph_max_bs,),
++                    dtype=torch.int32,
++                    device=device,
++                )
+             # B_cache shape = (ngroups, replayssm_buffer_len, dstate); the page
+             # layout is (conv_state, ssm_state, x_cache, dt_cache, B_cache).
+             bc_ngroups = kv_cache_spec.shapes[4][0]
+@@ -467,6 +486,8 @@ def _compute_common_metadata(
+         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+         write_pos_d = None
+         is_flush_d = None
++        sketch_indices_d = sketch_flush_rows_d = None
++        sketch_indices_p = sketch_build_p = None
+         replayssm_scratch = None
+ 
+         state_indices_tensor = mamba_get_block_table_tensor(
+@@ -521,7 +542,16 @@ def _compute_common_metadata(
+                     )
+                 )
+ 
+-        if self.use_replayssm and not self.use_flashinfer_replayssm and num_decodes > 0:
++            if self.use_sketchssm:
++                sketch_indices_p, sketch_build_p = _sketch_prefill_rows(
++                    common_attn_metadata, num_decodes, num_reqs
++                )
++
++        if (
++            self.use_window_rings
++            and not self.use_flashinfer_replayssm
++            and num_decodes > 0
++        ):
+             decode_base_cpu = common_attn_metadata.replayssm_decode_base_cpu
+             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+             async_spec_decode = (
+@@ -579,6 +609,10 @@ def _compute_common_metadata(
+                     & ((num_computed_d + query_lens_cpu) % block_size == 0)
+                 )
+             is_flush_cpu = is_flush_cpu.to(torch.int8)
++            if self.use_sketchssm:
++                sketch_indices_d, sketch_flush_rows_d = _sketch_decode_rows(
++                    common_attn_metadata, num_decodes, is_flush_cpu
++                )
+             write_pos_d = async_tensor_h2d(
+                 write_pos_cpu.to(torch.int32).tolist(),
+                 dtype=torch.int32,
+@@ -601,7 +635,7 @@ def _compute_common_metadata(
+ 
+         bc_pre_scratch = None
+         if (
+-            self.use_replayssm
++            self.use_window_rings
+             and self.decode_bc_pre_scratch is not None
+             and num_decodes > 0
+         ):
+@@ -618,6 +652,10 @@ def _compute_common_metadata(
+             state_indices_tensor_d=state_indices_tensor_d,
+             write_pos_d=write_pos_d,
+             is_flush_d=is_flush_d,
++            sketch_indices_d=sketch_indices_d,
++            sketch_flush_rows_d=sketch_flush_rows_d,
++            sketch_indices_p=sketch_indices_p,
++            sketch_build_p=sketch_build_p,
+             bc_pre_scratch=bc_pre_scratch,
+             replayssm_scratch=replayssm_scratch,
+             num_accepted_tokens=num_accepted_tokens,
+@@ -643,6 +681,8 @@ def _update_metadata_for_cudagraph_capture(
+         num_accepted_tokens = metadata.num_accepted_tokens
+         write_pos_d = metadata.write_pos_d
+         is_flush_d = metadata.is_flush_d
++        sketch_indices_d = metadata.sketch_indices_d
++        sketch_flush_rows_d = metadata.sketch_flush_rows_d
+         bc_pre_scratch = metadata.bc_pre_scratch
+         replayssm_scratch = metadata.replayssm_scratch
+         replayssm_state_indices_d = None
+@@ -669,7 +709,7 @@ def _update_metadata_for_cudagraph_capture(
+                     1  # pad with 1st slot index
+                 )
+ 
+-            if self.use_replayssm and not self.use_flashinfer_replayssm:
++            if self.use_window_rings and not self.use_flashinfer_replayssm:
+                 assert write_pos_d is not None
+                 assert is_flush_d is not None
+                 self.decode_write_pos_d[: metadata.num_decodes].copy_(
+@@ -686,6 +726,20 @@ def _update_metadata_for_cudagraph_capture(
+                 is_flush_d = self.decode_is_flush_d[:padded_bs]
+                 is_flush_d[metadata.num_decodes :] = 0
+ 
++                if self.use_sketchssm:
++                    assert sketch_indices_d is not None
++                    self.decode_sketch_indices_d[: metadata.num_decodes].copy_(
++                        sketch_indices_d[: metadata.num_decodes], non_blocking=True
++                    )
++                    sketch_indices_d = self.decode_sketch_indices_d[:padded_bs]
++                    sketch_indices_d[metadata.num_decodes :] = 0
++                    assert sketch_flush_rows_d is not None
++                    self.decode_sketch_flush_rows_d[: metadata.num_decodes].copy_(
++                        sketch_flush_rows_d[: metadata.num_decodes], non_blocking=True
++                    )
++                    sketch_flush_rows_d = self.decode_sketch_flush_rows_d[:padded_bs]
++                    sketch_flush_rows_d[metadata.num_decodes :] = -1
++
+                 if self.decode_bc_pre_scratch is not None:
+                     bc_pre_scratch = self.decode_bc_pre_scratch[:padded_bs]
+             elif self.use_flashinfer_replayssm:
+@@ -718,6 +772,8 @@ def _update_metadata_for_cudagraph_capture(
+             num_accepted_tokens=num_accepted_tokens,
+             write_pos_d=write_pos_d,
+             is_flush_d=is_flush_d,
++            sketch_indices_d=sketch_indices_d,
++            sketch_flush_rows_d=sketch_flush_rows_d,
+             bc_pre_scratch=bc_pre_scratch,
+             replayssm_scratch=replayssm_scratch,
+             replayssm_state_indices_d=replayssm_state_indices_d,
+@@ -762,3 +818,46 @@ def update_block_table(
+         )
+ 
+         return self._update_metadata_for_cudagraph_capture(new_metadata)
++
++
++def _sketch_decode_rows(
++    common_attn_metadata: CommonAttentionMetadata,
++    num_decodes: int,
++    is_flush_cpu: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Sketch rows of the decode rows, and the flush rows padded with -1."""
++    req_idx = common_attn_metadata.req_idx
++    assert req_idx is not None, "SketchSSM requires persistent request indices"
++    # Decode rows can outnumber the requests (padding); those read sketch row 0.
++    rows = req_idx[:num_decodes].tolist()
++    rows += [0] * (num_decodes - len(rows))
++    flush_rows = torch.nonzero(is_flush_cpu).flatten().tolist()
++    device = common_attn_metadata.query_start_loc.device
++    return (
++        async_tensor_h2d(rows, dtype=torch.int32, device=device),
++        async_tensor_h2d(
++            flush_rows + [-1] * (num_decodes - len(flush_rows)),
++            dtype=torch.int32,
++            device=device,
++        ),
++    )
++
++
++def _sketch_prefill_rows(
++    common_attn_metadata: CommonAttentionMetadata,
++    num_decodes: int,
++    num_reqs: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Sketch rows of the prefill rows, and which of them finish their prompt."""
++    req_idx = common_attn_metadata.req_idx
++    decode_base_cpu = common_attn_metadata.replayssm_decode_base_cpu
++    seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
++    assert req_idx is not None, "SketchSSM requires persistent request indices"
++    assert decode_base_cpu is not None and seq_lens_cpu is not None
++    rows = slice(num_decodes, num_reqs)
++    done = seq_lens_cpu[rows] >= decode_base_cpu[rows]
++    device = common_attn_metadata.query_start_loc.device
++    return (
++        async_tensor_h2d(req_idx[rows].tolist(), dtype=torch.int32, device=device),
++        async_tensor_h2d(done.to(torch.int8).tolist(), dtype=torch.int8, device=device),
++    )
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index 94c57c1968c3..5bbfd99c099b 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -42,11 +42,18 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
+     is_prefilling: torch.Tensor
+     num_accepted_tokens: torch.Tensor | None = None
+     num_decode_draft_tokens_cpu: torch.Tensor | None = None
++    # Ring origin per request row (CPU) for SketchSSM: the prefill length.
++    replayssm_decode_base_cpu: torch.Tensor | None = None
+ 
+     def get_extra_common_attn_kwargs(
+         self, kv_cache_group_id: int, num_reqs: int
+     ) -> dict[str, Any]:
+-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
++        kwargs: dict[str, Any] = {"is_prefilling": self.is_prefilling[:num_reqs]}
++        if self.replayssm_decode_base_cpu is not None:
++            kwargs["replayssm_decode_base_cpu"] = self.replayssm_decode_base_cpu[
++                :num_reqs
++            ]
++        return kwargs
+ 
+     def get_extra_attn_kwargs(
+         self, attn_metadata_builder: Any, num_reqs: int
+@@ -301,6 +308,15 @@ def prepare_attn(
+             )
+             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
+ 
++        replayssm_decode_base_cpu = None
++        if self.cache_config.sketchssm is not None:
++            # Padding rows get a zero origin. prefill_len includes output
++            # tokens replayed on resumption.
++            replayssm_decode_base_cpu = torch.zeros(num_reqs, dtype=torch.int32)
++            replayssm_decode_base_cpu[: input_batch.num_reqs] = torch.from_numpy(
++                input_batch.prefill_len_np[: input_batch.num_reqs]
++            )
++
+         if self._align_mode:
+             mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
+             aligned_index_builders = []
+@@ -321,6 +337,7 @@ def prepare_attn(
+             is_prefilling=is_prefilling,
+             num_accepted_tokens=num_accepted_tokens,
+             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
++            replayssm_decode_base_cpu=replayssm_decode_base_cpu,
+         )
+         attn_metadata = build_attn_metadata(
+             attn_groups=attn_groups,
+@@ -340,6 +357,12 @@ def prepare_attn(
+             model_specific_attn_metadata=mamba_attn_metadata,
+             for_cudagraph_capture=for_capture,
+             rswa_prefix_lens=input_batch.prompt_lens,
++            # SketchSSM keys its per-request sketches by the persistent index.
++            req_idx=(
++                input_batch.idx_mapping_np
++                if self.cache_config.sketchssm is not None
++                else None
++            ),
+         )
+         if self.recoverssm is not None:
+             self.recoverssm.record_step(

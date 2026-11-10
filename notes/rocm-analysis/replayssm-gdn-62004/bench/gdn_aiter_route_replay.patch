@@ -1,0 +1,58 @@
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index 0bd1023..a867c6a 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -116,6 +116,11 @@ GDN_AITER_TRITON_AVAILABLE = (
+ # Experiment switch: force GDN onto the generic path even with AITER enabled.
+ SPIKE_GDN_NO_AITER = os.environ.get("SPIKE_GDN_NO_AITER", "0") == "1"
+ 
++# Experiment switch: SPIKE_GATE_GDN=0 keeps GDN on the AITER path even with
++# --use-replayssm, so the AITER conv kernel can be paired with the ReplaySSM
++# recurrence (default 1 = the use_replayssm gate described in §1).
++SPIKE_GATE_GDN = os.environ.get("SPIKE_GATE_GDN", "1") == "1"
++
+ if GDN_AITER_TRITON_AVAILABLE:
+     from aiter.ops.triton.causal_conv1d_update_single_token import (
+         fused_reshape_causal_conv1d_update_single_token as gdn_aiter_fused_reshape_causal_conv1d_update_single_token,  # noqa: E501
+@@ -1285,7 +1290,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         if (
+             GDN_AITER_TRITON_AVAILABLE
+             and not self.enable_fused_gdn_spec_decode
+-            and not getattr(self, "use_replayssm", False)
++            and not (SPIKE_GATE_GDN and getattr(self, "use_replayssm", False))
+             and not SPIKE_GDN_NO_AITER
+         ):
+             num_tokens = hidden_states.size(0)
+@@ -2305,6 +2310,32 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         )
+ 
+         # 2. Recurrent attention
++        if getattr(self, "use_replayssm", False):
++            # SPIKE: AITER's fused conv1d+reshape above already produced the
++            # packed conv output and the b/a vectors, so the ReplaySSM kernel
++            # can replace only the recurrence.
++            num_actual_tokens = attn_metadata.num_actual_tokens
++            fused_recurrent_gated_delta_rule_replayssm(
++                mixed_qkv=mixed_qkv_non_spec,
++                a=a,
++                b=b,
++                A_log=self.A_log,
++                dt_bias=self.dt_bias,
++                scale=self.head_k_dim**-0.5,
++                initial_state=ssm_state,
++                d_cache=self_kv_cache[2],
++                k_cache=self_kv_cache[3],
++                g_cache=self_kv_cache[4],
++                out=core_attn_out[:num_actual_tokens].unsqueeze(1),
++                ssm_state_indices=non_spec_state_indices_tensor[
++                    :num_actual_tokens
++                ],
++                write_pos=attn_metadata.write_pos_d,
++                is_flush=attn_metadata.is_flush_d,
++                use_qk_l2norm_in_kernel=True,
++            )
++            return
++
+         gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule(
+             A_log=self.A_log,
+             a=a,

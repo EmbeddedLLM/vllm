@@ -1,0 +1,2446 @@
+diff --git a/benchmarks/replayssm/e2e_decode_speedup.py b/benchmarks/replayssm/e2e_decode_speedup.py
+index e8a1cc14bc..fc68d4b397 100644
+--- a/benchmarks/replayssm/e2e_decode_speedup.py
++++ b/benchmarks/replayssm/e2e_decode_speedup.py
+@@ -2,10 +2,14 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """End-to-end autoregressive decode benchmark: ReplaySSM vs the standard SSM kernel.
+ 
+-Loads a hybrid Mamba2 model, replicates one prompt across the batch, and times a
+-long greedy decode (CUDA graphs on) once with the standard kernel and once with
+-ReplaySSM, then reports the per-step / throughput speedup. The two modes run in
+-separate subprocesses so each gets a clean CUDA context.
++Loads a hybrid SSM model (Mamba2 or GDN), replicates one prompt across the batch,
++and times a long greedy decode (CUDA graphs on) once with the standard kernel and
++once with ReplaySSM, then reports the per-step / throughput speedup. The two modes
++run in separate subprocesses so each gets a clean CUDA context.
++
++GDN models (Qwen3.5) default to the Triton prefill backend, which starts
++instantly; FlashInfer JIT-compiles on first use (slow startup) but never affects
++the decode speedup measured here.
+ 
+ The FlashInfer FP4-MoE autotuner is disabled by default (it is unstable under
+ CUDA-graph capture on the pre-release Blackwell FP4 path); pass
+@@ -13,6 +17,7 @@ CUDA-graph capture on the pre-release Blackwell FP4 path); pass
+ 
+ Examples:
+     python e2e_decode_speedup.py --model-id nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
++    python e2e_decode_speedup.py --model-id Qwen/Qwen3.5-4B --buffer-len 16
+     python e2e_decode_speedup.py --dtype auto --buffer-len 16 \
+         --model-id nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4   # B300 NVFP4
+ 
+@@ -73,6 +78,14 @@ def parse_args():
+         "'bsm,nw' via override_ssm_config (forces the in-process "
+         "engine so the override reaches the kernel). Empty = off.",
+     )
++    p.add_argument(
++        "--gdn-prefill-backend",
++        default="triton",
++        choices=["triton", "flashinfer", "auto"],
++        help="GDN prefill kernel (GDN models only; Mamba2 ignores it). "
++        "'triton' (default) starts instantly; 'flashinfer'/'auto' JIT-compile "
++        "on first use (slow startup). Decode speed is unaffected.",
++    )
+     p.add_argument(
+         "--worker",
+         choices=["standard", "replayssm"],
+@@ -89,6 +102,8 @@ def resolve_max_model_len(args) -> int:
+ 
+ 
+ def run_worker(args):
++    # Triton ReplaySSM requires V1; use the same runner for the baseline.
++    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+     # override_ssm_config is a module global; it only reaches the model if the
+     # engine runs in-process (default V1 spawns a separate EngineCore). Force it.
+     if args.worker == "standard" and args.baseline_ssm_config:
+@@ -116,6 +131,12 @@ def run_worker(args):
+         gpu_memory_utilization=args.gpu_memory_utilization,
+         # SSM state dtype (applies to both standard and ReplaySSM).
+         mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
++        mamba_backend="triton",
++        # Skip the vision tower of multimodal hybrids (Qwen3.5 is a
++        # *ForConditionalGeneration model); ignored by text-only Mamba2 models.
++        language_model_only=True,
++        # GDN prefill kernel only; decode (and thus the speedup) is unaffected.
++        additional_config={"gdn_prefill_backend": args.gdn_prefill_backend},
+     )
+     if args.disable_flashinfer_autotune:
+         # FP4-MoE autotuner is unstable under CUDA-graph capture on Blackwell;
+@@ -208,6 +229,8 @@ def run_one_mode(args, mode) -> dict:
+         str(args.gpu_memory_utilization),
+         "--mamba-ssm-cache-dtype",
+         args.mamba_ssm_cache_dtype,
++        "--gdn-prefill-backend",
++        args.gdn_prefill_backend,
+         "--baseline-ssm-config",
+         args.baseline_ssm_config,
+     ]
+diff --git a/tests/kernels/mamba/test_gdn_forward_core_split.py b/tests/kernels/mamba/test_gdn_forward_core_split.py
+index 7e8b9ef238..1330ca764e 100644
+--- a/tests/kernels/mamba/test_gdn_forward_core_split.py
++++ b/tests/kernels/mamba/test_gdn_forward_core_split.py
+@@ -109,6 +109,7 @@ def _build_layer(
+     layer = types.SimpleNamespace()
+     layer.prefix = PREFIX
+     layer.enable_packed_recurrent_decode = False
++    layer.use_replayssm = False
+     layer.tp_size = 1
+     layer.num_k_heads = H
+     layer.num_v_heads = HV
+diff --git a/tests/kernels/mamba/test_gdn_fused_mtp.py b/tests/kernels/mamba/test_gdn_fused_mtp.py
+index f2a6f1698e..36906dc60e 100644
+--- a/tests/kernels/mamba/test_gdn_fused_mtp.py
++++ b/tests/kernels/mamba/test_gdn_fused_mtp.py
+@@ -59,6 +59,25 @@ PREFIX = "model.layers.0.linear_attn"
+ EPS = 1e-6
+ 
+ 
++def test_fused_decode_support_check_accepts_replayssm_ring_dtypes():
++    """Ring storage must not change the convolution/recurrent dtype checks."""
++    state_dtypes = (torch.bfloat16, torch.float32)
++    layer = types.SimpleNamespace(
++        get_state_dtype=lambda: state_dtypes,
++        gqa_interleaved_layout=False,
++        head_k_dim=128,
++        head_v_dim=128,
++        norm=types.SimpleNamespace(activation="silu"),
++    )
++    config = types.SimpleNamespace(
++        model_config=types.SimpleNamespace(dtype=torch.bfloat16)
++    )
++    check = QwenGatedDeltaNetAttention._fused_gdn_decode_unsupported_reason
++    expected = check(layer, config)
++    state_dtypes += (torch.float16, torch.float16, torch.float32)
++    assert check(layer, config) == expected
++
++
+ class _TestGatedNorm:
+     def __init__(self, weight: torch.Tensor, activation: str) -> None:
+         self.weight = weight
+@@ -109,6 +128,7 @@ def _build_layer(
+     layer = types.SimpleNamespace(
+         prefix=PREFIX,
+         enable_packed_recurrent_decode=False,
++        use_replayssm=False,
+         disable_tp_for_ba_proj=False,
+         tp_size=1,
+         num_k_heads=H,
+diff --git a/tests/kernels/test_replayssm_standard_decode_gdn.py b/tests/kernels/test_replayssm_standard_decode_gdn.py
+new file mode 100644
+index 0000000000..f69cf06b5d
+--- /dev/null
++++ b/tests/kernels/test_replayssm_standard_decode_gdn.py
+@@ -0,0 +1,403 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Standard (autoregressive) decode correctness for the GDN ReplaySSM kernel.
++
++GDN ReplaySSM caches the per-step delta-rule inputs (the corrected value ``u``,
++the key, and the gate) in a small ring buffer and reconstructs the recurrent
++state on the fly, writing it back to HBM only when the buffer flushes. This
++checks the cached decode kernel ``fused_recurrent_gated_delta_rule_replayssm``
++against the upstream baseline ``fused_recurrent_gated_delta_rule_packed_decode``
++over a multi-step decode, across the flush boundaries and with sparse
++(continuous-batching) state allocation including padding rows.
++
++GDN uses only the state-reconstruction route (it reads the state at both k and
++q, so there is no output-only variant). State precision and activation/buffer
++precision are swept independently; Qwen3.5 defaults to fp32 SSM state, though
++bf16 state is also supported. ``g_cache`` is always fp32.
++"""
++
++import pytest
++import torch
++
++from vllm.third_party.flash_linear_attention.ops import (
++    fused_recurrent_gated_delta_rule_packed_decode,
++    fused_recurrent_gated_delta_rule_replayssm,
++)
++from vllm.utils.torch_utils import set_random_seed
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
++@pytest.mark.parametrize("act_dtype", [torch.bfloat16, torch.float16])
++def test_replayssm_flush_keeps_beta_in_fp32(act_dtype):
++    """A one-token flush must not round beta to the activation dtype."""
++    device = "cuda"
++    k_dim = 64
++    mixed_qkv = torch.zeros(1, 2 * k_dim + 1, device=device, dtype=act_dtype)
++    mixed_qkv[0, 0] = 1
++    mixed_qkv[0, k_dim] = 1
++    mixed_qkv[0, -1] = 1
++    a = torch.zeros(1, 1, device=device, dtype=act_dtype)
++    b = torch.full_like(a, 0.25)
++    state = torch.zeros(2, 1, 1, k_dim, device=device, dtype=torch.float32)
++    fused_recurrent_gated_delta_rule_replayssm(
++        mixed_qkv=mixed_qkv,
++        a=a,
++        b=b,
++        A_log=torch.zeros(1, device=device),
++        dt_bias=torch.zeros(1, device=device),
++        scale=1.0,
++        initial_state=state,
++        d_cache=torch.zeros(2, 1, 16, 1, device=device, dtype=torch.float16),
++        k_cache=torch.zeros(2, 1, 16, k_dim, device=device, dtype=torch.float16),
++        g_cache=torch.zeros(2, 1, 16, device=device),
++        out=torch.empty(1, 1, 1, 1, device=device, dtype=act_dtype),
++        ssm_state_indices=torch.ones(1, device=device, dtype=torch.int32),
++        write_pos=torch.zeros(1, device=device, dtype=torch.int32),
++        is_flush=torch.ones(1, device=device, dtype=torch.int8),
++        use_qk_l2norm_in_kernel=False,
++    )
++    torch.testing.assert_close(
++        state[1, 0, 0, 0], torch.sigmoid(b.float()).squeeze(), rtol=1e-6, atol=1e-6
++    )
++
++
++def _output_tolerances(act_dtype: torch.dtype) -> tuple[float, float]:
++    # Anchored on the baseline packed-decode kernel; same regime as the existing
++    # GDN test. The output has no fp32 drift (tight 1e-4); keyed off act dtype.
++    if act_dtype == torch.float32:
++        return 1e-4, 1e-4
++    return 1e-2, 2e-2
++
++
++def _state_tolerances(
++    act_dtype: torch.dtype, state_dtype: torch.dtype
++) -> tuple[float, float]:
++    if state_dtype == torch.bfloat16:
++        # The baseline rounds state every token; ReplaySSM rounds at flushes.
++        return 2e-2, 2e-2
++    # The reconstructed checkpoint state vs the baseline's sequential state
++    # differs a bit more than the output at fp32 (~8e-4, an fp32 reconstruction
++    # vs recurrence difference, not a precision bug) -- same looser regime the
++    # existing GDN test uses for state.
++    if act_dtype == torch.float32:
++        return 1e-3, 2e-3
++    return 1e-2, 2e-2
++
++
++def _run_gdn_standard_decode(
++    *,
++    state_dtype: torch.dtype,
++    act_dtype: torch.dtype,
++    batch: int,
++    num_q_heads: int,
++    num_v_heads: int,
++    head_k_dim: int,
++    head_v_dim: int,
++    max_cache_len: int,
++    num_steps: int,
++    n_pad: int,
++    strided: bool = False,
++    seed: int = 0,
++) -> None:
++    """Drive ``num_steps`` decode steps; check the ReplaySSM kernel matches the
++    baseline packed decode each step (and the checkpoint state at flushes).
++    State follows ``state_dtype``; BF16 activations use FP16 ring storage."""
++    device = "cuda"
++    o_rtol, o_atol = _output_tolerances(act_dtype)
++    s_rtol, s_atol = _state_tolerances(act_dtype, state_dtype)
++    set_random_seed(seed)
++    scale = head_k_dim**-0.5
++    qkv_dim = 2 * (num_q_heads * head_k_dim) + num_v_heads * head_v_dim
++    padded_batch = batch + n_pad
++    num_state_slots = batch + n_pad + 1  # +1 reserves a null block at slot 0
++
++    A_log = torch.randn(num_v_heads, device=device, dtype=act_dtype)
++    dt_bias = torch.randn(num_v_heads, device=device, dtype=act_dtype)
++
++    # Sparse state allocation: active rows map to a random permutation of slots
++    # 1.., padding rows map to PAD_SLOT_ID=-1.
++    state_indices = (torch.randperm(num_state_slots - 1, device=device)[:batch] + 1).to(
++        torch.int32
++    )
++    ssm_state_indices = torch.cat(
++        [
++            state_indices,
++            torch.full((n_pad,), -1, dtype=torch.int32, device=device),
++        ]
++    )
++    unused = torch.ones(num_state_slots, dtype=torch.bool, device=device)
++    unused[state_indices] = False
++
++    state0 = torch.randn(
++        num_state_slots,
++        num_v_heads,
++        head_v_dim,
++        head_k_dim,
++        device=device,
++        dtype=state_dtype,
++    )
++    state_packed = state0.clone()
++    state_cached = state0.clone()
++    state_before = state0.clone()
++
++    cache_dtype = torch.float16 if act_dtype == torch.bfloat16 else act_dtype
++    d_cache = torch.zeros(
++        num_state_slots,
++        num_v_heads,
++        max_cache_len,
++        head_v_dim,
++        device=device,
++        dtype=cache_dtype,
++    )
++    k_cache = torch.zeros(
++        num_state_slots,
++        num_q_heads,
++        max_cache_len,
++        head_k_dim,
++        device=device,
++        dtype=cache_dtype,
++    )
++    g_cache = torch.zeros(
++        num_state_slots, num_v_heads, max_cache_len, device=device, dtype=torch.float32
++    )
++
++    for step in range(num_steps):
++        if strided:
++            proj = torch.randn(
++                padded_batch, qkv_dim + 64, device=device, dtype=act_dtype
++            )
++            mixed_qkv = proj[:, :qkv_dim]
++        else:
++            mixed_qkv = torch.randn(
++                padded_batch, qkv_dim, device=device, dtype=act_dtype
++            )
++        a = torch.randn(padded_batch, num_v_heads, device=device, dtype=act_dtype)
++        b = torch.randn(padded_batch, num_v_heads, device=device, dtype=act_dtype)
++        write_pos = torch.full(
++            (padded_batch,), step % max_cache_len, device=device, dtype=torch.int32
++        )
++        is_flush = (write_pos == max_cache_len - 1).to(torch.int8)
++
++        out_packed = torch.empty(
++            padded_batch, 1, num_v_heads, head_v_dim, device=device, dtype=act_dtype
++        )
++        fused_recurrent_gated_delta_rule_packed_decode(
++            mixed_qkv=mixed_qkv,
++            a=a,
++            b=b,
++            A_log=A_log,
++            dt_bias=dt_bias,
++            scale=scale,
++            initial_state=state_packed,
++            out=out_packed,
++            ssm_state_indices=ssm_state_indices,
++            use_qk_l2norm_in_kernel=True,
++        )
++
++        out_cached = torch.empty(
++            padded_batch, 1, num_v_heads, head_v_dim, device=device, dtype=act_dtype
++        )
++        fused_recurrent_gated_delta_rule_replayssm(
++            mixed_qkv=mixed_qkv,
++            a=a,
++            b=b,
++            A_log=A_log,
++            dt_bias=dt_bias,
++            scale=scale,
++            initial_state=state_cached,
++            d_cache=d_cache,
++            k_cache=k_cache,
++            g_cache=g_cache,
++            out=out_cached,
++            ssm_state_indices=ssm_state_indices,
++            write_pos=write_pos,
++            is_flush=is_flush,
++            use_qk_l2norm_in_kernel=True,
++        )
++
++        torch.testing.assert_close(
++            out_cached[:batch], out_packed[:batch], rtol=o_rtol, atol=o_atol
++        )
++        if step % max_cache_len == max_cache_len - 1:
++            torch.testing.assert_close(
++                state_cached[state_indices],
++                state_packed[state_indices],
++                rtol=s_rtol,
++                atol=s_atol,
++            )
++
++    # Padding / unused state slots are never written.
++    assert torch.equal(state_cached[unused], state_before[unused])
++
++
++# State/activation precisions. fp32 state is the default; bf16/fp16 are the
++# reduced-footprint configs. fp16 appears as an activation dtype (sfp16_afp16,
++# s32_afp16) and as a state dtype under bf16 activations (sfp16_a16): fp16 has a
++# finer mantissa than bf16 at the same 2 bytes, so it is a more accurate state at
++# no extra footprint. We skip fp16 state under fp32 activations.
++_PRECISIONS = [
++    pytest.param((torch.float32, torch.float32), id="s32_a32"),
++    pytest.param((torch.float32, torch.bfloat16), id="s32_a16"),
++    pytest.param((torch.bfloat16, torch.bfloat16), id="s16_a16"),
++    pytest.param((torch.float32, torch.float16), id="s32_afp16"),
++    pytest.param((torch.float16, torch.float16), id="sfp16_afp16"),
++    pytest.param((torch.float16, torch.bfloat16), id="sfp16_a16"),
++]
++_GEOMETRIES = [
++    # (num_q_heads, num_v_heads, head_k_dim, head_v_dim)
++    pytest.param((2, 4, 64, 64), id="small"),
++    pytest.param((16, 32, 128, 128), id="qwen4b"),
++    pytest.param((16, 64, 128, 128), id="qwen122b"),
++]
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
++@pytest.mark.parametrize("precision", _PRECISIONS)
++@pytest.mark.parametrize("geometry", _GEOMETRIES)
++@pytest.mark.parametrize("max_cache_len", [4, 16])
++@pytest.mark.parametrize("strided", [False, True])
++def test_replayssm_standard_decode_gdn_matches_packed(
++    precision: tuple[torch.dtype, torch.dtype],
++    geometry: tuple[int, int, int, int],
++    max_cache_len: int,
++    strided: bool,
++):
++    state_dtype, act_dtype = precision
++    num_q_heads, num_v_heads, head_k_dim, head_v_dim = geometry
++    _run_gdn_standard_decode(
++        state_dtype=state_dtype,
++        act_dtype=act_dtype,
++        batch=4,
++        num_q_heads=num_q_heads,
++        num_v_heads=num_v_heads,
++        head_k_dim=head_k_dim,
++        head_v_dim=head_v_dim,
++        max_cache_len=max_cache_len,
++        num_steps=2 * max_cache_len + 1,
++        n_pad=2,
++        strided=strided,
++    )
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
++@pytest.mark.parametrize("precision", _PRECISIONS)
++def test_replayssm_standard_decode_gdn_per_row_write_pos(
++    precision: tuple[torch.dtype, torch.dtype],
++):
++    # Each row is built up to a different prefix length, so when the batch runs
++    # together the rows sit at different ring positions. This validates that the
++    # kernel reads a per-row write_pos (independent cache cursors per sequence --
++    # the continuous-batching case the main test's uniform write_pos misses).
++    state_dtype, act_dtype = precision
++    device = "cuda"
++    o_rtol, o_atol = _output_tolerances(act_dtype)
++    set_random_seed(1)
++
++    batch = 4
++    num_q_heads, num_v_heads, head_k_dim, head_v_dim = 2, 4, 64, 64
++    max_cache_len = 4
++    num_state_slots = 7
++    scale = head_k_dim**-0.5
++    qkv_dim = 2 * (num_q_heads * head_k_dim) + num_v_heads * head_v_dim
++
++    A_log = torch.randn(num_v_heads, device=device, dtype=act_dtype)
++    dt_bias = torch.randn(num_v_heads, device=device, dtype=act_dtype)
++    ssm_state_indices = torch.tensor([4, 2, 6, 1], device=device, dtype=torch.int32)
++    prefix_lens = torch.tensor([0, 1, 2, 3], device=device, dtype=torch.int32)
++
++    state0 = torch.randn(
++        num_state_slots,
++        num_v_heads,
++        head_v_dim,
++        head_k_dim,
++        device=device,
++        dtype=state_dtype,
++    )
++    state_packed = state0.clone()
++    state_cached = state0.clone()
++    cache_dtype = torch.float16 if act_dtype == torch.bfloat16 else act_dtype
++    d_cache = torch.zeros(
++        num_state_slots,
++        num_v_heads,
++        max_cache_len,
++        head_v_dim,
++        device=device,
++        dtype=cache_dtype,
++    )
++    k_cache = torch.zeros(
++        num_state_slots,
++        num_q_heads,
++        max_cache_len,
++        head_k_dim,
++        device=device,
++        dtype=cache_dtype,
++    )
++    g_cache = torch.zeros(
++        num_state_slots, num_v_heads, max_cache_len, device=device, dtype=torch.float32
++    )
++
++    def decode_step(mixed_qkv, a, b, idx, write_pos):
++        is_flush = (write_pos == max_cache_len - 1).to(torch.int8)
++        out_p = torch.empty(
++            mixed_qkv.shape[0],
++            1,
++            num_v_heads,
++            head_v_dim,
++            device=device,
++            dtype=act_dtype,
++        )
++        fused_recurrent_gated_delta_rule_packed_decode(
++            mixed_qkv=mixed_qkv,
++            a=a,
++            b=b,
++            A_log=A_log,
++            dt_bias=dt_bias,
++            scale=scale,
++            initial_state=state_packed,
++            out=out_p,
++            ssm_state_indices=idx,
++            use_qk_l2norm_in_kernel=True,
++        )
++        out_c = torch.empty_like(out_p)
++        fused_recurrent_gated_delta_rule_replayssm(
++            mixed_qkv=mixed_qkv,
++            a=a,
++            b=b,
++            A_log=A_log,
++            dt_bias=dt_bias,
++            scale=scale,
++            initial_state=state_cached,
++            d_cache=d_cache,
++            k_cache=k_cache,
++            g_cache=g_cache,
++            out=out_c,
++            ssm_state_indices=idx,
++            write_pos=write_pos,
++            is_flush=is_flush,
++            use_qk_l2norm_in_kernel=True,
++        )
++        return out_p, out_c
++
++    # Build each row up independently to its prefix length.
++    for row, prefix_len in enumerate(prefix_lens.tolist()):
++        idx = ssm_state_indices[row : row + 1]
++        for s in range(prefix_len):
++            mixed_qkv = torch.randn(1, qkv_dim, device=device, dtype=act_dtype)
++            a = torch.randn(1, num_v_heads, device=device, dtype=act_dtype)
++            b = torch.randn(1, num_v_heads, device=device, dtype=act_dtype)
++            decode_step(
++                mixed_qkv,
++                a,
++                b,
++                idx,
++                torch.tensor([s], device=device, dtype=torch.int32),
++            )
++
++    # Run the whole batch with per-row write_pos = prefix_lens.
++    mixed_qkv = torch.randn(batch, qkv_dim, device=device, dtype=act_dtype)
++    a = torch.randn(batch, num_v_heads, device=device, dtype=act_dtype)
++    b = torch.randn(batch, num_v_heads, device=device, dtype=act_dtype)
++    out_packed, out_cached = decode_step(
++        mixed_qkv, a, b, ssm_state_indices, prefix_lens
++    )
++    torch.testing.assert_close(out_cached, out_packed, rtol=o_rtol, atol=o_atol)
+diff --git a/tests/kernels/test_replayssm_teacher_decode_equivalence_gdn.py b/tests/kernels/test_replayssm_teacher_decode_equivalence_gdn.py
+new file mode 100644
+index 0000000000..d7f64c7de5
+--- /dev/null
++++ b/tests/kernels/test_replayssm_teacher_decode_equivalence_gdn.py
+@@ -0,0 +1,251 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Prefill(chunk) == decode equivalence for the GDN ReplaySSM kernel.
++
++The GDN analog of the Mamba2 prefill-teacher: the chunked prefill kernel
++(``chunk_gated_delta_rule``, the path the model runs at prefill) and
++step-by-step decode must produce the same per-position outputs and final state
++over a sequence. We build q/k/v/g/beta with ``fused_post_conv_prep`` (the same
++shared prep the model's prefill uses, so the teacher's inputs match what the
++decode kernels compute internally from ``mixed_qkv``), then feed:
++
++  * the chunked prefill kernel (the teacher),
++  * the baseline step decode (``..._packed_decode``),
++  * the ReplaySSM step decode (ring buffer, ``..._replayssm``),
++
++and check the step decoders reproduce the teacher's per-position outputs and
++final state. The chunked prefill kernel only supports bf16 *activations*
++(q/k/v), so it is the (trusted) reference run with bf16 activations -- there is
++no separate fp32 ground truth here (the fp32-activation decode path is covered
++by the GDN standard-decode test). The recurrent *state* precision is still
++swept: fp32 (the production config) and bf16, both with bf16 activations.
++
++Prefill (a chunked scan) and decode (a step recurrence) are different code
++paths, so they differ numerically; we use chunked-scan tolerances (the same
++regime as the Mamba2 prefill-teacher).
++
++``seqlen`` is a multiple of the buffer length, so the final step flushes and
++ReplaySSM's stored checkpoint is the full final state.
++"""
++
++import pytest
++import torch
++
++from vllm.third_party.flash_linear_attention.ops import (
++    chunk_gated_delta_rule,
++    fused_recurrent_gated_delta_rule_packed_decode,
++    fused_recurrent_gated_delta_rule_replayssm,
++)
++from vllm.third_party.flash_linear_attention.ops.fused_gdn_prefill_post_conv import (
++    fused_post_conv_prep,
++)
++from vllm.utils.torch_utils import set_random_seed
++
++
++def _output_tolerances(act_dtype: torch.dtype) -> tuple[float, float]:
++    # Chunked-scan-vs-step regime (the chunked prefill, not the decode, sets
++    # these), same as the Mamba2 prefill-teacher. Keyed off the activation dtype.
++    if act_dtype == torch.float32:
++        return 1e-2, 3e-2
++    return 6e-2, 1e-1
++
++
++def _run_gdn_teacher_equivalence(
++    *,
++    state_dtype: torch.dtype,
++    act_dtype: torch.dtype,
++    batch: int,
++    num_q_heads: int,
++    num_v_heads: int,
++    head_k_dim: int,
++    head_v_dim: int,
++    seqlen: int,
++    max_cache_len: int,
++    seed: int = 0,
++) -> None:
++    assert seqlen % max_cache_len == 0, "final step must be a flush"
++    device = "cuda"
++    H, HV, K, V = num_q_heads, num_v_heads, head_k_dim, head_v_dim
++    o_rtol, o_atol = _output_tolerances(act_dtype)
++    set_random_seed(seed)
++    scale = K**-0.5
++    qkv_dim = 2 * (H * K) + HV * V
++    L = batch * seqlen
++
++    # Step decoders use slot-indexed state (slot 0 is the null block).
++    num_state_slots = batch + 1
++    ssm_state_indices = torch.arange(1, batch + 1, device=device, dtype=torch.int32)
++
++    A_log = torch.randn(HV, device=device, dtype=act_dtype)
++    dt_bias = torch.randn(HV, device=device, dtype=act_dtype)
++    mixed_qkv_seq = torch.randn(batch, seqlen, qkv_dim, device=device, dtype=act_dtype)
++    a_seq = torch.randn(batch, seqlen, HV, device=device, dtype=act_dtype)
++    b_seq = torch.randn(batch, seqlen, HV, device=device, dtype=act_dtype)
++
++    def run_teacher(qkv_dtype: torch.dtype, st_dtype: torch.dtype):
++        # Same post-conv prep as the model's prefill (GQA + l2norm), so the
++        # teacher's q/k/v/g/beta match what the decode kernels derive from
++        # mixed_qkv. apply_l2norm=True here -> l2norm off in the chunk kernel.
++        q, k, v, g, beta = fused_post_conv_prep(
++            conv_output=mixed_qkv_seq.reshape(L, qkv_dim).to(qkv_dtype),
++            a=a_seq.reshape(L, HV).to(qkv_dtype),
++            b=b_seq.reshape(L, HV).to(qkv_dtype),
++            A_log=A_log.to(qkv_dtype),
++            dt_bias=dt_bias.to(qkv_dtype),
++            num_k_heads=H,
++            head_k_dim=K,
++            head_v_dim=V,
++            apply_l2norm=True,
++            output_g_exp=False,
++        )
++        q = q.reshape(batch, seqlen, *q.shape[1:])
++        k = k.reshape(batch, seqlen, *k.shape[1:])
++        v = v.reshape(batch, seqlen, *v.shape[1:])
++        g = g.reshape(batch, seqlen, *g.shape[1:])
++        beta = beta.reshape(batch, seqlen, *beta.shape[1:])
++        state0 = torch.zeros(batch, HV, V, K, device=device, dtype=st_dtype)
++        out, final_state = chunk_gated_delta_rule(
++            q=q,
++            k=k,
++            v=v,
++            g=g,
++            beta=beta,
++            scale=scale,
++            initial_state=state0,
++            output_final_state=True,
++            cu_seqlens=None,
++            use_qk_l2norm_in_kernel=False,
++        )
++        return out, final_state  # (B, T, HV, V), (B, HV, V, K)
++
++    # The chunked prefill kernel only supports bf16 activations, so it is the
++    # (trusted) reference at the test (bf16-activation) precision; no separate
++    # fp32 ground truth (fp32-activation decode is covered by the GDN
++    # standard-decode test). The recurrent state precision is still swept.
++    y_teacher, state_teacher = run_teacher(act_dtype, state_dtype)
++
++    # Step decoders: baseline packed decode and ReplaySSM (ring buffer).
++    state_base = torch.zeros(
++        num_state_slots, HV, V, K, device=device, dtype=state_dtype
++    )
++    state_dec = torch.zeros(num_state_slots, HV, V, K, device=device, dtype=state_dtype)
++    cache_dtype = torch.float16 if act_dtype == torch.bfloat16 else act_dtype
++    d_cache = torch.zeros(
++        num_state_slots, HV, max_cache_len, V, device=device, dtype=cache_dtype
++    )
++    k_cache = torch.zeros(
++        num_state_slots, H, max_cache_len, K, device=device, dtype=cache_dtype
++    )
++    g_cache = torch.zeros(
++        num_state_slots, HV, max_cache_len, device=device, dtype=torch.float32
++    )
++
++    y_base = torch.empty(batch, seqlen, HV, V, device=device, dtype=act_dtype)
++    y_dec = torch.empty(batch, seqlen, HV, V, device=device, dtype=act_dtype)
++    for t in range(seqlen):
++        mixed_qkv = mixed_qkv_seq[:, t]
++        a = a_seq[:, t]
++        b = b_seq[:, t]
++        write_pos = torch.full(
++            (batch,), t % max_cache_len, device=device, dtype=torch.int32
++        )
++        is_flush = (write_pos == max_cache_len - 1).to(torch.int8)
++
++        out_b = torch.empty(batch, 1, HV, V, device=device, dtype=act_dtype)
++        fused_recurrent_gated_delta_rule_packed_decode(
++            mixed_qkv=mixed_qkv,
++            a=a,
++            b=b,
++            A_log=A_log,
++            dt_bias=dt_bias,
++            scale=scale,
++            initial_state=state_base,
++            out=out_b,
++            ssm_state_indices=ssm_state_indices,
++            use_qk_l2norm_in_kernel=True,
++        )
++        y_base[:, t] = out_b[:, 0]
++
++        out_d = torch.empty(batch, 1, HV, V, device=device, dtype=act_dtype)
++        fused_recurrent_gated_delta_rule_replayssm(
++            mixed_qkv=mixed_qkv,
++            a=a,
++            b=b,
++            A_log=A_log,
++            dt_bias=dt_bias,
++            scale=scale,
++            initial_state=state_dec,
++            d_cache=d_cache,
++            k_cache=k_cache,
++            g_cache=g_cache,
++            out=out_d,
++            ssm_state_indices=ssm_state_indices,
++            write_pos=write_pos,
++            is_flush=is_flush,
++            use_qk_l2norm_in_kernel=True,
++        )
++        y_dec[:, t] = out_d[:, 0]
++
++    # Baseline and ReplaySSM step decode both reproduce the chunked prefill
++    # teacher's per-position outputs.
++    torch.testing.assert_close(
++        y_base.float(), y_teacher.float(), rtol=o_rtol, atol=o_atol
++    )
++    torch.testing.assert_close(
++        y_dec.float(), y_teacher.float(), rtol=o_rtol, atol=o_atol
++    )
++    # Final state (the last step is a flush, so state_dec is the full state).
++    # The step decoders' state is slot-indexed; gather active rows to match the
++    # teacher's dense per-sequence state.
++    torch.testing.assert_close(
++        state_base[ssm_state_indices].float(),
++        state_teacher.float(),
++        rtol=o_rtol,
++        atol=o_atol,
++    )
++    torch.testing.assert_close(
++        state_dec[ssm_state_indices].float(),
++        state_teacher.float(),
++        rtol=o_rtol,
++        atol=o_atol,
++    )
++
++
++# The chunked prefill teacher is bf16-activation-only, so the activation dtype is
++# bf16; the recurrent-state precision is still swept: fp32 (production), bf16, and
++# fp16 (a finer-mantissa state than bf16 at the same 2 bytes). Fully-fp16
++# activations are out of scope here (the teacher cannot run them).
++_PRECISIONS = [
++    pytest.param((torch.float32, torch.bfloat16), id="s32_a16"),
++    pytest.param((torch.bfloat16, torch.bfloat16), id="s16_a16"),
++    pytest.param((torch.float16, torch.bfloat16), id="sfp16_a16"),
++]
++_GEOMETRIES = [
++    # (num_q_heads, num_v_heads, head_k_dim, head_v_dim)
++    pytest.param((2, 4, 64, 64), id="small"),
++    pytest.param((16, 32, 128, 128), id="qwen4b"),
++]
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
++@pytest.mark.parametrize("precision", _PRECISIONS)
++@pytest.mark.parametrize("geometry", _GEOMETRIES)
++@pytest.mark.parametrize("max_cache_len", [4, 16])
++def test_replayssm_teacher_decode_equivalence_gdn(
++    precision: tuple[torch.dtype, torch.dtype],
++    geometry: tuple[int, int, int, int],
++    max_cache_len: int,
++):
++    state_dtype, act_dtype = precision
++    num_q_heads, num_v_heads, head_k_dim, head_v_dim = geometry
++    _run_gdn_teacher_equivalence(
++        state_dtype=state_dtype,
++        act_dtype=act_dtype,
++        batch=4,
++        num_q_heads=num_q_heads,
++        num_v_heads=num_v_heads,
++        head_k_dim=head_k_dim,
++        head_v_dim=head_v_dim,
++        seqlen=16,
++        max_cache_len=max_cache_len,
++    )
+diff --git a/tests/models/kimi_k3/test_kda_metadata.py b/tests/models/kimi_k3/test_kda_metadata.py
+index dec854f4d9..892ae3292a 100644
+--- a/tests/models/kimi_k3/test_kda_metadata.py
++++ b/tests/models/kimi_k3/test_kda_metadata.py
+@@ -211,6 +211,7 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
+         ),
+         cache_config=SimpleNamespace(
+             mamba_cache_mode="align",
++            use_replayssm=True,
+             use_kda_recoverssm=True,
+             prefix_match_unit=None,
+         ),
+@@ -237,6 +238,7 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
+         vllm_config=builder_config,
+         device=DEVICE,
+     )
++    assert not builder.use_replayssm
+     builder_config.cache_config.hash_block_size = BLOCK_SIZE
+     builder_config.cache_config.cache_hit_alignment_tokens = BLOCK_SIZE
+ 
+diff --git a/tests/models/test_registry.py b/tests/models/test_registry.py
+index deceffcd29..638ced47f3 100644
+--- a/tests/models/test_registry.py
++++ b/tests/models/test_registry.py
+@@ -197,6 +197,10 @@ def test_registry_inspect_does_not_init_cuda(model_arch):
+             not (current_platform.is_rocm() or current_platform.is_xpu()),
+         ),
+         ("KimiK3ForConditionalGeneration", not current_platform.is_rocm()),
++        ("Qwen3_5ForCausalLM", True),
++        ("Qwen3_5MoeForCausalLM", True),
++        ("Qwen3_5ForConditionalGeneration", True),
++        ("Qwen3_5MoeForConditionalGeneration", True),
+         ("Mamba2ForCausalLM", False),
+         ("Zamba2ForCausalLM", False),
+     ],
+diff --git a/tests/v1/attention/test_gdn_metadata_builder.py b/tests/v1/attention/test_gdn_metadata_builder.py
+index e078b366c5..9a9be3a53d 100644
+--- a/tests/v1/attention/test_gdn_metadata_builder.py
++++ b/tests/v1/attention/test_gdn_metadata_builder.py
+@@ -17,6 +17,7 @@ from tests.v1.attention.utils import (
+ )
+ from vllm.config import SpeculativeConfig
+ from vllm.config.compilation import CUDAGraphMode
++from vllm.config.mamba import MambaBackendEnum
+ from vllm.v1.attention.backend import CommonAttentionMetadata
+ from vllm.v1.attention.backends.gdn_attn import (
+     GDNAttentionBackend,
+@@ -521,6 +522,308 @@ def test_checkpoint_metadata_preserves_non_spec_order(
+     )
+ 
+ 
++@dataclass
++class GDNReplaySSMBuildCase:
++    """A decode batch and its expected per-row ReplaySSM write_pos / is_flush.
++
++    num_computed = seq_len - query_len; write_pos = (num_computed -
++    effective_base) % buffer_len; is_flush = write_pos == buffer_len - 1, or a
++    forced one-token flush when num_computed < decode_base. In align mode the
++    anchor re-bases at each block start and the block-completing step flushes.
++    """
++
++    seq_lens: list[int]
++    query_lens: list[int]
++    is_prefilling: list[bool]
++    decode_base: list[int]
++    buffer_len: int
++    expected_write_pos: list[int]
++    expected_is_flush: list[int]
++    mamba_cache_mode: str = "none"
++    block_size: int = BLOCK_SIZE
++
++
++GDN_REPLAYSSM_BUILD_CASES = {
++    # decode_base == prompt length (fresh request).
++    "fresh_decode": GDNReplaySSMBuildCase(
++        seq_lens=[106],
++        query_lens=[1],
++        is_prefilling=[False],
++        decode_base=[100],
++        buffer_len=16,
++        expected_write_pos=[5],
++        expected_is_flush=[0],
++    ),
++    # decode_base > prompt anchors write_pos at the resume point.
++    "resumed_reanchors_to_zero": GDNReplaySSMBuildCase(
++        seq_lens=[106],
++        query_lens=[1],
++        is_prefilling=[False],
++        decode_base=[105],
++        buffer_len=16,
++        expected_write_pos=[0],
++        expected_is_flush=[0],
++    ),
++    # write_pos == buffer_len - 1 flushes.
++    "flush_boundary": GDNReplaySSMBuildCase(
++        seq_lens=[116],
++        query_lens=[1],
++        is_prefilling=[False],
++        decode_base=[100],
++        buffer_len=16,
++        expected_write_pos=[15],
++        expected_is_flush=[1],
++    ),
++    # Per-row write_pos / is_flush are independent.
++    "mixed_rows": GDNReplaySSMBuildCase(
++        seq_lens=[104, 106, 216],
++        query_lens=[1, 1, 1],
++        is_prefilling=[False, False, False],
++        decode_base=[100, 105, 200],
++        buffer_len=16,
++        expected_write_pos=[3, 0, 15],
++        expected_is_flush=[0, 0, 1],
++    ),
++    # write_pos wraps within the buffer (6 % 4 == 2).
++    "small_buffer_wrap": GDNReplaySSMBuildCase(
++        seq_lens=[112],
++        query_lens=[1],
++        is_prefilling=[False],
++        decode_base=[105],
++        buffer_len=4,
++        expected_write_pos=[2],
++        expected_is_flush=[0],
++    ),
++    # Single-token prompt step replayed as decode (num_computed < decode_base):
++    # forced one-token flush off the checkpoint.
++    "leftover_prompt_one_token_flush": GDNReplaySSMBuildCase(
++        seq_lens=[100],
++        query_lens=[1],
++        is_prefilling=[False],
++        decode_base=[101],
++        buffer_len=16,
++        expected_write_pos=[0],
++        expected_is_flush=[1],
++    ),
++    # Align mode (block_size 16): past the first boundary the anchor re-bases at
++    # block_start 112, so write_pos is 5 (vs 1 in none mode).
++    "align_reanchor_past_boundary": GDNReplaySSMBuildCase(
++        seq_lens=[118],
++        query_lens=[1],
++        is_prefilling=[False],
++        decode_base=[100],
++        buffer_len=16,
++        expected_write_pos=[5],
++        expected_is_flush=[0],
++        mamba_cache_mode="align",
++    ),
++    # Block-completing step forces a flush even though write_pos (11) != L - 1.
++    "align_block_boundary_flush": GDNReplaySSMBuildCase(
++        seq_lens=[112],
++        query_lens=[1],
++        is_prefilling=[False],
++        decode_base=[100],
++        buffer_len=16,
++        expected_write_pos=[11],
++        expected_is_flush=[1],
++        mamba_cache_mode="align",
++    ),
++    # First step of a new block re-anchors write_pos to 0.
++    "align_new_block_start_zero": GDNReplaySSMBuildCase(
++        seq_lens=[113],
++        query_lens=[1],
++        is_prefilling=[False],
++        decode_base=[100],
++        buffer_len=16,
++        expected_write_pos=[0],
++        expected_is_flush=[0],
++        mamba_cache_mode="align",
++    ),
++    # block_size % buffer_len != 0 (L 6): the boundary still flushes at wp 3.
++    "align_unaligned_buffer_forces_flush": GDNReplaySSMBuildCase(
++        seq_lens=[128],
++        query_lens=[1],
++        is_prefilling=[False],
++        decode_base=[100],
++        buffer_len=6,
++        expected_write_pos=[3],
++        expected_is_flush=[1],
++        mamba_cache_mode="align",
++    ),
++    # Per-row independence in align mode: partial-block / new-block / boundary.
++    "align_mixed_rows": GDNReplaySSMBuildCase(
++        seq_lens=[105, 113, 112],
++        query_lens=[1, 1, 1],
++        is_prefilling=[False, False, False],
++        decode_base=[100, 100, 100],
++        buffer_len=16,
++        expected_write_pos=[4, 0, 11],
++        expected_is_flush=[0, 0, 1],
++        mamba_cache_mode="align",
++    ),
++    # block_size (64) > buffer_len, so the block anchor and the ring period are
++    # distinct. A prefill may end mid-block, so decode_base must win over the
++    # block start until decode itself crosses the next boundary:
++    #   row 0 anchors on decode_base 150, not block start 128 (else wp 6)
++    #   row 1 completes 192 and flushes mid-ring (wp 9)
++    #   row 2 re-anchors on block start 192, now that 192 holds the checkpoint
++    "align_block_larger_than_buffer": GDNReplaySSMBuildCase(
++        seq_lens=[151, 192, 201],
++        query_lens=[1, 1, 1],
++        is_prefilling=[False, False, False],
++        decode_base=[150, 150, 150],
++        buffer_len=16,
++        expected_write_pos=[0, 9, 8],
++        expected_is_flush=[0, 1, 0],
++        mamba_cache_mode="align",
++        block_size=64,
++    ),
++}
++
++
++def _create_replayssm_gdn_builder(
++    buffer_len: int,
++    mamba_cache_mode: str = "none",
++    full_cuda_graph: bool = False,
++    block_size: int = BLOCK_SIZE,
++) -> GDNAttentionMetadataBuilder:
++    """Create a GDNAttentionMetadataBuilder with ReplaySSM cached decode on."""
++    vllm_config = create_vllm_config(
++        model_name="Qwen/Qwen3.5-0.8B",
++        block_size=block_size,
++    )
++    if full_cuda_graph:
++        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
++    # Enable after config construction so validate_mamba_cached_kernel (Triton
++    # only) does not run; the builder reads the flags in __init__.
++    vllm_config.cache_config.use_replayssm = True
++    vllm_config.cache_config.replayssm_buffer_len = buffer_len
++    vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
++    mamba_spec = MambaSpec(
++        block_size=block_size,
++        shapes=((16, 64),),
++        dtypes=(torch.float16,),
++    )
++    return GDNAttentionMetadataBuilder(
++        kv_cache_spec=mamba_spec,
++        layer_names=["layer.0"],
++        vllm_config=vllm_config,
++        device=DEVICE,
++    )
++
++
++def _build_replayssm(
++    builder: GDNAttentionMetadataBuilder,
++    case: GDNReplaySSMBuildCase,
++) -> GDNAttentionMetadata:
++    batch = BatchSpec(seq_lens=case.seq_lens, query_lens=case.query_lens)
++    common = create_common_attn_metadata(batch, case.block_size, DEVICE).replace(
++        is_prefilling=torch.tensor(case.is_prefilling, dtype=torch.bool),
++        replayssm_decode_base_cpu=torch.tensor(case.decode_base, dtype=torch.int32),
++    )
++    return builder.build(common_prefix_len=0, common_attn_metadata=common)
++
++
++def test_replayssm_single_token_prefill_runs_as_decode():
++    # A final single-token prefill chunk lands in a shape-uniform batch that the
++    # runner dispatches as a FULL cudagraph. It must stay in the decode group,
++    # or num_prefills > 0 skips the persistent-buffer refresh and the replayed
++    # graph reads last step's cursor.
++    builder = _create_replayssm_gdn_builder(16, full_cuda_graph=True)
++    case = GDNReplaySSMBuildCase(
++        seq_lens=[106, 100],
++        query_lens=[1, 1],
++        is_prefilling=[False, True],
++        decode_base=[100, 100],
++        buffer_len=16,
++        expected_write_pos=[5, 0],
++        expected_is_flush=[0, 1],
++    )
++    meta = _build_replayssm(builder, case)
++
++    assert meta.num_decodes == 2
++    assert meta.num_prefills == 0
++    assert meta.write_pos_d is not None and meta.is_flush_d is not None
++    assert meta.write_pos_d.tolist() == case.expected_write_pos
++    assert meta.is_flush_d.tolist() == case.expected_is_flush
++    # The cursor must live in the captured buffers, not a fresh allocation.
++    assert meta.write_pos_d.data_ptr() == builder.decode_write_pos_d.data_ptr()
++    assert meta.is_flush_d.data_ptr() == builder.decode_is_flush_d.data_ptr()
++
++
++def test_replayssm_first_token_prefill_stays_prefill():
++    # A first-token prefill has no prior GDN state, so it must not be pulled
++    # into the decode group.
++    builder = _create_replayssm_gdn_builder(16)
++    case = GDNReplaySSMBuildCase(
++        seq_lens=[1],
++        query_lens=[1],
++        is_prefilling=[True],
++        decode_base=[1],
++        buffer_len=16,
++        expected_write_pos=[],
++        expected_is_flush=[],
++    )
++    meta = _build_replayssm(builder, case)
++
++    assert meta.num_decodes == 0
++    assert meta.num_prefills == 1
++    assert meta.write_pos_d is None
++
++
++@pytest.mark.parametrize(
++    "case",
++    GDN_REPLAYSSM_BUILD_CASES.values(),
++    ids=GDN_REPLAYSSM_BUILD_CASES.keys(),
++)
++def test_replayssm_write_pos(case: GDNReplaySSMBuildCase):
++    builder = _create_replayssm_gdn_builder(
++        case.buffer_len, case.mamba_cache_mode, block_size=case.block_size
++    )
++    meta = _build_replayssm(builder, case)
++
++    assert meta.write_pos_d is not None and meta.is_flush_d is not None
++    n = len(case.expected_write_pos)
++    assert meta.write_pos_d[:n].tolist() == case.expected_write_pos
++    assert meta.is_flush_d[:n].tolist() == case.expected_is_flush
++
++
++def test_replayssm_rejects_stochastic_rounding():
++    # The GDN cached kernel has no stochastic rounding; the builder must reject
++    # the combination rather than silently ignore it.
++    builder = _create_replayssm_gdn_builder(16)
++    vllm_config = builder.vllm_config
++    vllm_config.mamba_config.enable_stochastic_rounding = True
++    with pytest.raises(ValueError, match="stochastic rounding"):
++        GDNAttentionMetadataBuilder(
++            kv_cache_spec=builder.kv_cache_spec,
++            layer_names=["layer.0"],
++            vllm_config=vllm_config,
++            device=DEVICE,
++        )
++
++
++def test_replayssm_rejects_flashinfer_backend():
++    builder = _create_replayssm_gdn_builder(16)
++    builder.vllm_config.mamba_config.backend = MambaBackendEnum.FLASHINFER
++    with pytest.raises(ValueError, match="GDN ReplaySSM requires.*triton"):
++        GDNAttentionMetadataBuilder(
++            kv_cache_spec=builder.kv_cache_spec,
++            layer_names=["layer.0"],
++            vllm_config=builder.vllm_config,
++            device=DEVICE,
++        )
++
++
++def test_replayssm_requires_decode_base():
++    builder = _create_replayssm_gdn_builder(16)
++    common = create_common_attn_metadata(
++        BatchSpec(seq_lens=[106], query_lens=[1]), BLOCK_SIZE, DEVICE
++    )
++    with pytest.raises(ValueError, match="exact CPU sequence lengths.*decode-base"):
++        builder.build(0, common)
++
++
+ @pytest.mark.parametrize("num_spec", [0, 3])
+ def test_update_block_table_regathers_checkpoint(num_spec):
+     """Checkpoint pages come from the target group's block table, not the
+diff --git a/tests/v1/e2e/test_replayssm_decode.py b/tests/v1/e2e/test_replayssm_decode.py
+index 4409cb166d..cfd8bc3787 100644
+--- a/tests/v1/e2e/test_replayssm_decode.py
++++ b/tests/v1/e2e/test_replayssm_decode.py
+@@ -54,6 +54,7 @@ if os.environ.get("VLLM_TEST_REQUIRE_REPLAYSSM") == "1":
+ 
+ # Mamba2 (Nemotron-3) hybrid.
+ MAMBA2_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"
++GDN_MODEL = "Qwen/Qwen3.5-4B"
+ MAMBA2_MTP_MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+ requires_flashinfer = pytest.mark.skipif(
+     not current_platform.is_cuda(), reason="FlashInfer Mamba SSU is CUDA-only"
+@@ -65,6 +66,7 @@ FLASHINFER_MODELS = [
+ ]
+ MODELS = [
+     pytest.param(MAMBA2_MODEL, marks=large_gpu_mark(min_gb=40)),
++    pytest.param(GDN_MODEL, marks=large_gpu_mark(min_gb=40)),
+ ]
+ 
+ PROMPTS = [
+@@ -102,6 +104,7 @@ def _check_replayssm_parity(
+         enable_prefix_caching=False,
+         tensor_parallel_size=tensor_parallel_size,
+         mamba_backend=mamba_backend,
++        additional_config={"gdn_prefill_backend": "triton"},
+     )
+     with vllm_runner(model_name, **common) as llm:
+         baseline = llm.generate_greedy_logprobs(prompts, max_tokens=32, num_logprobs=5)
+@@ -124,7 +127,7 @@ def test_replayssm_decode_matches_baseline(vllm_runner, model_name):
+ 
+ 
+ @multi_gpu_test(num_gpus=2)
+-@pytest.mark.parametrize("model_name", [MAMBA2_MODEL])
++@pytest.mark.parametrize("model_name", [MAMBA2_MODEL, GDN_MODEL])
+ def test_replayssm_decode_matches_baseline_tp2(vllm_runner, model_name, monkeypatch):
+     # Collection can initialize CUDA before the tensor-parallel workers start.
+     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+@@ -259,6 +262,9 @@ def _check_replayssm_prefix_caching(
+         mamba_backend=mamba_backend,
+         disable_log_stats=False,  # required for llm.get_metrics()
+         tensor_parallel_size=tensor_parallel_size,
++        # GDN prefill JIT-compiles under FlashInfer; the backend is irrelevant
++        # to the decode parity measured here and Triton avoids the JIT.
++        additional_config={"gdn_prefill_backend": "triton"},
+     )
+     prompts = PREFIX_CACHING_PROMPTS
+     if speculative_method is not None:
+diff --git a/vllm/model_executor/layers/mamba/gdn/base.py b/vllm/model_executor/layers/mamba/gdn/base.py
+index 249d56685e..841454c629 100644
+--- a/vllm/model_executor/layers/mamba/gdn/base.py
++++ b/vllm/model_executor/layers/mamba/gdn/base.py
+@@ -51,8 +51,13 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
+         return MambaAttentionBackendEnum.GDN_ATTN
+ 
+     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
++        base_dtype = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+             self.model_config.dtype,
+             self.cache_config.mamba_cache_dtype,
+             self.cache_config.mamba_ssm_cache_dtype,
+         )
++        if self.cache_config.use_replayssm:
++            return MambaStateDtypeCalculator.append_gated_delta_net_replayssm_ring(
++                base_dtype, self.model_config.dtype
++            )
++        return base_dtype
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index 9d313ad672..7a800ea594 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -80,6 +80,7 @@ from vllm.third_party.flash_linear_attention.ops import (
+ from vllm.third_party.flash_linear_attention.ops import (
+     fused_post_conv_prep,
+     fused_recurrent_gated_delta_rule_packed_decode,
++    fused_recurrent_gated_delta_rule_replayssm,
+     fused_sigmoid_gating_delta_rule_update,
+ )
+ from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
+@@ -683,8 +684,8 @@ class ChunkGatedDeltaRule(CustomOp):
+ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+     def get_state_shape(
+         self,
+-    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
++    ) -> tuple[tuple[int, ...], ...]:
++        base_shape = MambaStateShapeCalculator.gated_delta_net_state_shape(
+             self.tp_size,
+             self.num_k_heads,
+             self.num_v_heads,
+@@ -693,6 +694,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             self.conv_kernel_size,
+             self.num_spec,
+         )
++        if self.cache_config.use_replayssm:
++            return MambaStateShapeCalculator.append_gated_delta_net_replayssm_ring(
++                base_shape,
++                self.num_k_heads,
++                self.tp_size,
++                self.cache_config.replayssm_buffer_len,
++            )
++        return base_shape
+ 
+     def __init__(
+         self,
+@@ -889,6 +898,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         )
+         if self.speculative_config is not None:
+             logger.info_once("GDN spec decode kernel: %s", self.gdn_decode_kernel)
++        # Cached-decode kernel (reuses the engine-level mamba_* flags). When
++        # enabled, the paged GDN page grows to 5 tensors and the non-spec decode
++        # branch decodes through fused_recurrent_gated_delta_rule_replayssm.
++        self.use_replayssm = self.cache_config.use_replayssm
++        self.replayssm_buffer_len = (
++            self.cache_config.replayssm_buffer_len if self.use_replayssm else None
++        )
+ 
+         compilation_config = get_current_vllm_config().compilation_config
+         if prefix in compilation_config.static_forward_context:
+@@ -941,7 +957,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+     def _fused_gdn_decode_unsupported_reason(
+         self, vllm_config: VllmConfig
+     ) -> str | None:
+-        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()
++        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()[:2]
+         if (
+             self.gqa_interleaved_layout
+             or self.head_k_dim != 128
+@@ -1550,7 +1566,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         dtype = qkv_or_qkvz.dtype
+         num_k_heads = self.num_k_heads // self.tp_size
+         num_v_heads = self.num_v_heads // self.tp_size
+-        _, state_dtype = self.get_state_dtype()
++        # get_state_dtype() is (conv, ssm[, d, k, g]); we only need the ssm dtype.
++        state_dtype = self.get_state_dtype()[1]
+ 
+         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
+         # is sufficient to populate every autotuner cache. Mirror the real
+@@ -1793,12 +1810,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+ 
+         assert isinstance(attn_metadata, GDNAttentionMetadata)
+ 
+-        if (
+-            self.enable_packed_recurrent_decode
+-            and attn_metadata.spec_sequence_masks is None
++        is_non_spec_decode = (
++            attn_metadata.spec_sequence_masks is None
+             and attn_metadata.num_prefills == 0
+             and attn_metadata.num_decodes > 0
+-        ):
++        )
++
++        # Cached decode kernel (own kernel; independent of the packed-recurrent
++        # env flag).
++        if self.use_replayssm and is_non_spec_decode:
++            return self._forward_core_decode_non_spec_cached(
++                mixed_qkv=mixed_qkv,
++                b=b,
++                a=a,
++                core_attn_out=core_attn_out,
++                attn_metadata=attn_metadata,
++            )
++
++        if self.enable_packed_recurrent_decode and is_non_spec_decode:
+             return self._forward_core_decode_non_spec(
+                 mixed_qkv=mixed_qkv,
+                 b=b,
+@@ -1993,25 +2022,55 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+ 
+         # 2.2: Process non-spec-decode part
+         if split_non_spec:
+-            query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
+-                mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
+-            )
+-            core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
+-                A_log=self.A_log,
+-                a=a[:num_decode_tokens],
+-                b=b[:num_decode_tokens],
+-                dt_bias=self.dt_bias,
+-                q=query_decode,
+-                k=key_decode,
+-                v=value_decode,
+-                initial_state=ssm_state,
+-                inplace_final_state=True,
+-                cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
+-                    : attn_metadata.num_decodes + 1
+-                ],
+-                ssm_state_indices=non_spec_state_indices_tensor,
+-                use_qk_l2norm_in_kernel=True,
+-            )
++            if self.use_replayssm:
++                out_decode = torch.empty(
++                    num_decode_tokens,
++                    1,
++                    self.num_v_heads // self.tp_size,
++                    self.head_v_dim,
++                    dtype=mixed_qkv_non_spec.dtype,  # type: ignore[union-attr]
++                    device=mixed_qkv_non_spec.device,  # type: ignore[union-attr]
++                )
++                fused_recurrent_gated_delta_rule_replayssm(
++                    mixed_qkv=mixed_qkv_non_spec[:num_decode_tokens].contiguous(),  # type: ignore[index]
++                    a=a[:num_decode_tokens],
++                    b=b[:num_decode_tokens],
++                    A_log=self.A_log,
++                    dt_bias=self.dt_bias,
++                    scale=self.head_k_dim**-0.5,
++                    initial_state=ssm_state,
++                    d_cache=self_kv_cache[2],
++                    k_cache=self_kv_cache[3],
++                    g_cache=self_kv_cache[4],
++                    out=out_decode,
++                    ssm_state_indices=non_spec_state_indices_tensor[  # type: ignore[index]
++                        : attn_metadata.num_decodes
++                    ],
++                    write_pos=attn_metadata.write_pos_d,
++                    is_flush=attn_metadata.is_flush_d,
++                    use_qk_l2norm_in_kernel=True,
++                )
++                core_attn_out_decode = out_decode.transpose(0, 1)
++            else:
++                query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
++                    mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
++                )
++                core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
++                    A_log=self.A_log,
++                    a=a[:num_decode_tokens],
++                    b=b[:num_decode_tokens],
++                    dt_bias=self.dt_bias,
++                    q=query_decode,
++                    k=key_decode,
++                    v=value_decode,
++                    initial_state=ssm_state,
++                    inplace_final_state=True,
++                    cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
++                        : attn_metadata.num_decodes + 1
++                    ],
++                    ssm_state_indices=non_spec_state_indices_tensor,
++                    use_qk_l2norm_in_kernel=True,
++                )
+         else:
+             core_attn_out_decode = None
+ 
+@@ -2308,6 +2367,72 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         )
+         return
+ 
++    def _forward_core_decode_non_spec_cached(
++        self,
++        mixed_qkv: torch.Tensor,
++        b: torch.Tensor,
++        a: torch.Tensor,
++        core_attn_out: torch.Tensor,
++        attn_metadata: GDNAttentionMetadata,
++    ):
++        """Cached non-spec decode: amortizes the SSM-state HBM traffic by caching
++        the per-step d/k/g vectors in a ring buffer and reconstructing the
++        output from a checkpoint that is only rewritten every
++        replayssm_buffer_len steps.
++        """
++        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
++        write_pos_d = attn_metadata.write_pos_d
++        is_flush_d = attn_metadata.is_flush_d
++        self_kv_cache = self.kv_cache
++        # conv_state must be (..., dim, width-1) for the conv kernels.
++        # DS layout stores it that way directly; SD layout needs a transpose.
++        conv_state = (
++            self_kv_cache[0]
++            if is_conv_state_dim_first()
++            else self_kv_cache[0].transpose(-1, -2)
++        )
++        ssm_state = self_kv_cache[1]
++        d_cache = self_kv_cache[2]
++        k_cache = self_kv_cache[3]
++        g_cache = self_kv_cache[4]
++        num_actual_tokens = attn_metadata.num_actual_tokens
++
++        mixed_qkv = mixed_qkv[:num_actual_tokens]
++        b = b[:num_actual_tokens]
++        a = a[:num_actual_tokens]
++
++        conv_weights = self.conv1d.weight.view(
++            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
++        )
++        mixed_qkv_non_spec = causal_conv1d_update(
++            mixed_qkv,
++            conv_state,
++            conv_weights,
++            self.conv1d.bias,
++            self.activation,
++            conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
++            validate_data=False,
++        )
++        out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
++        fused_recurrent_gated_delta_rule_replayssm(
++            mixed_qkv=mixed_qkv_non_spec,
++            a=a,
++            b=b,
++            A_log=self.A_log,
++            dt_bias=self.dt_bias,
++            scale=self.head_k_dim**-0.5,
++            initial_state=ssm_state,
++            d_cache=d_cache,
++            k_cache=k_cache,
++            g_cache=g_cache,
++            out=out_buf,
++            ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
++            write_pos=write_pos_d,
++            is_flush=is_flush_d,
++            use_qk_l2norm_in_kernel=True,
++        )
++        return
++
+     def _forward_core_decode_spec_fused_norm(
+         self,
+         mixed_qkv: torch.Tensor,
+diff --git a/vllm/model_executor/layers/mamba/mamba_utils.py b/vllm/model_executor/layers/mamba/mamba_utils.py
+index 26a3ee785f..37a85c500c 100644
+--- a/vllm/model_executor/layers/mamba/mamba_utils.py
++++ b/vllm/model_executor/layers/mamba/mamba_utils.py
+@@ -137,6 +137,22 @@ class MambaStateDtypeCalculator:
+             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
+         )
+ 
++    @classmethod
++    def append_gated_delta_net_replayssm_ring(
++        cls,
++        base_dtypes: tuple[torch.dtype, ...],
++        model_dtype: ModelDType | torch.dtype,
++    ) -> tuple[torch.dtype, ...]:
++        """Append the GDN ReplaySSM ring dtypes to a base ``(conv, ssm)`` tuple:
++        ``(d_cache, k_cache, g_cache)``. The ``d``/``k`` input caches use fp16
++        for bf16 activations; ``g_cache`` is float32.
++        """
++        activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
++        cache_dtype = (
++            torch.float16 if activation_dtype == torch.bfloat16 else activation_dtype
++        )
++        return (*base_dtypes, cache_dtype, cache_dtype, torch.float32)
++
+     @classmethod
+     def kda_state_dtype(
+         cls,
+@@ -286,7 +302,7 @@ class MambaStateShapeCalculator:
+         head_v_dim: int,
+         conv_kernel_size: int,
+         num_spec: int = 0,
+-    ):
++    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+         conv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads
+         conv_state_shape = cls._orient_conv_shape(
+             divide(conv_dim, tp_world_size),
+@@ -300,6 +316,34 @@ class MambaStateShapeCalculator:
+         )
+         return conv_state_shape, temporal_state_shape
+ 
++    @classmethod
++    def append_gated_delta_net_replayssm_ring(
++        cls,
++        base_shapes: tuple[tuple[int, int], tuple[int, int, int]],
++        num_k_heads: int,
++        tp_world_size: int,
++        replayssm_buffer_len: int,
++    ) -> tuple[
++        tuple[int, int],
++        tuple[int, int, int],
++        tuple[int, int, int],
++        tuple[int, int, int],
++        tuple[int, int],
++    ]:
++        """Append the GDN ReplaySSM ring shapes (d_cache, k_cache, g_cache) to a
++        base ``(conv, ssm)`` tuple. ``base_shapes[1]`` is the ssm shape
++        ``(num_v_heads // tp, head_v_dim, head_k_dim)``; k_cache uses the
++        un-extended ``num_k_heads``.
++        """
++        local_v_heads, head_v_dim, head_k_dim = base_shapes[1]
++        local_k_heads = divide(num_k_heads, tp_world_size)
++        return (
++            *base_shapes,
++            (local_v_heads, replayssm_buffer_len, head_v_dim),
++            (local_k_heads, replayssm_buffer_len, head_k_dim),
++            (local_v_heads, replayssm_buffer_len),
++        )
++
+     @classmethod
+     def kda_state_shape(
+         cls,
+diff --git a/vllm/model_executor/layers/mamba/ops/replayssm_config.py b/vllm/model_executor/layers/mamba/ops/replayssm_config.py
+index 3cee44ba50..7f5af5dc8b 100644
+--- a/vllm/model_executor/layers/mamba/ops/replayssm_config.py
++++ b/vllm/model_executor/layers/mamba/ops/replayssm_config.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Launch-config selection for the ReplaySSM Mamba2 output_only decode kernel.
++"""Launch-config selection for the ReplaySSM decode kernels (Mamba2
++output_only and GDN).
+ 
+ Mirrors ``mamba_ssm.py``: a hard-coded heuristic per kernel, plus an
+ ``override`` context manager for benchmarks/tests/config sweeps. Hardware is
+@@ -37,15 +38,25 @@ def _mamba2_output_only(dstate, L, is_blackwell):
+     return 16, 1, _dstate_tile(dstate, 64), _dstate_tile(dstate, 128), 2
+ 
+ 
++def _gdn_decode(L, is_blackwell):
++    # (block_v, num_warps, num_stages, nk); serving-batch optimum per device.
++    if is_blackwell:
++        return 128, 1, 3, 4
++    return 64, 1, 3, 2
++
++
+ def get_replayssm_config(kernel: str, **shape) -> tuple:
+     """Return the launch config for ``kernel`` (override > tuned default).
+ 
+-    kernel: "mamba2_output_only". ``shape`` carries the keying dims (dstate;
+-    ``L`` for the buffer length, default 16); hardware is auto-detected.
++    kernel: "mamba2_output_only" or "gdn_decode". ``shape`` carries the keying
++    dims (dstate; ``L`` for the buffer length, default 16); hardware is
++    auto-detected.
+     """
+     if kernel in _overrides:
+         return _overrides[kernel]
+     bw = _is_blackwell()
+     if kernel == "mamba2_output_only":
+         return _mamba2_output_only(shape["dstate"], shape.get("L", 16), bw)
++    if kernel == "gdn_decode":
++        return _gdn_decode(shape.get("L", 16), bw)
+     raise ValueError(f"unknown ReplaySSM kernel config key: {kernel}")
+diff --git a/vllm/model_executor/models/interfaces.py b/vllm/model_executor/models/interfaces.py
+index 788fbd3377..0647f8638b 100644
+--- a/vllm/model_executor/models/interfaces.py
++++ b/vllm/model_executor/models/interfaces.py
+@@ -102,6 +102,13 @@ MambaStateShapes: TypeAlias = (
+         tuple[int, int],
+         tuple[int, int, int],
+     ]
++    | tuple[
++        tuple[int, int],
++        tuple[int, int, int],
++        tuple[int, int, int],
++        tuple[int, int, int],
++        tuple[int, int],
++    ]
+ )
+ 
+ 
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index 6e370f180d..651b1e9626 100644
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -66,12 +66,14 @@ from vllm.tokenizers.registry import cached_tokenizer_from_config
+ from .interfaces import (
+     HasInnerState,
+     IsHybrid,
++    MambaStateShapes,
+     MixtureOfExperts,
+     MultiModalEmbeddings,
+     SupportsEagle3,
+     SupportsLoRA,
+     SupportsMRoPE,
+     SupportsPP,
++    SupportsReplaySSM,
+     _require_is_multimodal,
+ )
+ from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
+@@ -301,6 +303,7 @@ class Qwen3_5ForCausalLMBase(
+     SupportsLoRA,
+     SupportsMRoPE,
+     SupportsPP,
++    SupportsReplaySSM,
+ ):
+     packed_modules_mapping = {
+         "qkv_proj": [
+@@ -386,17 +389,22 @@ class Qwen3_5ForCausalLMBase(
+     def get_mamba_state_dtype_from_config(
+         cls,
+         vllm_config: "VllmConfig",
+-    ) -> tuple[torch.dtype, torch.dtype]:
+-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
++    ) -> tuple[torch.dtype, ...]:
++        base_dtype = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+             vllm_config.model_config.dtype,
+             vllm_config.cache_config.mamba_cache_dtype,
+             vllm_config.cache_config.mamba_ssm_cache_dtype,
+         )
++        if vllm_config.cache_config.use_replayssm:
++            return MambaStateDtypeCalculator.append_gated_delta_net_replayssm_ring(
++                base_dtype, vllm_config.model_config.dtype
++            )
++        return base_dtype
+ 
+     @classmethod
+     def get_mamba_state_shape_from_config(
+         cls, vllm_config: "VllmConfig"
+-    ) -> tuple[tuple[int, int], tuple[int, int]]:
++    ) -> MambaStateShapes:
+         parallel_config = vllm_config.parallel_config
+         hf_config = vllm_config.model_config.hf_text_config
+         tp_size = parallel_config.tensor_parallel_size
+@@ -405,7 +413,7 @@ class Qwen3_5ForCausalLMBase(
+             if vllm_config.speculative_config
+             else 0
+         )
+-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
++        base_shape = MambaStateShapeCalculator.gated_delta_net_state_shape(
+             tp_size,
+             hf_config.linear_num_key_heads,
+             hf_config.linear_num_value_heads,
+@@ -414,6 +422,14 @@ class Qwen3_5ForCausalLMBase(
+             hf_config.linear_conv_kernel_dim,
+             num_spec,
+         )
++        if vllm_config.cache_config.use_replayssm:
++            return MambaStateShapeCalculator.append_gated_delta_net_replayssm_ring(
++                base_shape,
++                hf_config.linear_num_key_heads,
++                tp_size,
++                vllm_config.cache_config.replayssm_buffer_len,
++            )
++        return base_shape
+ 
+     @classmethod
+     def get_mamba_state_copy_func(
+@@ -468,7 +484,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
+     info=Qwen3_5ProcessingInfo,
+     dummy_inputs=Qwen3VLDummyInputsBuilder,
+ )
+-class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
++class Qwen3_5ForConditionalGeneration(
++    Qwen3VLForConditionalGeneration, IsHybrid, SupportsReplaySSM
++):
+     supports_multimodal_pruning = True
+ 
+     hf_to_vllm_mapper = (
+@@ -607,17 +625,22 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+     def get_mamba_state_dtype_from_config(
+         cls,
+         vllm_config: "VllmConfig",
+-    ) -> tuple[torch.dtype, torch.dtype]:
+-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
++    ) -> tuple[torch.dtype, ...]:
++        base_dtype = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+             vllm_config.model_config.dtype,
+             vllm_config.cache_config.mamba_cache_dtype,
+             vllm_config.cache_config.mamba_ssm_cache_dtype,
+         )
++        if vllm_config.cache_config.use_replayssm:
++            return MambaStateDtypeCalculator.append_gated_delta_net_replayssm_ring(
++                base_dtype, vllm_config.model_config.dtype
++            )
++        return base_dtype
+ 
+     @classmethod
+     def get_mamba_state_shape_from_config(
+         cls, vllm_config: "VllmConfig"
+-    ) -> tuple[tuple[int, int], tuple[int, int]]:
++    ) -> MambaStateShapes:
+         parallel_config = vllm_config.parallel_config
+         hf_config = vllm_config.model_config.hf_text_config
+         tp_size = parallel_config.tensor_parallel_size
+@@ -626,7 +649,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+             if vllm_config.speculative_config
+             else 0
+         )
+-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
++        base_shape = MambaStateShapeCalculator.gated_delta_net_state_shape(
+             tp_size,
+             hf_config.linear_num_key_heads,
+             hf_config.linear_num_value_heads,
+@@ -635,6 +658,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+             hf_config.linear_conv_kernel_dim,
+             num_spec,
+         )
++        if vllm_config.cache_config.use_replayssm:
++            return MambaStateShapeCalculator.append_gated_delta_net_replayssm_ring(
++                base_shape,
++                hf_config.linear_num_key_heads,
++                tp_size,
++                vllm_config.cache_config.replayssm_buffer_len,
++            )
++        return base_shape
+ 
+     @classmethod
+     def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+diff --git a/vllm/third_party/flash_linear_attention/ops/__init__.py b/vllm/third_party/flash_linear_attention/ops/__init__.py
+index 1942d8980b..77ae2e9909 100644
+--- a/vllm/third_party/flash_linear_attention/ops/__init__.py
++++ b/vllm/third_party/flash_linear_attention/ops/__init__.py
+@@ -12,6 +12,9 @@ from .fused_recurrent import (
+     fused_recurrent_gated_delta_rule,
+     fused_recurrent_gated_delta_rule_packed_decode,
+ )
++from .fused_recurrent_replayssm import (
++    fused_recurrent_gated_delta_rule_replayssm,
++)
+ from .fused_sigmoid_gating import fused_sigmoid_gating_delta_rule_update
+ from .layernorm_guard import RMSNormGated
+ 
+@@ -20,6 +23,7 @@ __all__ = [
+     "chunk_gated_delta_rule",
+     "fused_recurrent_gated_delta_rule",
+     "fused_recurrent_gated_delta_rule_packed_decode",
++    "fused_recurrent_gated_delta_rule_replayssm",
+     "fused_post_conv_prep",
+     "fused_sigmoid_gating_delta_rule_update",
+ ]
+diff --git a/vllm/third_party/flash_linear_attention/ops/fused_recurrent_replayssm.py b/vllm/third_party/flash_linear_attention/ops/fused_recurrent_replayssm.py
+new file mode 100644
+index 0000000000..e370dbecb2
+--- /dev/null
++++ b/vllm/third_party/flash_linear_attention/ops/fused_recurrent_replayssm.py
+@@ -0,0 +1,423 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# ruff: noqa: E501
++
++from __future__ import annotations
++
++import torch
++
++from vllm.model_executor.layers.mamba.ops.replayssm_config import (
++    get_replayssm_config,
++)
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit
++def fused_recurrent_gated_delta_rule_replayssm_kernel(
++    mixed_qkv,
++    a,
++    b,
++    A_log,
++    dt_bias,
++    o,
++    h0,
++    ht,
++    d_cache,
++    k_cache,
++    g_cache,
++    ssm_state_indices,
++    write_pos,
++    is_flush,
++    scale,
++    stride_mixed_qkv_tok: tl.constexpr,
++    stride_a_tok: tl.constexpr,
++    stride_b_tok: tl.constexpr,
++    stride_init_state_token: tl.constexpr,
++    stride_final_state_token: tl.constexpr,
++    stride_indices_seq: tl.constexpr,
++    stride_d_slot: tl.constexpr,
++    stride_k_slot: tl.constexpr,
++    stride_g_slot: tl.constexpr,
++    H: tl.constexpr,
++    HV: tl.constexpr,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    BK: tl.constexpr,
++    BV: tl.constexpr,
++    BC: tl.constexpr,
++    NK: tl.constexpr,
++    BKT: tl.constexpr,
++    MAX_CACHE_LEN: tl.constexpr,
++    SOFTPLUS_THRESHOLD: tl.constexpr,
++    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
++):
++    i_v = tl.program_id(0)
++    i_n = tl.program_id(1)
++    i_hv = tl.program_id(2)
++    i_h = i_hv // (HV // H)
++
++    o_v = i_v * BV + tl.arange(0, BV)
++    o_c = tl.arange(0, BC)
++    mask_v = o_v < V
++
++    # Resolve the physical state slot; zero the output and bail for padded rows.
++    state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
++    p_o = o + (i_n * HV + i_hv) * V + o_v
++    if state_idx <= 0:
++        tl.store(
++            p_o, tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty), mask=mask_v
++        )
++        return
++
++    # Per-row buffer cursor and flush flag; valid (committed) cache positions.
++    # write_pos and is_flush are per decode row (i_n). is_flush is a builder
++    # input (not derived) so align mode can force a flush mid-buffer.
++    b_write_pos = tl.load(write_pos + i_n).to(tl.int64)
++    b_is_flush = tl.load(is_flush + i_n) != 0
++    cache_valid = o_c < b_write_pos
++
++    # Gate for the current token: decay g, its exp alpha, and the beta mixing weight.
++    a_val = tl.load(a + i_n * stride_a_tok + i_hv).to(tl.float32)
++    b_val = tl.load(b + i_n * stride_b_tok + i_hv).to(tl.float32)
++    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
++    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
++    x = a_val + dt_bias_val
++    softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
++    g_val = -tl.exp(A_log_val) * softplus_x
++    alpha_val = tl.exp(g_val)
++    beta_val = tl.sigmoid(b_val)
++
++    # Replay decay over the committed cache, from the cached per-step gates g.
++    p_g_main = g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + o_c
++    b_g_all = tl.load(p_g_main, mask=cache_valid, other=0.0).to(tl.float32)
++    b_g_prefix = tl.cumsum(b_g_all, axis=0)
++    b_g_total = tl.sum(b_g_all, axis=0)
++    b_replay_decay = tl.where(cache_valid, tl.exp(b_g_total - b_g_prefix), 0.0)
++    b_total_decay = tl.exp(b_g_total)
++
++    # Cached delta-rule update vectors d (K-independent), scaled by the replay decay.
++    p_d_main = (
++        d_cache
++        + state_idx * stride_d_slot
++        + ((i_hv * MAX_CACHE_LEN + o_c[None, :]) * V + o_v[:, None])
++    )
++    b_d_all = tl.load(
++        p_d_main, mask=mask_v[:, None] & cache_valid[None, :], other=0
++    ).to(tl.float32)
++    b_d_scaled_tc = (b_d_all * b_replay_decay[None, :]).to(
++        p_d_main.dtype.element_ty
++    )  # [BV, BC]
++
++    # Current token value (for the delta-rule update).
++    v_off = (2 * H * K) + i_hv * V + o_v
++    b_v = tl.load(
++        mixed_qkv + i_n * stride_mixed_qkv_tok + v_off, mask=mask_v, other=0
++    ).to(tl.float32)
++
++    # Optional q/k L2 norm: full-vector reciprocal norms (computed, not kept).
++    if USE_QK_L2NORM_IN_KERNEL:
++        o_kf = tl.arange(0, BK)
++        mask_kf = o_kf < K
++        p_mix = mixed_qkv + i_n * stride_mixed_qkv_tok
++        qf = tl.load(p_mix + i_h * K + o_kf, mask=mask_kf, other=0).to(tl.float32)
++        kf = tl.load(p_mix + H * K + i_h * K + o_kf, mask=mask_kf, other=0).to(
++            tl.float32
++        )
++        q_rnorm = 1.0 / tl.sqrt(tl.sum(qf * qf) + 1e-6)
++        k_rnorm = 1.0 / tl.sqrt(tl.sum(kf * kf) + 1e-6)
++    else:
++        q_rnorm = 1.0
++        k_rnorm = 1.0
++
++    # Reconstruct the state from the checkpoint + cached (d, k) in K tiles and read
++    # it with the current q and k. K-tiling avoids holding a full [BV, BK] tile.
++    # Also append the current key chunk to the ring cache (non-flush only).
++    b_state_q = tl.zeros([BV], dtype=tl.float32)
++    b_state_k = tl.zeros([BV], dtype=tl.float32)
++    cur_kq = tl.zeros([1], dtype=tl.float32)
++    write_k = (not b_is_flush) and (i_v == 0) and (i_hv == i_h * (HV // H))
++    for kk in range(NK):
++        o_kt = kk * BKT + tl.arange(0, BKT)
++        mask_kt = o_kt < K
++        p_mix = mixed_qkv + i_n * stride_mixed_qkv_tok
++        q_c = (
++            tl.load(p_mix + i_h * K + o_kt, mask=mask_kt, other=0).to(tl.float32)
++            * q_rnorm
++        )
++        k_c = (
++            tl.load(p_mix + H * K + i_h * K + o_kt, mask=mask_kt, other=0).to(
++                tl.float32
++            )
++            * k_rnorm
++        )
++        q_cs = q_c * scale
++        cur_kq += tl.sum(k_c * q_cs)
++
++        # Reconstruct this K tile of the state: S = total_decay * S_0 + d_scaled . k_cache.
++        p_h0_c = (
++            h0
++            + state_idx * stride_init_state_token
++            + i_hv * V * K
++            + o_v[:, None] * K
++            + o_kt[None, :]
++        )
++        b_h0_c = tl.load(p_h0_c, mask=mask_v[:, None] & mask_kt[None, :], other=0).to(
++            tl.float32
++        )
++        p_k_c = (
++            k_cache
++            + state_idx * stride_k_slot
++            + ((i_h * MAX_CACHE_LEN + o_c[:, None]) * K + o_kt[None, :])
++        )
++        b_k_all_c = tl.load(
++            p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0
++        ).to(p_k_c.dtype.element_ty)
++        b_h_c = b_h0_c * b_total_decay + tl.dot(b_d_scaled_tc, b_k_all_c).to(
++            tl.float32
++        )  # [BV, BKT]
++
++        # Read the state with q and k (accumulated across K tiles).
++        b_state_q += tl.sum(b_h_c * q_cs[None, :], axis=1)
++        b_state_k += tl.sum(b_h_c * k_c[None, :], axis=1)
++
++        if write_k:
++            p_cur_k = (
++                k_cache
++                + state_idx * stride_k_slot
++                + ((i_h * MAX_CACHE_LEN + b_write_pos) * K + o_kt)
++            )
++            tl.store(
++                p_cur_k,
++                k_c.to(p_cur_k.dtype.element_ty),
++                mask=mask_kt & (b_write_pos < MAX_CACHE_LEN),
++            )
++
++    # Current-token output: alpha*(S q) + d_cur * (k . q), with the new update
++    # vector d_cur = beta * (v - alpha*(S k)).
++    b_state_q *= alpha_val
++    b_state_k *= alpha_val
++    b_d_cur = beta_val * (b_v - b_state_k)
++    b_o = b_state_q + b_d_cur * tl.sum(cur_kq)
++    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
++
++    if b_is_flush:
++        # Flush: fold the current token into the checkpoint, S_t = alpha*S + d_t k_t^T,
++        # and persist it. Re-walk K chunks to rebuild S before applying the update.
++        for kk in range(NK):
++            o_kt = kk * BKT + tl.arange(0, BKT)
++            mask_kt = o_kt < K
++            p_mix = mixed_qkv + i_n * stride_mixed_qkv_tok
++            k_c = (
++                tl.load(p_mix + H * K + i_h * K + o_kt, mask=mask_kt, other=0).to(
++                    tl.float32
++                )
++                * k_rnorm
++            )
++            p_h0_c = (
++                h0
++                + state_idx * stride_init_state_token
++                + i_hv * V * K
++                + o_v[:, None] * K
++                + o_kt[None, :]
++            )
++            b_h0_c = tl.load(
++                p_h0_c, mask=mask_v[:, None] & mask_kt[None, :], other=0
++            ).to(tl.float32)
++            p_k_c = (
++                k_cache
++                + state_idx * stride_k_slot
++                + ((i_h * MAX_CACHE_LEN + o_c[:, None]) * K + o_kt[None, :])
++            )
++            b_k_all_c = tl.load(
++                p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0
++            ).to(p_k_c.dtype.element_ty)
++            b_h_c = b_h0_c * b_total_decay + tl.dot(b_d_scaled_tc, b_k_all_c).to(
++                tl.float32
++            )
++            b_h_new_c = alpha_val * b_h_c + b_d_cur[:, None] * k_c[None, :]
++            p_ht_c = (
++                ht
++                + state_idx * stride_final_state_token
++                + i_hv * V * K
++                + o_v[:, None] * K
++                + o_kt[None, :]
++            )
++            tl.store(
++                p_ht_c,
++                b_h_new_c.to(p_ht_c.dtype.element_ty),
++                mask=mask_v[:, None] & mask_kt[None, :],
++            )
++    else:
++        # Non-flush: append the current token's update vector d and gate g to the
++        # cache (the k chunks were already written inside the loop above).
++        p_cur_d = (
++            d_cache
++            + state_idx * stride_d_slot
++            + ((i_hv * MAX_CACHE_LEN + b_write_pos) * V + o_v)
++        )
++        tl.store(
++            p_cur_d,
++            b_d_cur.to(p_cur_d.dtype.element_ty),
++            mask=mask_v & (b_write_pos < MAX_CACHE_LEN),
++        )
++        if i_v == 0:
++            p_cur_g = (
++                g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + b_write_pos
++            )
++            tl.store(p_cur_g, g_val, mask=b_write_pos < MAX_CACHE_LEN)
++
++
++def fused_recurrent_gated_delta_rule_replayssm(
++    mixed_qkv: torch.Tensor,
++    a: torch.Tensor,
++    b: torch.Tensor,
++    A_log: torch.Tensor,
++    dt_bias: torch.Tensor,
++    scale: float,
++    initial_state: torch.Tensor,
++    d_cache: torch.Tensor,
++    k_cache: torch.Tensor,
++    g_cache: torch.Tensor,
++    out: torch.Tensor,
++    ssm_state_indices: torch.Tensor,
++    write_pos: torch.Tensor,
++    is_flush: torch.Tensor,
++    use_qk_l2norm_in_kernel: bool = False,
++    block_v: int | None = None,
++    num_warps: int | None = None,
++    num_stages: int | None = None,
++    nk: int | None = None,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Cached GDN autoregressive decode (one new token per sequence).
++
++    Same call surface as ``fused_recurrent_gated_delta_rule_packed_decode``
++    plus the three ring caches (``d_cache``/``k_cache``/``g_cache``) and the
++    per-decode-row ``write_pos`` cursor. ``initial_state`` is both the
++    checkpoint read (h0) and the (flush-only) checkpoint write (ht), in place.
++    """
++    if mixed_qkv.ndim != 2:
++        raise ValueError(
++            f"`mixed_qkv` must be a 2D tensor (got ndim={mixed_qkv.ndim})."
++        )
++    if mixed_qkv.stride(-1) != 1:
++        raise ValueError("`mixed_qkv` must be contiguous in the last dim.")
++    if a.ndim != 2 or b.ndim != 2:
++        raise ValueError(
++            f"`a` and `b` must be 2D tensors (got a.ndim={a.ndim}, b.ndim={b.ndim})."
++        )
++    if A_log.ndim != 1 or dt_bias.ndim != 1:
++        raise ValueError("`A_log`/`dt_bias` must be 1D tensors.")
++    if initial_state.ndim != 4:
++        raise ValueError(
++            f"`initial_state` must be a 4D tensor (got ndim={initial_state.ndim})."
++        )
++    if not out.is_contiguous():
++        raise ValueError("`out` must be contiguous.")
++    if write_pos.ndim != 1 or write_pos.dtype != torch.int32:
++        raise ValueError("`write_pos` must be a 1D int32 tensor.")
++    if is_flush.ndim != 1 or is_flush.dtype != torch.int8:
++        raise ValueError("`is_flush` must be a 1D int8 tensor.")
++
++    B = mixed_qkv.shape[0]
++    num_state_slots, HV, V, K = initial_state.shape
++    qkv_dim = mixed_qkv.shape[1]
++    q_dim = (qkv_dim - HV * V) // 2
++    if q_dim <= 0 or q_dim % K != 0:
++        raise ValueError(
++            f"Invalid packed `mixed_qkv` last dim={qkv_dim} for HV={HV}, V={V}, K={K}."
++        )
++    H = q_dim // K
++    if H <= 0 or HV % H != 0:
++        raise ValueError(
++            f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}."
++        )
++    max_cache_len = d_cache.shape[2]
++
++    # Explicit launch parameters override the defaults for this buffer length.
++    cfg_bv, cfg_nw, cfg_ns, cfg_nk = get_replayssm_config("gdn_decode", L=max_cache_len)
++    if block_v is None:
++        block_v = cfg_bv
++    if num_warps is None:
++        num_warps = cfg_nw
++    if num_stages is None:
++        num_stages = cfg_ns
++    if nk is None:
++        nk = cfg_nk
++
++    # Cache shape sanity (per state slot): d=(HV, L, V), k=(H, L, K), g=(HV, L).
++    if tuple(d_cache.shape[1:]) != (HV, max_cache_len, V):
++        raise ValueError(
++            f"`d_cache` per-slot shape must be {(HV, max_cache_len, V)} "
++            f"(got {tuple(d_cache.shape[1:])})."
++        )
++    if tuple(k_cache.shape[1:]) != (H, max_cache_len, K):
++        raise ValueError(
++            f"`k_cache` per-slot shape must be {(H, max_cache_len, K)} "
++            f"(got {tuple(k_cache.shape[1:])})."
++        )
++    if tuple(g_cache.shape[1:]) != (HV, max_cache_len):
++        raise ValueError(
++            f"`g_cache` per-slot shape must be {(HV, max_cache_len)} "
++            f"(got {tuple(g_cache.shape[1:])})."
++        )
++    if g_cache.dtype != torch.float32:
++        raise ValueError(f"`g_cache` must be float32 (got {g_cache.dtype}).")
++
++    BK = triton.next_power_of_2(K)
++    if triton.cdiv(K, BK) != 1:
++        raise ValueError(
++            f"Cached decode kernel only supports NK_global=1 (got K={K}, BK={BK})."
++        )
++    if BK % nk != 0:
++        raise ValueError(f"nk={nk} must divide BK={BK}.")
++    BKT = BK // nk
++    if BKT < 16:
++        raise ValueError(f"BKT={BKT} must be >=16 for tl.dot (nk={nk}, BK={BK}).")
++    # K-tiling keeps the per-program tile small enough that BV=64 (NV=1, half the
++    # grid -> fewer redundant cache/metadata loads) fits without register
++    # spilling.
++    BV = block_v if block_v is not None else min(triton.next_power_of_2(V), 64)
++    BC = max(16, triton.next_power_of_2(max_cache_len))
++
++    grid = (triton.cdiv(V, BV), B, HV)
++    fused_recurrent_gated_delta_rule_replayssm_kernel[grid](
++        mixed_qkv=mixed_qkv,
++        a=a,
++        b=b,
++        A_log=A_log,
++        dt_bias=dt_bias,
++        o=out,
++        h0=initial_state,
++        ht=initial_state,
++        d_cache=d_cache,
++        k_cache=k_cache,
++        g_cache=g_cache,
++        ssm_state_indices=ssm_state_indices,
++        write_pos=write_pos,
++        is_flush=is_flush,
++        scale=scale,
++        stride_mixed_qkv_tok=mixed_qkv.stride(0),
++        stride_a_tok=a.stride(0),
++        stride_b_tok=b.stride(0),
++        stride_init_state_token=initial_state.stride(0),
++        stride_final_state_token=initial_state.stride(0),
++        stride_indices_seq=ssm_state_indices.stride(0),
++        stride_d_slot=d_cache.stride(0),
++        stride_k_slot=k_cache.stride(0),
++        stride_g_slot=g_cache.stride(0),
++        H=H,
++        HV=HV,
++        K=K,
++        V=V,
++        BK=BK,
++        BV=BV,
++        BC=BC,
++        NK=nk,
++        BKT=BKT,
++        MAX_CACHE_LEN=max_cache_len,
++        SOFTPLUS_THRESHOLD=20.0,
++        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
++        num_warps=num_warps,
++        num_stages=num_stages,
++    )
++    return out, initial_state
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index a6ae2413cd..91cafa6455 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -472,6 +472,11 @@ class CommonAttentionMetadata:
+     fixed sliding window. None disables R-SWA. The attention backend copies this
+     into its own persistent buffer and reads ``rswa_window`` from model config."""
+ 
++    replayssm_decode_base_cpu: torch.Tensor | None = None
++    """(batch_size,) CPU ring origin for Mamba2 ReplaySSM decode: num_computed
++    at the current decode run's last full-state write. write_pos counts from
++    here, so a preemption-resumed request re-anchors past the prompt boundary."""
++
+     _num_computed_tokens_cache: torch.Tensor | None = None
+     _token_to_req_indices_cache: torch.Tensor | None = None
+ 
+@@ -542,6 +547,7 @@ class CommonAttentionMetadata:
+             is_prefilling=maybe_slice_reqs(self.is_prefilling),
+             req_idx=maybe_slice_reqs(self.req_idx),
+             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
++            replayssm_decode_base_cpu=maybe_slice_reqs(self.replayssm_decode_base_cpu),
+         )
+ 
+ 
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+index 6f7196be5d..6f5ef13840 100644
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -10,6 +10,7 @@ import torch
+ 
+ from vllm._aiter_ops import rocm_aiter_ops
+ from vllm.config import VllmConfig
++from vllm.config.mamba import MambaBackendEnum
+ from vllm.model_executor.layers.mamba.checkpoint import (
+     MambaPrefillCheckpointBuilder,
+     MambaPrefillCheckpointMetadata,
+@@ -121,6 +122,11 @@ class GDNAttentionMetadata:
+     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
+     uniform_spec_sequence_length: int | None = None  # None for ragged batches
+ 
++    # Per-decode-row ring write position and flush flag for the cached decode
++    # kernel. shape: [num_decodes]; None unless use_replayssm is enabled.
++    write_pos_d: torch.Tensor | None = None
++    is_flush_d: torch.Tensor | None = None
++
+     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
+     chunk_indices: torch.Tensor | None = None
+     chunk_offsets: torch.Tensor | None = None
+@@ -258,6 +264,40 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             device=device,
+         )
+ 
++        # Cached decode kernel: persistent per-decode-row write position and
++        # flush flag. write_pos is derived per request each step so recycled
++        # paged blocks need no zero-init.
++        self.use_replayssm: bool = (
++            vllm_config.cache_config.use_replayssm
++            and not vllm_config.cache_config.use_kda_recoverssm
++        )
++        self.replayssm_buffer_len: int | None = (
++            vllm_config.cache_config.replayssm_buffer_len
++            if self.use_replayssm
++            else None
++        )
++        if self.use_replayssm and vllm_config.mamba_config.enable_stochastic_rounding:
++            # The GDN cached decode kernel does not implement stochastic
++            # rounding yet (planned in the CuteDSL follow-up).
++            raise ValueError(
++                "--use-replayssm with --enable-mamba-cache-stochastic-rounding "
++                "is not supported for GDN models yet; use fp32 SSM state or drop "
++                "stochastic rounding."
++            )
++        if self.use_replayssm:
++            if vllm_config.mamba_config.backend != MambaBackendEnum.TRITON:
++                raise ValueError("GDN ReplaySSM requires --mamba-backend triton")
++            self.decode_write_pos_d: torch.Tensor = torch.empty(
++                (self.decode_cudagraph_max_bs,),
++                dtype=torch.int32,
++                device=device,
++            )
++            self.decode_is_flush_d: torch.Tensor = torch.empty(
++                (self.decode_cudagraph_max_bs,),
++                dtype=torch.int8,
++                device=device,
++            )
++
+     @staticmethod
+     def _check_chunk_metadata_override(
+         builder_cls: type["GDNAttentionMetadataBuilder"], backend: str
+@@ -623,6 +663,75 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             f"num_decodes: {num_decodes}, num_spec_decodes: {num_spec_decodes}"
+         )
+ 
++        # Cached decode kernel: write_pos = decode steps since the ring's last
++        # full-state write, mod replayssm_buffer_len. decode_base re-anchors after
++        # preemption; in align mode it also re-anchors at each block start so the
++        # ring restarts empty per block. is_flush is a kernel input, not derived.
++        write_pos_d = None
++        is_flush_d = None
++        if self.use_replayssm and spec_sequence_masks is None and num_decodes > 0:
++            decode_base_cpu = m.replayssm_decode_base_cpu
++            seq_lens_cpu = m.seq_lens_cpu_upper_bound
++            async_spec_decode = (
++                self.vllm_config.scheduler_config.async_scheduling
++                and self.speculative_config is not None
++            )
++            if decode_base_cpu is None or seq_lens_cpu is None or async_spec_decode:
++                raise ValueError(
++                    "--use-replayssm requires exact CPU sequence lengths and "
++                    "decode-base counts to derive decode write positions"
++                )
++            query_lens_cpu = (
++                query_start_loc_cpu[1 : num_decodes + 1]
++                - query_start_loc_cpu[:num_decodes]
++            )
++            num_computed_d = seq_lens_cpu[:num_decodes] - query_lens_cpu
++            decode_base_d = decode_base_cpu[:num_decodes]
++            align_mode = self.vllm_config.cache_config.mamba_cache_mode == "align"
++            block_size = self.kv_cache_spec.block_size
++            if align_mode:
++                # A prefill chunk may end mid-block, so the block start does not
++                # always hold a checkpoint; decode_base wins until decode itself
++                # crosses the boundary and flushes it below.
++                effective_base = torch.maximum(
++                    decode_base_d, (num_computed_d // block_size) * block_size
++                )
++            else:
++                effective_base = decode_base_d
++            decode_steps_cpu = num_computed_d - effective_base
++            valid_decode_rows = query_lens_cpu > 0
++            # A single-token prefill row replayed as decode has decode_steps < 0;
++            # force a one-token flush (write_pos=0, is_flush=1) off the checkpoint.
++            leftover_prompt = valid_decode_rows & (decode_steps_cpu < 0)
++            decode_steps_cpu = torch.where(
++                valid_decode_rows & ~leftover_prompt,
++                decode_steps_cpu,
++                torch.zeros_like(decode_steps_cpu),
++            )
++            assert self.replayssm_buffer_len is not None
++            write_pos_cpu = torch.remainder(decode_steps_cpu, self.replayssm_buffer_len)
++            is_flush_cpu = (
++                write_pos_cpu == self.replayssm_buffer_len - 1
++            ) | leftover_prompt
++            if align_mode:
++                # Force a flush on the step completing a block so the boundary
++                # state is materialized for prefix caching.
++                is_flush_cpu = is_flush_cpu | (
++                    valid_decode_rows
++                    & ((num_computed_d + query_lens_cpu) % block_size == 0)
++                )
++            is_flush_cpu = is_flush_cpu.to(torch.int8)
++            write_pos_d = async_tensor_h2d(
++                write_pos_cpu.to(torch.int32).tolist(),
++                dtype=torch.int32,
++                device=query_start_loc.device,
++            )
++            is_flush_d = async_tensor_h2d(
++                is_flush_cpu.tolist(),
++                dtype=torch.int8,
++                device=query_start_loc.device,
++            )
++
+         # Prepare per-request tensors for cudagraph. m.num_actual_tokens is
+         # token-padded for FULL graph replay, but the GDN state/query/accepted
+         # metadata below is indexed by request.
+@@ -686,6 +795,21 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
+             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
+ 
++            if self.use_replayssm:
++                assert write_pos_d is not None and is_flush_d is not None
++                self.decode_write_pos_d[:num_decodes].copy_(
++                    write_pos_d, non_blocking=True
++                )
++                self.decode_is_flush_d[:num_decodes].copy_(
++                    is_flush_d, non_blocking=True
++                )
++                write_pos_d = self.decode_write_pos_d[:batch_size]
++                is_flush_d = self.decode_is_flush_d[:batch_size]
++                # Padded rows map to NULL_BLOCK_ID and hit the kernel's early
++                # return, so their values are never read; zero is fine.
++                write_pos_d[num_decodes:].fill_(0)
++                is_flush_d[num_decodes:].fill_(0)
++
+         attn_metadata = GDNAttentionMetadata(
+             num_prefills=num_prefills,
+             num_prefill_tokens=num_prefill_tokens,
+@@ -713,6 +837,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             non_spec_token_indx=non_spec_token_indx,
+             num_accepted_tokens=num_accepted_tokens,
+             uniform_spec_sequence_length=uniform_spec_sequence_length,
++            write_pos_d=write_pos_d,
++            is_flush_d=is_flush_d,
+             nums_dict=nums_dict,
+             batch_ptr=batch_ptr,
+             token_chunk_offset_ptr=token_chunk_offset_ptr,
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index c0205c7c0b..3750adfa49 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -46,11 +46,19 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
+     is_prefilling: torch.Tensor
+     num_accepted_tokens: torch.Tensor | None = None
+     num_decode_draft_tokens_cpu: torch.Tensor | None = None
++    # SPIKE: GDN plans its decode ring on the host (no GPU ring_pos tracker),
++    # so the builder needs the per-row ring origin as a CPU tensor.
++    replayssm_decode_base_cpu: torch.Tensor | None = None
+ 
+     def get_extra_common_attn_kwargs(
+         self, kv_cache_group_id: int, num_reqs: int
+     ) -> dict[str, Any]:
+-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
++        kwargs: dict[str, Any] = {"is_prefilling": self.is_prefilling[:num_reqs]}
++        if self.replayssm_decode_base_cpu is not None:
++            kwargs["replayssm_decode_base_cpu"] = self.replayssm_decode_base_cpu[
++                :num_reqs
++            ]
++        return kwargs
+ 
+     def get_extra_attn_kwargs(
+         self, attn_metadata_builder: Any, num_reqs: int
+@@ -320,6 +328,18 @@ class MambaHybridModelState(DefaultModelState):
+             )
+             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
+ 
++        replayssm_decode_base_cpu = None
++        if getattr(self, "cache_config", None) is not None and (
++            self.cache_config.use_replayssm
++        ):
++            # Padding rows get a zero origin. prefill_len counts the tokens the
++            # runner was given, so a resumed request anchors past the replayed
++            # prompt+generated tokens that just rewrote its checkpoint.
++            replayssm_decode_base_cpu = torch.zeros(num_reqs, dtype=torch.int32)
++            replayssm_decode_base_cpu[: input_batch.num_reqs] = torch.from_numpy(
++                input_batch.prefill_len_np[: input_batch.num_reqs]
++            )
++
+         if self._align_mode:
+             mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
+             aligned_index_builders = []
+@@ -340,6 +360,7 @@ class MambaHybridModelState(DefaultModelState):
+             is_prefilling=is_prefilling,
+             num_accepted_tokens=num_accepted_tokens,
+             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
++            replayssm_decode_base_cpu=replayssm_decode_base_cpu,
+         )
+         attn_metadata = build_attn_metadata(
+             attn_groups=attn_groups,
+diff --git a/vllm/v1/worker/replayssm_utils.py b/vllm/v1/worker/replayssm_utils.py
+index 4570b3413a..2024a4f169 100644
+--- a/vllm/v1/worker/replayssm_utils.py
++++ b/vllm/v1/worker/replayssm_utils.py
+@@ -25,8 +25,11 @@ def initialize_replayssm_ring_trackers(
+         names = [
+             name
+             for name in group.layer_names
++            # SPIKE: only layers that plan their ring on the GPU (Mamba-2) own
++            # these trackers. GDN derives write_pos/is_flush on the host.
+             if isinstance(layer := forward_context.get(name), MambaBase)
+             and layer.use_replayssm
++            and hasattr(layer, "_replayssm_ring_start")
+         ]
+         if not names:
+             continue
