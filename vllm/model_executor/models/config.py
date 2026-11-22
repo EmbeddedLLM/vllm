@@ -205,6 +205,30 @@ class GlmMoeDsaForCausalLM(VerifyAndUpdateConfig):
             comm_backend="a2a", q_replicate=True
         )
 
+        model_config = vllm_config.model_config
+        overrides = model_config.hf_overrides
+        # A shipped indexer_types list silently shadows explicit index_topk
+        # overrides; clearing it lets compute_skip_topk_layers fall back to
+        # the freq/offset/pattern formula.
+        if (
+            isinstance(overrides, dict)
+            and "indexer_types" not in overrides
+            and any(
+                key in overrides
+                for key in (
+                    "index_topk_freq",
+                    "index_topk_pattern",
+                    "index_skip_topk_offset",
+                )
+            )
+            and getattr(model_config.hf_config, "indexer_types", None)
+        ):
+            model_config.hf_config.indexer_types = None
+            logger.info_once(
+                "Explicit index_topk override replaces the shipped "
+                "indexer_types schedule for GlmMoeDsaForCausalLM"
+            )
+
 
 class Glm5NextModelConfig(VerifyAndUpdateConfig):
     @staticmethod
